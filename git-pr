@@ -1,0 +1,39 @@
+#!/bin/bash
+#
+# Copyright (c) 2020 Karl-Johan Alm
+# Distributed under the MIT software license, see the accompanying
+# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+
+# Usage:
+#   git pr <#>      Fetch and check out PR number <#> as "pr-<#>"
+#   git pr          Show existing PR* list
+#   git pr cleanup  Remove all checked out PR branches
+# (* any branch starting with "pr-")
+
+git checkout master &> /dev/null
+
+if [ "$1" = "" ]; then
+    for i in $(git branch | grep "pr-"); do
+        if [ "${i:0:3}" != "pr-" ]; then continue; fi
+        echo "  $i"
+    done
+    exit 0
+fi
+
+if [ "$1" = "cleanup" ]; then
+    for i in $(git branch | grep "pr-"); do
+        if [ "${i:0:3}" != "pr-" ]; then continue; fi
+        git branch -D $i
+    done
+    exit 0
+fi
+
+src=origin
+git remote | grep "upstream" &> /dev/null
+if [ $? -eq 0 ]; then src=upstream; fi
+
+git branch | grep "pr-$1" &> /dev/null
+if [ $? -eq 0 ]; then git branch -D "pr-$1"; fi
+
+git fetch $src pull/$1/head:pr-$1
+git checkout pr-$1

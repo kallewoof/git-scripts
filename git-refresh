@@ -1,0 +1,41 @@
+#!/bin/bash
+#
+# Copyright (c) 2020 Karl-Johan Alm
+# Distributed under the MIT software license, see the accompanying
+# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+
+# Usage:
+#   git refresh     Update master to upstream (and push it to remote),
+#                   and rebase currently checked out branch with master
+#
+# Notes:
+#   * if current branch is master, this skips the rebase part
+#   * if no "upstream" remote exists, this assumes there is no upstream, and will use the origin master, which naturally means
+#     master is not rebased onto upstream/master (because the latter does not exist)
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+src=origin
+git remote | grep "upstream" &> /dev/null
+if [ $? -eq 0 ]; then src=upstream; fi
+
+set -e
+
+# Update our master to upstream master
+# If upstream = origin, this is simply a git pull with bells & whistles
+if [ "$branch" != "master" ]; then
+    git checkout master
+fi
+
+git fetch $src
+
+if [ "$src" != "origin" ]; then
+    git rebase $src/master
+    git push
+fi
+
+if [ "$branch" = "master" ]; then exit 1; fi
+
+git checkout $branch
+
+git rebase master
