@@ -7,7 +7,7 @@
 # Usage:
 #   git pr <#>      Fetch and check out PR number <#> as "pr-<#>"
 #   git pr          Show existing PR* list
-#   git pr cleanup  Remove all checked out PR branches
+#   git pr cleanup  Remove all checked out PR* branches
 # (* any branch starting with "pr-")
 
 git checkout master &> /dev/null
