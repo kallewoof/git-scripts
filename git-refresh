@@ -34,7 +34,7 @@ if [ "$src" != "origin" ]; then
     git push
 fi
 
-if [ "$branch" = "master" ]; then exit 1; fi
+if [ "$branch" = "master" ]; then exit 0; fi
 
 git checkout $branch
 
