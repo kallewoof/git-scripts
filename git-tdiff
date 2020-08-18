@@ -1,0 +1,11 @@
+#!/bin/bash
+
+if [ "${OSTYPE:0:6}" = "darwin" ]; then
+   sedflag="-E"
+else
+   sedflag="-r"
+fi
+
+git diff --color "$@" |\
+    sed -E "s/^([^-+ ]*)[-+ ]/\\1/" |\
+    less -r
