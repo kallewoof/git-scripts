@@ -1,0 +1,9 @@
+#!/bin/bash
+commit=HEAD
+rebase=HEAD~2
+if [ $# -eq 1 ]; then
+    commit=$1
+    rebase=$1~1
+fi
+git commit -a --fixup $commit && \
+GIT_SEQUENCE_EDITOR=true git rebase -i $rebase
