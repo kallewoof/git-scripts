@@ -1,0 +1,21 @@
+#!/bin/bash
+#
+# Copyright (c) 2021 Karl-Johan Alm
+# Distributed under the MIT software license, see the accompanying
+# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+
+# Usage:
+#   git done     Checks out master, refreshes, and cleanups
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+set -e
+
+# Update our master to upstream master
+# If upstream = origin, this is simply a git pull with bells & whistles
+if [ "$branch" != "master" ]; then
+    git checkout master
+fi
+
+git refresh
+git cleanup
