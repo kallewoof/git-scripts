@@ -21,21 +21,24 @@ if [ $? -eq 0 ]; then src=upstream; fi
 
 set -e
 
+# determine if we are master or main
+default_branch=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
+
 # Update our master to upstream master
 # If upstream = origin, this is simply a git pull with bells & whistles
-if [ "$branch" != "master" ]; then
-    git checkout master
+if [ "$branch" != "$default_branch" ]; then
+    git checkout $default_branch
 fi
 
 git fetch $src
 
 if [ "$src" != "origin" ]; then
-    git rebase $src/master
+    git rebase $src/$default_branch
     git push
 fi
 
-if [ "$branch" = "master" ]; then exit 0; fi
+if [ "$branch" = "$default_branch" ]; then exit 0; fi
 
 git checkout $branch
 
-git rebase master
+git rebase $default_branch
