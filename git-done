@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright (c) 2021 Karl-Johan Alm
+# Copyright (c) 2021-2023 Karl-Johan Alm
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
@@ -9,12 +9,15 @@
 
 branch=$(git rev-parse --abbrev-ref HEAD)
 
+# determine if we are master or main
+default_branch=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
+
 set -e
 
-# Update our master to upstream master
+# Update our default branch to upstream default branch
 # If upstream = origin, this is simply a git pull with bells & whistles
-if [ "$branch" != "master" ]; then
-    git checkout master
+if [ "$branch" != "$default_branch" ]; then
+    git checkout $default_branch
 fi
 
 git refresh

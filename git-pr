@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright (c) 2020 Karl-Johan Alm
+# Copyright (c) 2020-2023 Karl-Johan Alm
 # Distributed under the MIT software license, see the accompanying
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
@@ -10,7 +10,10 @@
 #   git pr cleanup  Remove all checked out PR* branches
 # (* any branch starting with "pr-")
 
-git checkout master &> /dev/null
+# determine if we are master or main
+default_branch=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
+
+git checkout $default_branch &> /dev/null
 
 if [ "$1" = "" ]; then
     for i in $(git branch | grep "pr-"); do
