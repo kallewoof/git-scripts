@@ -1,0 +1,19 @@
+#!/bin/bash
+#
+# Copyright (c) 2023 Karl-Johan Alm
+# Distributed under the MIT software license, see the accompanying
+# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+
+# Usage:
+#   git cleanup     Remove local branches that were merged upstream
+
+git branch | grep detached &> /dev/null
+if [ $? -eq 0 ]; then
+    echo "Checked out a detached branch. Please switch to an existing branch (not tag) first."
+    exit 1
+fi
+
+# determine if we are master or main
+default_branch=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
+
+git branch --merged | grep -v "$default_branch" | xargs -n 1 git branch -d
