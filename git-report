@@ -1,0 +1,150 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Karl-Johan Alm
+# Distributed under the MIT software license, see the accompanying
+# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+
+# Usage:
+#   git report            Cache hit -> print the cached report; miss -> run the gate
+#                         (pre-commit), cache the result on success, and print it.
+#   git report --record   Write a cache entry attesting that the gate passed, without
+#                         running anything. Meant to be called from a pre-commit
+#                         post-commit stage, right after a commit succeeds.
+#
+# The cache key spans this repo and its declared dependencies (see below), not just
+# this repo's HEAD: in a stack of editable-installed repos, a dependency's commit can
+# change what this repo's tests do even though this repo's own HEAD hasn't moved. See
+# README.md for the full design.
+#
+# Dependency file: a file named below at a repo's root, one relative repo path per
+# line, blank lines and lines starting with '#' ignored. Absent file means no
+# dependencies.
+
+DEPS_FILE=".git-report-deps"
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  git report            Print a cached report; run the gate on a cache miss.
+  git report --record   Attest that the gate passed for the current key; runs nothing.
+EOF
+}
+
+mode="report"
+case "${1:-}" in
+    "") ;;
+    --record) mode="record" ;;
+    *) usage; exit 2 ;;
+esac
+
+self_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "git-report: not inside a git repository" >&2
+    exit 1
+}
+
+# Lists the repos that make up this key, in fixed order: declared dependencies (in
+# the order they appear in the dependency file), then this repo itself, last.
+list_repos() {
+    local root="$1"
+    local deps_file="$root/$DEPS_FILE"
+    local line trimmed resolved
+
+    if [ -f "$deps_file" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [ -z "$trimmed" ] && continue
+            [ "${trimmed:0:1}" = "#" ] && continue
+            resolved=$(cd "$root/$trimmed" 2>/dev/null && pwd) || {
+                echo "git-report: dependency path '$trimmed' (from $deps_file) does not exist" >&2
+                return 1
+            }
+            printf '%s\n' "$resolved"
+        done < "$deps_file"
+    fi
+    printf '%s\n' "$root"
+}
+
+# key = sha256( HEAD_1 diffhash_1 ... HEAD_n diffhash_n  sha256(this script) )
+# where diffhash_i = sha256( git diff HEAD ; git status --porcelain ) for repo i.
+# A dirty dependency is hashed by its actual diff content, not a boolean, so two
+# different work-in-progress states never share a key, and a clean tree collapses to
+# the canonical sha256("") with no special-casing.
+compute_key() {
+    local root="$1"
+    local repos_file repo head diffhash acc
+
+    repos_file=$(mktemp)
+    if ! list_repos "$root" > "$repos_file"; then
+        rm -f "$repos_file"
+        return 1
+    fi
+
+    acc=""
+    while IFS= read -r repo; do
+        head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || {
+            echo "git-report: '$repo' has no commits (or is not a git repo)" >&2
+            rm -f "$repos_file"
+            return 1
+        }
+        diffhash=$( { git -C "$repo" diff HEAD; git -C "$repo" status --porcelain; } | sha256sum | cut -d' ' -f1)
+        acc="$acc$head
+$diffhash
+"
+    done < "$repos_file"
+    rm -f "$repos_file"
+
+    acc="$acc$(sha256sum "$(readlink -f "$0")" | cut -d' ' -f1)"
+    printf '%s' "$acc" | sha256sum | cut -d' ' -f1
+}
+
+# A report certifies a clean, committed state. --record additionally relies on this:
+# pre-commit validates the staged state and stashes the rest, so surviving unstaged
+# changes mean the working tree is not what was validated.
+if [ -n "$(git -C "$self_root" status --porcelain)" ]; then
+    if [ "$mode" = "record" ]; then
+        echo "git-report: '$self_root' has unstaged changes surviving the commit; pre-commit only validated the staged state. Refusing to record." >&2
+    else
+        echo "git-report: '$self_root' has a dirty working tree; a report must reflect a clean, committed state." >&2
+    fi
+    exit 1
+fi
+
+key=$(compute_key "$self_root") || exit 1
+
+cache_dir="$self_root/.git/info/git-report"
+entry="$cache_dir/$key"
+
+if [ "$mode" = "record" ]; then
+    mkdir -p "$cache_dir"
+    self_head=$(git -C "$self_root" rev-parse HEAD)
+    printf 'gate passed at %s, recorded at commit time\n' "$self_head" > "$entry"
+    exit 0
+fi
+
+if [ -f "$entry" ]; then
+    cat "$entry"
+    exit 0
+fi
+
+if [ ! -f "$self_root/.pre-commit-config.yaml" ]; then
+    echo "git-report: no .pre-commit-config.yaml in '$self_root'." >&2
+    exit 1
+fi
+if ! command -v pre-commit >/dev/null 2>&1; then
+    echo "git-report: 'pre-commit' not found on PATH." >&2
+    exit 1
+fi
+
+tmp=$(mktemp)
+(cd "$self_root" && pre-commit run --all-files --hook-stage pre-commit) > "$tmp" 2>&1
+status=$?
+
+cat "$tmp"
+
+if [ "$status" -eq 0 ]; then
+    mkdir -p "$cache_dir"
+    cp "$tmp" "$entry"
+fi
+
+rm -f "$tmp"
+exit "$status"
