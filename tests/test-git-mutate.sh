@@ -375,6 +375,15 @@ test3() {
     mkdir -p "$d"
     make_fixture "$repo"
     cp "$repo/mod.py" "$d/mod.before"
+    # A TOML preset: the triple-quoted block here is a VALUE -- the artifact under test --
+    # not commentary about code, which is why the same syntax gets the opposite verdict.
+    cat > "$repo/preset.toml" <<'TOMLEOF'
+version = 1
+instruction = """You are enacting a scene.
+- Their words are theirs: never write for them.
+"""
+TOMLEOF
+    commit_all "$repo" "add a preset"
 
     cat > "$d/refusals.toml" <<'EOF'
 [[mutation]]
@@ -435,6 +444,13 @@ old = '''max_tokens=1'''
 new = '''max_tokens=2'''
 
 [[mutation]]
+name = "toml-value-anchor"
+[[mutation.edit]]
+file = "preset.toml"
+old = '''never write for them'''
+new = '''write for them freely'''
+
+[[mutation]]
 name = "still-runs"
 [[mutation.edit]]
 file = "mod.py"
@@ -458,6 +474,11 @@ EOF
         "comment-anchor: REFUSED -- edit 1/1: the anchor sits after a '#' on its line"
     assert_contains "an anchor in a docstring is caught, naming file and line" \
         "docstring-anchor: REFUSED -- edit 1/1: the anchor sits inside a triple-quoted block (docstring or string literal) (mod.py:3)"
+    # The pair is the point: identical syntax, opposite verdict. TOML has triple-quoted
+    # strings too, but there the block is a VALUE -- for a prompt preset it is the artifact
+    # under test -- so refusing it leaves a real behaviour unmeasured.
+    assert_missing "the same syntax in a TOML value is NOT refused -- there it is the artifact" \
+        "toml-value-anchor: REFUSED"
     assert_contains "a refused mutation does not stop the rest of the sweep" \
         "still-runs: reddened 1 -- 1 by assertion, 0 by error."
     assert_contains "refusals are surfaced as an incomplete measurement, not as survivors" \

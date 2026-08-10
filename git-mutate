@@ -24,6 +24,14 @@
 #   --timeout <seconds>   Per-mutation timeout, default 900. A timeout is reported as
 #                         "not measured", never as "reddened nothing".
 #
+# Run it UNPIPED. A sweep is slow -- one full test run per mutation, plus a baseline -- and
+# it prints one line per mutation as that mutation finishes, so an unpiped run is a live
+# progress report. Piping it through `grep`/`head` buys nothing (the sweep is not spammy:
+# three header lines, one line per mutation, then the report) and costs everything: the
+# filter blocks until the whole sweep ends, so a run that is stuck, timing out, or refusing
+# every anchor looks identical to one that is working. `head` is worse -- it can SIGPIPE the
+# sweep mid-mutation, which is the one way to leave a tree needing --recover.
+#
 # The tool is stateless. Mutations are passed in for one invocation and forgotten; the file
 # is scratch and belongs in .gitignore, never in a commit. README.md says why a persistent
 # mutations file is not offered -- briefly: anchors are coupled to the code's current text
@@ -241,24 +249,34 @@ def read_text(path):
     with open(path, "rb") as fh:
         return fh.read().decode("utf-8", "surrogateescape")
 
-def comment_verdict(buf, idx, old):
+def comment_verdict(buf, idx, old, rel=""):
     """Crude, stated heuristic for 'this anchor is prose, not code'.
 
     Catches: an anchor preceded by a '#' on its own line, an anchor that is itself a '#'
-    comment, and an anchor sitting inside a triple-quoted block (the real case: a stale
-    anchor that now matches only a docstring, mutating prose, reddening nothing, and
-    reporting a false finding).
+    comment, and -- in '.py' only -- an anchor inside a triple-quoted block (the real case:
+    a stale anchor that now matches only a docstring, mutating prose, reddening nothing,
+    and reporting a false finding).
     Misses: // and /* */ comments, and '#' inside a string literal on the same line. It
     can also false-positive on a file whose triple quotes are unbalanced by a raw string.
+
+    Triple quotes are not Python's alone -- TOML has them too -- so the test is scoped by
+    what the block MEANS, with the file suffix as the crude proxy. In Python a triple-quoted
+    block at statement level is usually prose ABOUT the code. In TOML, `key = \"\"\"...\"\"\"`
+    is a value: for a prompt preset it IS the artifact under test, and mutating it is exactly
+    right. Refusing those left real behaviours unmeasured and reported as such -- a worse
+    outcome than the false accept it guards against, which merely reddens nothing and is
+    surfaced prominently as a survivor. The '#' tests stay on for every file type: TOML
+    comments are '#' too.
     """
     line_start = buf.rfind("\n", 0, idx) + 1
     if "#" in buf[line_start:idx]:
         return "the anchor sits after a '#' on its line (comment)"
     if old.lstrip().startswith("#"):
         return "the anchor is itself a '#' comment"
-    before = buf[:idx]
-    if before.count('"""') % 2 or before.count("'''") % 2:
-        return "the anchor sits inside a triple-quoted block (docstring or string literal)"
+    if rel.endswith(".py"):
+        before = buf[:idx]
+        if before.count('"""') % 2 or before.count("'''") % 2:
+            return "the anchor sits inside a triple-quoted block (docstring or string literal)"
     return None
 
 edits = []
@@ -297,7 +315,7 @@ for j, (rel, old, new) in enumerate(edits, start=1):
                   " (an earlier edit of this mutation may have changed it)" if j > 1 else ""))
 
     idx = bufs[rel].index(old)
-    verdict = comment_verdict(bufs[rel], idx, old)
+    verdict = comment_verdict(bufs[rel], idx, old, rel)
     if verdict is not None:
         line_no = bufs[rel].count("\n", 0, idx) + 1
         refuse("%s: %s (%s:%d) -- mutating prose proves nothing; pick an anchor in code"

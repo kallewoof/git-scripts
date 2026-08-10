@@ -51,6 +51,13 @@ git mutate --recover                    # restore from a stale sweep's snapshot;
   --timeout <seconds>     per-mutation timeout (default 900)
 ```
 
+**Run it unpiped.** A sweep is slow — one full test run per mutation, plus a baseline — and it prints one
+line per mutation as that mutation finishes, so an unpiped run is a live progress report. Filtering it
+through `grep`/`head` buys nothing: the sweep is not spammy (three header lines, one line per mutation, then
+the report). It costs the progress, because the filter blocks until the sweep ends — a run that is stuck,
+timing out, or refusing every anchor then looks exactly like one that is working. `head` is worse: it can
+SIGPIPE the sweep mid-mutation, which is the one way to leave a tree needing `--recover`.
+
 Runs a mutation sweep: for each mutation, guard it, snapshot the files it touches, apply it, run the test
 suite, restore the tree, and report **which tests reddened and whether they reddened by an assertion or by
 an error**. The point of the tool is that last distinction: an assertion kill means a test checks the
