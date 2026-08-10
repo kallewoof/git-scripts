@@ -274,6 +274,43 @@ test8() {
     assert_eq "modified script busts the key (gate re-run)" "2" "$(counter_value "$counter")"
 }
 
+# --- test 9: a dirty tree during a git-mutate sweep says so ------------------------
+
+test9() {
+    echo "test 9: a dirty tree caused by a git mutate sweep in flight is named as such"
+    local d="$WORK/t9" repo counter marker out status
+    repo="$d/self"; counter="$d/counter"; marker="$d/marker"
+    init_repo "$repo"
+    make_fake_gate_config "$repo" "$counter" "$marker"
+    echo x > "$repo/f.txt"
+    commit_all "$repo" init
+
+    echo "mutated" >> "$repo/f.txt"
+
+    out=$(run_report "$repo" 2>&1); status=$?
+    if [ "$status" -ne 0 ]; then ok "still refuses on the dirty tree"; else fail "still refuses on the dirty tree (exit was 0)"; fi
+    case "$out" in
+        *"sweep is in flight"*) fail "no sweep claimed when no sweep is running" ;;
+        *) ok "no sweep claimed when no sweep is running" ;;
+    esac
+
+    mkdir -p "$repo/.git/git-mutate.lock"
+    printf 'pid=4242\nstarted=2026-08-10T21:00:00+09:00\n' > "$repo/.git/git-mutate.lock/info"
+
+    out=$(run_report "$repo" 2>&1); status=$?
+    if [ "$status" -ne 0 ]; then ok "refusal is unchanged while a sweep is in flight"; else fail "refusal is unchanged while a sweep is in flight (exit was 0)"; fi
+    case "$out" in
+        *"sweep is in flight (pid 4242, since 2026-08-10T21:00:00+09:00)"*)
+            ok "names the sweep, its pid and its start time" ;;
+        *) fail "names the sweep, its pid and its start time (got: $out)" ;;
+    esac
+    case "$out" in
+        *"this dirtiness is transient"*) ok "says the dirtiness is transient" ;;
+        *) fail "says the dirtiness is transient" ;;
+    esac
+    assert_eq "gate was never invoked" "0" "$(counter_value "$counter")"
+}
+
 test1
 test2
 test3
@@ -282,6 +319,7 @@ test5
 test6
 test7
 test8
+test9
 
 echo
 echo "== behaviour -> test mapping =="
@@ -293,6 +331,7 @@ echo "5. dirty own tree refused, both modes ...................... test5"
 echo "6. --record writes an entry and runs nothing ............... test6"
 echo "7. failing gate caches nothing .............................. test7"
 echo "8. changing git-report itself busts the key ................. test8"
+echo "9. a dirty tree from a git mutate sweep is named as such .... test9"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed"
 [ "$TESTS_FAILED" -eq 0 ]

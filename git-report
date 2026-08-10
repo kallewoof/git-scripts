@@ -106,6 +106,14 @@ if [ -n "$(git -C "$self_root" status --porcelain)" ]; then
     else
         echo "git-report: '$self_root' has a dirty working tree; a report must reflect a clean, committed state." >&2
     fi
+    # A 'git mutate' sweep dirties the tree on purpose while a mutation is applied. Saying so
+    # is the difference between "this repo is broken" and "a measurement is in flight".
+    sweep_lock="$(git -C "$self_root" rev-parse --absolute-git-dir)/git-mutate.lock"
+    if [ -d "$sweep_lock" ]; then
+        sweep_pid=$(sed -n 's/^pid=//p' "$sweep_lock/info" 2>/dev/null)
+        sweep_started=$(sed -n 's/^started=//p' "$sweep_lock/info" 2>/dev/null)
+        echo "git-report: a 'git mutate' sweep is in flight (pid ${sweep_pid:-unknown}, since ${sweep_started:-unknown}); this dirtiness is transient. Wait for the sweep to finish." >&2
+    fi
     exit 1
 fi
 

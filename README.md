@@ -38,6 +38,9 @@ every commit.
 
 Run `tests/test-git-report.sh` to exercise the cache/key logic against throwaway repos.
 
+When `git report` refuses on a dirty tree it also says whether a `git mutate` sweep is in flight, since a
+sweep dirties the tree on purpose while a mutation is applied.
+
 # git mutate
 
 ```
