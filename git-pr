@@ -9,34 +9,43 @@
 #   git pr          Show existing PR* list
 #   git pr cleanup  Remove all checked out PR* branches
 # (* any branch starting with "pr-")
+#
+# Leaving the current branch first is what lets a pr- branch be refreshed or deleted at
+# all: git refuses to fetch into, or delete, the branch that is checked out.
 
 # determine if we are master or main
 default_branch=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
 
-git checkout $default_branch &> /dev/null
+git checkout "$default_branch" &> /dev/null
+
+# Branch names only, one per line, and no "*" marker for the current branch: that marker
+# word-splits into an argument of its own and then globs the working directory, so a file
+# named "pr-something" would be listed -- and passed to `git branch -D` -- as if it were a
+# branch.
+pr_branches() {
+    git for-each-ref --format='%(refname:short)' 'refs/heads/pr-*'
+}
 
 if [ "$1" = "" ]; then
-    for i in $(git branch | grep "pr-"); do
-        if [ "${i:0:3}" != "pr-" ]; then continue; fi
-        echo "  $i"
-    done
+    pr_branches | sed 's/^/  /'
     exit 0
 fi
 
 if [ "$1" = "cleanup" ]; then
-    for i in $(git branch | grep "pr-"); do
-        if [ "${i:0:3}" != "pr-" ]; then continue; fi
-        git branch -D $i
+    pr_branches | while IFS= read -r branch; do
+        git branch -D "$branch"
     done
     exit 0
 fi
 
 src=origin
-git remote | grep "upstream" &> /dev/null
-if [ $? -eq 0 ]; then src=upstream; fi
+if git remote | grep -q "^upstream$"; then src=upstream; fi
 
-git branch | grep "pr-$1" &> /dev/null
-if [ $? -eq 0 ]; then git branch -D "pr-$1"; fi
+# An exact ref lookup: grepping the branch list for "pr-5" also matches pr-50, and would
+# then delete a pr-5 that was never there while leaving the real branch alone.
+if git show-ref --verify --quiet "refs/heads/pr-$1"; then
+    git branch -D "pr-$1"
+fi
 
-git fetch $src pull/$1/head:pr-$1
-git checkout pr-$1
+git fetch "$src" "pull/$1/head:pr-$1"
+git checkout "pr-$1"
