@@ -6,14 +6,44 @@
 
 # Usage:
 #   git cleanup     Remove local branches that were merged upstream
+#
+# "Merged upstream" is taken literally: contained in origin's default branch. A branch you
+# merged locally but have not pushed is left alone, since nothing outside this repo has it
+# yet. To count local merges instead, point $base at "refs/heads/$default_branch".
+#
+# Deletion is by -D after an explicit ancestry check, not by -d. `git branch -d` measures
+# against HEAD (or the branch's own upstream), so run from a feature branch it refuses to
+# delete branches that really are upstream; the check below is the stronger one -- every
+# commit on the branch is already contained in $base, so only the label goes away.
 
-git branch | grep detached &> /dev/null
-if [ $? -eq 0 ]; then
-    echo "Checked out a detached branch. Please switch to an existing branch (not tag) first."
+# An exact check. `git branch | grep detached` reads git's English output and would also
+# fire on a branch merely named something like "detached-experiment".
+current=$(git symbolic-ref --short -q HEAD) || {
+    echo "git-cleanup: HEAD is detached. Please switch to a branch (not a tag) first." >&2
     exit 1
-fi
+}
 
 # determine if we are master or main
 default_branch=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
+if [ -z "$default_branch" ]; then
+    echo "git-cleanup: could not determine origin's default branch." >&2
+    exit 1
+fi
 
-git branch --merged | grep -v "$default_branch" | xargs -n 1 git branch -d
+base="refs/remotes/origin/$default_branch"
+if ! git show-ref --verify --quiet "$base"; then
+    echo "git-cleanup: no $base in this repository; fetch first. Refusing to guess what is upstream." >&2
+    exit 1
+fi
+
+# Branch names only, one per line. `git branch` marks the current branch with "*", which
+# word-splits into an argument of its own and reaches `git branch -d` as a literal "*".
+# The two exclusions are exact, whole-line matches: `grep -v "$default_branch"` is a
+# substring filter, so with a default branch of "main" it also spares "remain-fix".
+git for-each-ref --format='%(refname:short)' refs/heads |
+    grep -vxF -e "$default_branch" -e "$current" |
+    while IFS= read -r branch; do
+        if git merge-base --is-ancestor "$branch" "$base"; then
+            git branch -D "$branch"
+        fi
+    done
