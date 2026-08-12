@@ -560,6 +560,45 @@ EOF
     esac
 }
 
+# --- test 16: an untracked dependency file is keyed by its content, not its name ---
+
+test16() {
+    echo "test 16: editing an untracked file in a dependency busts the key"
+    local d="$WORK/t16" dep self counter marker
+    dep="$d/dep"; self="$d/self"; counter="$d/counter"; marker="$d/marker"
+    init_repo "$dep"
+    echo x > "$dep/d.txt"
+    printf 'ignored.txt\n' > "$dep/.gitignore"
+    commit_all "$dep" "dep init"
+
+    init_repo "$self"
+    make_fake_gate_config "$self" "$counter" "$marker"
+    printf '../dep\n' > "$self/.git-report-deps"
+    echo x > "$self/f.txt"
+    commit_all "$self" "self init"
+
+    run_report "$self" > /dev/null
+    assert_eq "baseline run invoked the gate once" "1" "$(counter_value "$counter")"
+
+    echo "state-A" > "$dep/untracked.py"
+    run_report "$self" > /dev/null
+    assert_eq "an untracked file appearing busts the key" "2" "$(counter_value "$counter")"
+
+    # The one that used to be missed: status prints the name, never the content, so this edit
+    # left the key untouched and replayed a report from before it.
+    echo "state-B-entirely-different" > "$dep/untracked.py"
+    run_report "$self" > /dev/null
+    assert_eq "editing that untracked file busts the key too" "3" "$(counter_value "$counter")"
+
+    run_report "$self" > /dev/null
+    assert_eq "the same untracked content again is a cache hit" "3" "$(counter_value "$counter")"
+
+    # And the bound on it: ignored files are not dirtiness, here or in git status.
+    echo "noise" > "$dep/ignored.txt"
+    run_report "$self" > /dev/null
+    assert_eq "an ignored file does not bust the key" "3" "$(counter_value "$counter")"
+}
+
 test1
 test2
 test3
@@ -575,6 +614,7 @@ test12
 test13
 test14
 test15
+test16
 
 echo
 echo "== behaviour -> test mapping =="
@@ -593,6 +633,7 @@ echo "12. a recorded entry carries the captured output ............. test12"
 echo "13. no capture for this tree is said plainly ................. test13"
 echo "14. no capture while a mutation sweep is in flight ........... test14"
 echo "15. the real wiring, end to end through pre-commit ........... test15"
+echo "16. untracked dependency content is keyed, not just its name . test16"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed"
 [ "$TESTS_FAILED" -eq 0 ]

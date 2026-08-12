@@ -31,11 +31,18 @@ renamed, so a reader hitting the same key mid-write sees either no entry or a wh
 **Dependency file:** a file named `.git-report-deps` at a repo's root, one relative repo path per line,
 blank lines and lines starting with `#` ignored. No file means no dependencies.
 
-**The key:** for each repo in `[dependencies..., self]`, hash `git diff HEAD` plus `git status --porcelain`
-(so a dirty repo is keyed by its actual diff content, not a boolean flag -- two different uncommitted states
-never collide, and a clean repo always collapses to the same canonical hash) alongside its `HEAD`. All of
-that, plus a hash of `git-report` itself, is hashed together into the final key. Both modes compute this
-identically.
+**The key:** for each repo in `[dependencies..., self]`, hash `git diff HEAD`, `git status --porcelain`, and
+the *contents* of its untracked files (`git ls-files --others --exclude-standard`, so an ignored file is
+still ignored) alongside its `HEAD`. A dirty repo is therefore keyed by its actual content, not by a boolean
+flag: two different uncommitted states never collide, and a clean repo always collapses to the same
+canonical hash. All of that, plus a hash of `git-report` itself, is hashed together into the final key. Both
+modes compute this identically.
+
+The untracked contents are load-bearing rather than thorough. `git diff HEAD` covers tracked changes only
+and `status --porcelain` prints an untracked file's *name* but never a byte of it, so editing an untracked
+module in a dependency used to leave the key unchanged and replay a report from before the edit. It costs
+one read per untracked file in a dependency, and nothing for the repo being reported on: a dirty own tree,
+untracked files included, is refused before the key is computed.
 
 **`--record`** writes an attestation (`gate passed at <hash>, recorded at commit time`) instead of running
 the gate -- meant to be called right after a commit succeeds, when the commit succeeding is already proof

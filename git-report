@@ -129,10 +129,19 @@ list_repos() {
 }
 
 # key = sha256( HEAD_1 diffhash_1 ... HEAD_n diffhash_n  sha256(this script) )
-# where diffhash_i = sha256( git diff HEAD ; git status --porcelain ) for repo i.
-# A dirty dependency is hashed by its actual diff content, not a boolean, so two
+# where diffhash_i = sha256( git diff HEAD ; git status --porcelain ; untracked contents )
+# for repo i. A dirty dependency is hashed by its actual content, not a boolean, so two
 # different work-in-progress states never share a key, and a clean tree collapses to
 # the canonical sha256("") with no special-casing.
+#
+# The untracked contents are load-bearing, not thoroughness: 'git diff HEAD' covers tracked
+# changes only and 'status --porcelain' prints an untracked file's *name* but never a byte of
+# it, so without them editing an untracked module in a dependency left the key unchanged and
+# replayed a report from before the edit. Measured, not theorised.
+#
+# --exclude-standard so an ignored file is still ignored, matching what status counts as
+# dirtiness. This costs one read per untracked file in a dependency, and nothing for this
+# repo: a dirty own tree, untracked files included, is refused before the key is computed.
 compute_key() {
     local root="$1"
     local repos_file repo head diffhash acc
@@ -150,7 +159,18 @@ compute_key() {
             rm -f "$repos_file"
             return 1
         }
-        diffhash=$( { git -C "$repo" diff HEAD; git -C "$repo" status --porcelain; } | sha256sum | cut -d' ' -f1)
+        diffhash=$( {
+            git -C "$repo" diff HEAD
+            git -C "$repo" status --porcelain
+            # NUL-delimited so an exotic filename cannot split a field. Sorted as well, which
+            # no test can pin -- git already emits these in order -- so that a change in its
+            # traversal order could not silently move the hash. A file that vanishes between
+            # the listing and the hashing is skipped rather than fatal: the worst that can do
+            # is miss the cache.
+            git -C "$repo" ls-files --others --exclude-standard -z |
+                sort -z |
+                (cd "$repo" && xargs -0 -r sha256sum -- 2>/dev/null)
+        } | sha256sum | cut -d' ' -f1)
         acc="$acc$head
 $diffhash
 "
