@@ -42,7 +42,8 @@
 #     0  every selected mutation was measured and killed by at least one assertion
 #     1  usage or environment error -- nothing was measured
 #     2  findings: a mutation reddened nothing, or was reddened only by errors
-#     3  not measured: a mutation was refused, timed out, or produced a line we cannot classify
+#     3  not measured: a mutation was refused, timed out, produced a line we cannot classify, or
+#        failed while matching nothing we can classify at all
 #     4  restore verification failed -- THE TREE MAY STILL BE MUTATED
 #   130  interrupted; the tree was restored
 # A survivor is a finding (2), never a tool failure -- conflating them would make the tool
@@ -769,9 +770,20 @@ echo
 baseline_ids="$work/baseline.ids"
 : > "$baseline_ids"
 run_test_cmd "$work/baseline.log"
+baseline_rc=$?
 py_classify "$work/baseline.log" > "$work/baseline.rows"
 if [ "$RUN_TIMEDOUT" -eq 1 ]; then
     die "the unmutated test command timed out after ${timeout_secs}s. Nothing can be measured; raise --timeout."
+fi
+# A failing baseline that matches no FAILED/ERROR line at all is not "no pre-existing
+# failures" -- it is a suite this classifier cannot read, and every mutation afterwards would
+# be scored against a measurement that was never real. Refuse before sweeping, the same way an
+# ambiguous or missing pytest hook refuses below.
+if [ "$baseline_rc" -ne 0 ] && [ ! -s "$work/baseline.rows" ]; then
+    die "the unmutated test command exited $baseline_rc but produced no line this classifier
+recognises as FAILED/ERROR ('$test_cmd'). The classifier is pytest-shaped: it cannot tell a
+real failure from another runner's output, so no mutation afterwards would be measurable.
+Pass a pytest-compatible command with --cmd."
 fi
 if grep -q '^E' "$work/baseline.rows"; then
     {
@@ -840,6 +852,7 @@ while IFS= read -r d; do
     done < "$plan/files"
 
     run_test_cmd "$work/log.$idx"
+    mut_rc=$?
     timed_out="$RUN_TIMEDOUT"
 
     # Restore before doing anything else with the result, so that even a bug in the
@@ -871,6 +884,17 @@ while IFS= read -r d; do
         echo "unclassifiable output -- not measured"
         echo "unclassified" > "$res.status"
         printf '%s line(s) matched FAILED/ERROR but carry no failure text we can classify' "$n_u" > "$res.note"
+    elif [ ! -s "$res.rows.all" ] && [ "$mut_rc" -ne 0 ]; then
+        # The command failed, so this is not a well-defended behaviour -- it is a suite this
+        # classifier cannot read. Reporting it as a survivor would be worse than an error: it
+        # reads as a real finding in the tool whose whole purpose is to prevent exactly that.
+        # Tested against the UNFILTERED classify output, not the baseline-excluded one: a
+        # mutation that only reddens an already-baseline-red test also exits non-zero, but the
+        # classifier read it fine -- the baseline filter emptying res.rows there is by design,
+        # not a sign of an unreadable format.
+        echo "test command exited $mut_rc but matched nothing -- not measured"
+        echo "unclassified" > "$res.status"
+        printf 'the test command exited %s but produced no FAILED/ERROR line this pytest-shaped classifier recognises; pass a pytest-compatible command with --cmd' "$mut_rc" > "$res.note"
     elif [ "$n_a" -eq 0 ] && [ "$n_e" -eq 0 ]; then
         echo "reddened nothing"
         echo "survived" > "$res.status"

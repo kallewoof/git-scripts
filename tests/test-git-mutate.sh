@@ -864,6 +864,107 @@ EOF
     git -C "$repo" checkout -- tests/test_mod.py
 }
 
+# --- the go-style fixture: a runner whose failures are real but not pytest-shaped --------
+#
+# `py_classify` only knows pytest's `FAILED`/`ERROR` summary lines. Any other runner's failure
+# text -- Go's `--- FAIL: TestAdd` here -- matches nothing at all, so this fixture pins that a
+# genuinely broken, genuinely failing suite is reported as "not measured", never as a survivor.
+make_go_fixture() {
+    local repo="$1"
+    init_repo "$repo"
+
+    cat > "$repo/.gitignore" <<'EOF'
+__pycache__/
+EOF
+
+    cat > "$repo/mod.py" <<'EOF'
+def add(a, b):
+    return a + b
+
+
+def unused():
+    return 1
+EOF
+
+    # -B: no .pyc is ever written. Without it, a mutation two edits later can reuse a stale
+    # cached bytecode from an earlier mutation whose source happened to match on mtime and
+    # size (same-second writes, same-length text) -- a real trap, not hypothetical here, since
+    # "return 1" and "return 2" are the same length.
+    cat > "$repo/runner.sh" <<'EOF'
+#!/bin/bash
+python3 -B -c "import mod; assert mod.add(2, 3) == 5" \
+    && { echo "--- PASS: TestAdd"; exit 0; } \
+    || { echo "--- FAIL: TestAdd"; exit 1; }
+EOF
+    chmod +x "$repo/runner.sh"
+
+    commit_all "$repo" "go-style fixture"
+}
+
+write_go_mutations() {
+    cat > "$1" <<'EOF'
+[[mutation]]
+name = "break-add"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return a + b'''
+new = '''    return a - b'''
+
+[[mutation]]
+name = "touch-unused"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return 1'''
+new = '''    return 2'''
+EOF
+}
+
+# --- test 14: a failing-but-unparseable run is not measured, never a survivor -------------
+
+test14() {
+    echo "test 14: a genuinely-failing, unparseable run is 'not measured', never 'reddened nothing'"
+    local d="$WORK/t14" repo="$WORK/t14/repo"
+    mkdir -p "$d"
+    make_go_fixture "$repo"
+    write_go_mutations "$d/mutations.toml"
+
+    mutate "$repo" --cmd "$repo/runner.sh" "$d/mutations.toml"
+
+    assert_contains "a mutation that genuinely breaks the code and fails is NOT MEASURED" \
+        "break-add: NOT MEASURED --"
+    assert_missing "it is never reported as a well-defended survivor" \
+        "break-add: reddened nothing"
+    assert_contains "the pin proves it -- a mutation the runner never exercises IS a survivor" \
+        "touch-unused: reddened nothing."
+    assert_status "unclassified beats a plain finding: exit 3, not 2" 3
+    assert_contains "counts are reported per behaviour" \
+        "0 killed by assertion, 1 finding(s), 1 not measured."
+    assert_clean_tree "$repo" "the tree is clean after a run with an unclassifiable failure"
+    assert_no_sweep_state "$repo" "no lock or marker survives a run with an unclassifiable failure"
+}
+
+# --- test 15: a baseline that fails unreadably refuses to sweep at all --------------------
+
+test15() {
+    echo "test 15: an unreadable failing baseline refuses to sweep, naming the command and --cmd"
+    local d="$WORK/t15" repo="$WORK/t15/repo"
+    mkdir -p "$d"
+    make_go_fixture "$repo"
+    # Break add() before any mutation runs: the unmutated tree already fails the runner's
+    # check, in the same unparseable Go-style shape.
+    sed -i 's/    return a + b/    return a - b/' "$repo/mod.py"
+    commit_all "$repo" "pre-broken baseline"
+    write_go_mutations "$d/mutations.toml"
+
+    mutate "$repo" --cmd "$repo/runner.sh" "$d/mutations.toml"
+
+    assert_status "an unreadable failing baseline refuses (exit 1), it does not sweep" 1
+    assert_contains "the refusal names the command" "$repo/runner.sh"
+    assert_contains "the refusal points at --cmd" "--cmd"
+    assert_contains "the refusal explains the classifier is pytest-shaped" "pytest-shaped"
+    assert_no_sweep_state "$repo" "a refused baseline leaves no lock or marker"
+}
+
 # --- test 13: exit status distinguishes clean, finding and not-measured -------------------
 
 test13() {
@@ -901,6 +1002,8 @@ test10
 test11
 test12
 test13
+test14
+test15
 
 echo
 echo "== behaviour -> test mapping =="
@@ -917,6 +1020,8 @@ echo "10. --check guards without mutating or running tests .............. test10
 echo "11. the test command is the gate's own pytest hook, minus coverage . test11"
 echo "12. an already-red test is excluded; an erroring suite refuses .... test12"
 echo "13. exit status separates clean, finding and broken measurement ... test13"
+echo "14. a failing, unparseable run is 'not measured', never a survivor . test14"
+echo "15. an unreadable failing baseline refuses to sweep, naming --cmd .. test15"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
 [ "$TESTS_FAILED" -eq 0 ]
