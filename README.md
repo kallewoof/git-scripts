@@ -166,7 +166,10 @@ four settings above.
 **A baseline run comes first.** If the unmutated suite errors, the sweep refuses: nothing is measurable when
 the suite does not even import, since every mutation would look like a kill. If the unmutated suite merely
 has failing tests, they are named loudly and excluded from every mutation's kills -- a test already red
-cannot be a kill.
+cannot be a kill. And if the unmutated suite exits non-zero while matching no line the classifier
+recognises at all, the sweep refuses too, naming the command and pointing at `--cmd`: that is not "no
+pre-existing failures", it is a suite this pytest-shaped classifier cannot read, and every mutation
+afterwards would be unmeasurable.
 
 ## The tree, and saying so
 
@@ -203,7 +206,7 @@ mutation reddened 3, all by NameError"* invite thought.
 | 0 | every selected mutation was measured and killed by at least one assertion |
 | 1 | usage or environment error -- nothing was measured |
 | 2 | **findings**: a mutation reddened nothing, or was reddened only by errors |
-| 3 | **not measured**: a mutation was refused, timed out, or produced an unclassifiable line |
+| 3 | **not measured**: a mutation was refused, timed out, produced an unclassifiable line, or failed while matching nothing the classifier recognises at all |
 | 4 | restore verification failed -- the tree may still be mutated |
 | 130 | interrupted; the tree was restored |
 
