@@ -965,6 +965,86 @@ test15() {
     assert_no_sweep_state "$repo" "a refused baseline leaves no lock or marker"
 }
 
+# --- test 16: the help text teaches the format, and teaches it correctly -------------------
+#
+# A worker went looking for README.md to learn the TOML schema, because `-h` did not carry
+# it. The help now does -- and a documented example that the tool's own guards would refuse
+# is worse than no example, so the test does not eyeball the text: it extracts the example
+# out of the help, builds the file that example names, and puts it through --check.
+
+test16() {
+    echo "test 16: -h carries the mutations-file format, and the example it shows is real"
+    local d="$WORK/t16" repo="$WORK/t16/repo"
+    mkdir -p "$d"
+    init_repo "$repo"
+
+    "$SCRIPT" -h > "$d/help.txt" 2>"$d/help.err"
+    assert_eq "-h exits 0" 0 "$?"
+    OUT=$(cat "$d/help.err")
+    assert_eq "-h writes the help to stdout, not stderr" "" "$OUT"
+
+    OUT=$(cat "$d/help.txt")
+    assert_contains "the help names the top-level table" "[[mutation]]"
+    assert_contains "the help names the edit table" "[[mutation.edit]]"
+    assert_contains "the help says the file is TOML" "TOML"
+    assert_contains "the help documents the uniqueness guard" "exactly once"
+    assert_contains "the help documents the prose-anchor refusal" "docstring"
+    assert_contains "the help says the file is scratch, not committed" ".gitignore"
+
+    # Pull the first [[mutation]] block out of the help and dedent it -- whatever it says
+    # today -- then build the tree it describes: each file it names, holding exactly the
+    # anchors it declares. The fixture is derived from the documentation, so it cannot be a
+    # second copy of it that drifts.
+    if ! python3 - "$d/help.txt" "$d/example.toml" "$repo" <<'PY'
+import os
+import sys
+import tomllib
+
+help_txt, out, root = sys.argv[1], sys.argv[2], sys.argv[3]
+
+lines = open(help_txt, encoding="utf-8").read().splitlines()
+start = next(i for i, l in enumerate(lines) if l.strip() == "[[mutation]]")
+end = start
+while end < len(lines) and lines[end].strip():
+    end += 1
+block = "\n".join(l[2:] if l.startswith("  ") else l for l in lines[start:end]) + "\n"
+with open(out, "w", encoding="utf-8") as fh:
+    fh.write(block)
+
+doc = tomllib.loads(block)                       # the example must be valid TOML at all
+mut = doc["mutation"][0]
+assert isinstance(mut.get("name"), str) and mut["name"], "the example has no name"
+
+files = {}
+for edit in mut["edit"]:                         # ...carrying every key the parser requires
+    for key in ("file", "old", "new"):
+        assert isinstance(edit.get(key), str), "the example edit has no string %r" % key
+    files.setdefault(edit["file"], []).append(edit["old"])
+
+for rel, anchors in files.items():               # each anchor, once, and nothing else
+    path = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(path) or root, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n\n".join(anchors) + "\n")
+PY
+    then
+        fail "the example in -h is not a parseable mutations file"
+        return 0
+    fi
+    ok "the example in -h is valid TOML with name, file, old and new"
+    commit_all "$repo" "the files the help's example names"
+
+    mutate "$repo" --check "$d/example.toml"
+    assert_status "the example passes every guard the tool actually enforces" 0
+    assert_contains "and --check confirms it names a real, unique, in-code anchor" \
+        "every anchor is unique, in code, and changes the file."
+
+    OUT=$("$SCRIPT" --check 2>&1); ST=$?
+    assert_status "a usage error still prints the terse usage, not the whole manual" 1
+    assert_contains "and the terse usage points at -h for the format" "git mutate -h"
+    assert_missing "the terse usage does not inline the schema" "[[mutation.edit]]"
+}
+
 # --- test 13: exit status distinguishes clean, finding and not-measured -------------------
 
 test13() {
@@ -1004,6 +1084,7 @@ test12
 test13
 test14
 test15
+test16
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1022,6 +1103,7 @@ echo "12. an already-red test is excluded; an erroring suite refuses .... test12
 echo "13. exit status separates clean, finding and broken measurement ... test13"
 echo "14. a failing, unparseable run is 'not measured', never a survivor . test14"
 echo "15. an unreadable failing baseline refuses to sweep, naming --cmd .. test15"
+echo "16. -h teaches the file format, and its example passes the guards . test16"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
 [ "$TESTS_FAILED" -eq 0 ]

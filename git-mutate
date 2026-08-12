@@ -65,6 +65,10 @@ DEFAULT_TIMEOUT=900
 #                   loud means a repo's own -r setting cannot take the summary away.
 #   COLUMNS/NO_COLOR are set in the child environment, see run_test_cmd.
 
+# Two texts, on purpose. usage() is the terse reminder printed beside an error, on stderr.
+# help_text() is the whole interface, on stdout, and it carries the mutations-file format:
+# a caller that has to go and find a README to learn the TOML schema will instead guess it,
+# and the tool's own help is the only copy that cannot be installed without it.
 usage() {
     cat >&2 <<'EOF'
 Usage:
@@ -74,6 +78,80 @@ Usage:
 
   --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
   --timeout <seconds>     Per-mutation timeout (default 900).
+
+For the mutations-file format, and what each guard refuses: git mutate -h
+EOF
+}
+
+help_text() {
+    cat <<'EOF'
+git mutate -- break the code on purpose, and report whether the tests noticed.
+
+For each mutation: guard it, snapshot the files it touches, apply it, run the test command,
+restore the tree, and classify every failing test as an assertion kill (a test checks this
+behaviour) or an error kill (the mutation merely broke the code, proving nothing).
+
+Usage:
+  git mutate <mutations-file> [name...]   Run every mutation, or only the named ones.
+  git mutate --check <mutations-file>     Run the guards only: mutate nothing, run no tests.
+  git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
+
+  --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
+  --timeout <seconds>     Per-mutation timeout (default 900).
+
+THE MUTATIONS FILE is TOML. A mutation is a name plus a list of edits; 'name', 'file', 'old'
+and 'new' are all required, and the [name...] argument above selects by that 'name':
+
+  [[mutation]]
+  name = "history-never-sent"
+  [[mutation.edit]]
+  file = "src/autorp/claims.py"
+  old = '''        "history": _history_anchor(played),'''
+  new = '''        "history": [],'''
+
+'file' is relative to the repo root. Anchors are matched byte-for-byte against the file's
+bytes: write them as literal ''' strings, so nothing needs escaping and the leading
+indentation is part of the anchor. TOML drops a newline immediately after the opening ''',
+which is what lets a multi-line anchor start on its own line:
+
+  old = '''
+        if not allowed:
+            raise PermissionError(name)'''
+
+A mutation may list several [[mutation.edit]] tables. That is how a two-part change -- add
+something here, drain it there -- stays one mutation, applied and reported as one.
+
+THE GUARDS. Each refuses that one mutation loudly, names the offending edit, and lets the
+rest of the sweep run. A refusal is "not measured", never a survivor:
+  - every edit's 'old' must occur exactly once in its file, with no privileged first edit
+  - 'new' must differ from 'old'
+  - once every edit is applied, the file must actually differ from the tree
+  - an anchor sitting in a '#' comment, or inside a Python docstring, is refused: mutating
+    prose reddens nothing, and would report a defended behaviour as undefended
+
+Run 'git mutate --check <file>' to put a file through every guard in seconds, running no
+tests and touching nothing.
+
+THE FILE IS SCRATCH. Pass it in for one invocation; it belongs in .gitignore, never in a
+commit. Anchors are coupled to the code's current text while tests are coupled to its
+behaviour, so a kept mutations file rots -- and the dangerous rot is not the anchor that
+stops matching, it is the one that comes to match a comment.
+
+RUN IT UNPIPED. A sweep is slow -- one full test run per mutation, plus a baseline -- and it
+prints one line per mutation as that mutation finishes, so an unpiped run is a live progress
+report. A grep/head filter blocks until the sweep ends, making a run that is stuck, timing
+out or refusing every anchor look exactly like one that is working. 'head' is worse: it can
+SIGPIPE the sweep mid-mutation, the one way to leave a tree needing --recover.
+
+Exit status (precedence when several apply: 4 > 3 > 2):
+    0  every selected mutation was measured and killed by at least one assertion
+    1  usage or environment error -- nothing was measured
+    2  findings: a mutation reddened nothing, or was reddened only by errors
+    3  not measured: a mutation was refused, timed out, or produced test output this
+       pytest-shaped classifier cannot read
+    4  restore verification failed -- THE TREE MAY STILL BE MUTATED
+  130  interrupted; the tree was restored
+A survivor is a finding (2), never a tool failure.
 EOF
 }
 
@@ -99,7 +177,7 @@ while [ $# -gt 0 ]; do
         --timeout)
             [ $# -ge 2 ] || { echo "$SELF: --timeout needs an argument" >&2; usage; exit 1; }
             timeout_secs="$2"; shift 2 ;;
-        -h|--help) usage; exit 0 ;;
+        -h|--help) help_text; exit 0 ;;
         -*) echo "$SELF: unknown option '$1'" >&2; usage; exit 1 ;;
         *)
             if [ -z "$mutations_file" ]; then

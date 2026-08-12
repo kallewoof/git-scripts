@@ -127,6 +127,12 @@ git mutate --recover                    # restore from a stale sweep's snapshot;
   --timeout <seconds>     per-mutation timeout (default 900)
 ```
 
+`git mutate -h` is self-contained: it carries the mutations-file format with a worked example, what each
+guard refuses, and the exit statuses. Nothing below is needed to author a mutations file — this section is
+the *why*, and a worker who has to come here for the *what* has already been given the wrong interface. The
+example the help prints is extracted and run through the real guards by `tests/test-git-mutate.sh`, so it
+cannot document a mutation the tool would refuse.
+
 **Run it unpiped.** A sweep is slow — one full test run per mutation, plus a baseline — and it prints one
 line per mutation as that mutation finishes, so an unpiped run is a live progress report. Filtering it
 through `grep`/`head` buys nothing: the sweep is not spammy (three header lines, one line per mutation, then
