@@ -6,6 +6,8 @@ Some useful `git-`scripts.
 ```
 git report            # cache hit -> print it; miss -> run the gate (pre-commit), cache on success, print
 git report --record   # attest only: write the entry for the current key, run nothing
+git report --capture [--] <cmd> [args...]
+                      # run <cmd> transparently, leaving its output for --record to fold in
 ```
 
 A cached, dependency-aware report of whether a repo's `pre-commit` gate passes. The cache key covers this
@@ -35,11 +37,65 @@ never collide, and a clean repo always collapses to the same canonical hash) alo
 that, plus a hash of `git-report` itself, is hashed together into the final key. Both modes compute this
 identically.
 
-**`--record`** writes a synthesized attestation (`gate passed at <hash>, recorded at commit time`) instead
-of running the gate -- meant to be called right after a commit succeeds, when the commit succeeding is
-already proof the gate passed. It refuses on a dirty own tree, same as the default mode: `pre-commit`
-validates only the staged state, so unstaged changes surviving the commit mean the tree isn't what was
-validated.
+**`--record`** writes an attestation (`gate passed at <hash>, recorded at commit time`) instead of running
+the gate -- meant to be called right after a commit succeeds, when the commit succeeding is already proof
+the gate passed. It refuses on a dirty own tree, same as the default mode: `pre-commit` validates only the
+staged state, so unstaged changes surviving the commit mean the tree isn't what was validated.
+
+## `--capture`: making a recorded entry carry the gate's numbers
+
+A recorded entry is the entry a worker meets most often -- they start on a clean tree at the recorded
+`HEAD`, hit the cache, and get whatever is in it. An attestation alone gives them a colour where a number
+was needed: a baseline is *"how many tests before I started"*, and its whole point is to catch a test
+silently disappearing, which `Passed` cannot show. A worker once re-ran a full suite under `pytest` purely
+to recover the `3196 passed` the gate had already computed and thrown away.
+
+`--record` cannot see that number by itself: it runs as a *post-commit* hook, so its sibling hooks' output
+is long gone. So the gate's own test hook hands it over. **The per-repo change is one line** -- prefix the
+existing entry, and change nothing else about the hook:
+
+```yaml
+      - id: pytest-cov-floor
+        name: pytest -m "not slow" + coverage floor
+        entry: git report --capture -- pytest -m "not slow" --cov=src/terea --cov-fail-under=63
+```
+
+`--capture` runs the command, passes its stdout through untouched, exits with the command's own status, and
+leaves a copy at `.git/info/git-report/pending`. `--record` folds that copy into the entry it writes, under
+the attestation line, so every cache hit afterwards carries the suite's numbers. Nothing else in the hook
+changes, and the same one line is the whole change in every repo. Also add `verbose: true` to that hook if
+it isn't there already, for the *un*cached path: `pre-commit` discards a passing hook's stdout, so without
+it a fresh `git report` prints `Passed` and throws the same number away.
+
+**A capture is stamped with the tree it ran against** (`git write-tree` at pre-commit time is exactly the
+tree the new commit will carry, since `pre-commit` stashes everything unstaged), and `--record` uses it only
+if the stamp matches the commit it is attesting. This is load-bearing rather than belt-and-braces: a hook
+with `types_or: [python]` is *skipped* on a docs-only commit, so without the stamp such a commit would
+inherit an earlier commit's numbers as if they were its own. The copy is deleted once read, matched or not.
+
+**When no capture matches, the entry says so** and names the one-line remedy, rather than leaving the
+reader to wonder whether the gate had nothing to say:
+
+```
+gate passed at c9ce6a68..., recorded at commit time
+
+this entry carries no gate output: no run was captured for this commit tree.
+Either this repo's test hook is not wired for capture (see README.md), or it
+was skipped because the commit touched no files it selects. For a report with
+numbers now:
+    rm '/path/to/.git/info/git-report/<key>' && git report
+```
+
+That is also what an unwired repo gets: the honest sentence, never a number belonging to something else.
+
+**`--capture` never refuses and never fails a commit.** Every step of setting the capture up may fail into
+a plain `exec "$@"`, which leaves nothing at all between the caller and the command. Two details are
+deliberate rather than incidental: only stdout is teed (merging `stderr` would reorder the command's two
+streams and drag unrelated noise into the entry), and it is a foreground pipeline rather than a process
+substitution around an `exec`, because procsub leaves the copy being written by a process nobody waits for
+-- so output can surface *after* the wrapper exits and a caller reading its log the moment the wrapper
+returns can read a truncated one. `git mutate` is exactly such a caller. During a sweep `--capture` writes
+nothing and `exec`s, since a mutated run's output is not a report of this tree.
 
 **Wiring `--record` into a commit:** add a hook to `.pre-commit-config.yaml` with `stages: [post-commit]`,
 `always_run: true`, `pass_filenames: false`, and `entry: git report --record`, then run `pre-commit install

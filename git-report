@@ -10,6 +10,11 @@
 #   git report --record   Write a cache entry attesting that the gate passed, without
 #                         running anything. Meant to be called from a pre-commit
 #                         post-commit stage, right after a commit succeeds.
+#   git report --capture [--] <cmd> [args...]
+#                         Run <cmd>, pass its output through untouched, exit with its status,
+#                         and leave a copy where --record can find it. Meant to prefix the
+#                         gate's own pytest hook entry, so that a recorded entry carries the
+#                         suite's numbers instead of only a colour. See README.md.
 #
 # A cache hit says so, on its first line, naming when the entry was produced and at which
 # HEAD. Above the content, never below: a note under a wall of output is read after the
@@ -32,6 +37,8 @@ Usage:
   git report            Print a cached report; run the gate on a cache miss. A hit says it
                         is a hit, on the line above the content.
   git report --record   Attest that the gate passed for the current key; runs nothing.
+  git report --capture [--] <cmd> [args...]
+                        Run <cmd> transparently and leave its output for --record.
 EOF
 }
 
@@ -39,6 +46,11 @@ mode="report"
 case "${1:-}" in
     "") ;;
     --record) mode="record" ;;
+    --capture)
+        mode="capture"; shift
+        [ "${1:-}" = "--" ] && shift
+        [ "$#" -gt 0 ] || { usage; exit 2; }
+        ;;
     *) usage; exit 2 ;;
 esac
 
@@ -46,6 +58,53 @@ self_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
     echo "git-report: not inside a git repository" >&2
     exit 1
 }
+
+cache_dir="$self_root/.git/info/git-report"
+
+# Where --capture leaves a run for --record to pick up. A key is 64 hex characters, so the
+# literal name cannot collide with one.
+pending="$cache_dir/pending"
+
+# A 'git mutate' sweep dirties the tree on purpose while a mutation is applied. Two places
+# care: the dirty-tree refusal below says so instead of implying the repo is broken, and
+# --capture writes nothing while it exists, because a mutated run's output is not a report of
+# this tree.
+sweep_lock="$(git -C "$self_root" rev-parse --absolute-git-dir)/git-mutate.lock"
+
+# --capture is a wrapper around the gate's own test command, and its first duty is to be
+# invisible: it must never refuse, never fail a commit, and never alter what the command
+# printed or what it exited with. So every step of setting the capture up is allowed to fail,
+# into a plain 'exec "$@"' that leaves nothing between the caller and the command at all.
+#
+# Only stdout is teed. Merging stderr into it would reorder a command's two streams and drag
+# unrelated noise into the cache entry; a pytest summary is on stdout.
+#
+# 'tee', not a process substitution around an exec'd command: procsub leaves the copy being
+# written by a process nobody waits for, so the command's output can surface *after* the
+# wrapper has exited, and a caller that reads its log the moment the wrapper returns can read
+# a truncated one. 'git mutate' is exactly such a caller. A foreground pipeline plus
+# PIPESTATUS is ordered, complete on exit, and still exits with the command's own status.
+#
+# During a sweep it captures nothing and exec's, because a mutated run's output is not a
+# report of this tree -- which also keeps the sweep's own path free of the pipeline, so
+# 'git mutate --timeout' signals a process group holding nothing but the test command.
+#
+# The tree stamp is what makes the handshake exact. At pre-commit time the index is what will
+# be committed (pre-commit stashes everything unstaged), so 'write-tree' is the tree the new
+# commit will carry, and --record only uses a capture whose stamp matches the commit it is
+# attesting. Without it, a commit that skipped the pytest hook -- 'types_or: [python]' skips
+# it for a docs-only commit -- would inherit an earlier commit's numbers as if they were its
+# own.
+if [ "$mode" = "capture" ]; then
+    if [ -d "$sweep_lock" ] ||
+       ! tree=$(git -C "$self_root" write-tree 2>/dev/null) ||
+       ! mkdir -p "$cache_dir" 2>/dev/null ||
+       ! printf 'tree=%s\n' "$tree" > "$pending" 2>/dev/null; then
+        exec "$@"
+    fi
+    "$@" | tee -a -- "$pending"
+    exit "${PIPESTATUS[0]}"
+fi
 
 # Lists the repos that make up this key, in fixed order: declared dependencies (in
 # the order they appear in the dependency file), then this repo itself, last.
@@ -111,9 +170,8 @@ if [ -n "$(git -C "$self_root" status --porcelain)" ]; then
     else
         echo "git-report: '$self_root' has a dirty working tree; a report must reflect a clean, committed state." >&2
     fi
-    # A 'git mutate' sweep dirties the tree on purpose while a mutation is applied. Saying so
-    # is the difference between "this repo is broken" and "a measurement is in flight".
-    sweep_lock="$(git -C "$self_root" rev-parse --absolute-git-dir)/git-mutate.lock"
+    # Naming the sweep is the difference between "this repo is broken" and "a measurement is
+    # in flight".
     if [ -d "$sweep_lock" ]; then
         sweep_pid=$(sed -n 's/^pid=//p' "$sweep_lock/info" 2>/dev/null)
         sweep_started=$(sed -n 's/^started=//p' "$sweep_lock/info" 2>/dev/null)
@@ -124,7 +182,6 @@ fi
 
 key=$(compute_key "$self_root") || exit 1
 
-cache_dir="$self_root/.git/info/git-report"
 entry="$cache_dir/$key"
 
 # Every entry starts with a header line naming when it was produced and at which HEAD; the
@@ -151,9 +208,34 @@ write_entry() {
     mv "$tmp_entry" "$entry"
 }
 
+# --record runs as a post-commit hook, so it never sees its sibling hooks' output: it knows
+# the gate passed and nothing else. That attestation is also the entry a worker meets most
+# often -- clean tree at the recorded HEAD, straight into a cache hit -- so an entry with no
+# content in it hands them a colour where a number was needed.
+#
+# So it folds in whatever --capture left for this commit's tree, and keeps the attestation
+# line itself, which is the thing that stops a post-commit report from re-running the gate.
+# When no capture matches, it says that plainly rather than leaving the reader to wonder
+# whether the gate simply has nothing to say.
 if [ "$mode" = "record" ]; then
     self_head=$(git -C "$self_root" rev-parse HEAD)
-    printf 'gate passed at %s, recorded at commit time\n' "$self_head" | write_entry
+    {
+        printf 'gate passed at %s, recorded at commit time\n' "$self_head"
+        echo
+        if [ "$(sed -n '1s/^tree=//p' "$pending" 2>/dev/null)" = "$(git -C "$self_root" rev-parse "HEAD^{tree}")" ]; then
+            printf -- "--- the gate's own output for this tree, captured at pre-commit time ---\n"
+            tail -n +2 "$pending"
+        else
+            printf 'this entry carries no gate output: no run was captured for this commit tree.\n'
+            printf "Either this repo's test hook is not wired for capture (see README.md), or it\n"
+            printf 'was skipped because the commit touched no files it selects. For a report with\n'
+            printf 'numbers now:\n'
+            printf "    rm '%s' && git report\n" "$entry"
+        fi
+    } | write_entry
+    # Consumed either way: a capture that did not match this tree will not match a later one
+    # either, and leaving it would offer the next commit an older commit's numbers.
+    rm -f "$pending"
     exit 0
 fi
 
