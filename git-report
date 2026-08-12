@@ -11,6 +11,10 @@
 #                         running anything. Meant to be called from a pre-commit
 #                         post-commit stage, right after a commit succeeds.
 #
+# A cache hit says so, on its first line, naming when the entry was produced and at which
+# HEAD. Above the content, never below: a note under a wall of output is read after the
+# reader has already believed the numbers were fresh.
+#
 # The cache key spans this repo and its declared dependencies (see below), not just
 # this repo's HEAD: in a stack of editable-installed repos, a dependency's commit can
 # change what this repo's tests do even though this repo's own HEAD hasn't moved. See
@@ -25,7 +29,8 @@ DEPS_FILE=".git-report-deps"
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  git report            Print a cached report; run the gate on a cache miss.
+  git report            Print a cached report; run the gate on a cache miss. A hit says it
+                        is a hit, on the line above the content.
   git report --record   Attest that the gate passed for the current key; runs nothing.
 EOF
 }
@@ -122,15 +127,43 @@ key=$(compute_key "$self_root") || exit 1
 cache_dir="$self_root/.git/info/git-report"
 entry="$cache_dir/$key"
 
+# Every entry starts with a header line naming when it was produced and at which HEAD; the
+# report itself is everything after it. That is what lets a hit say it is a hit instead of
+# passing off an old run as a fresh one. Body on stdin.
+#
+# Written to a temp file in the cache directory and renamed, so a reader hitting the same
+# key mid-write sees either no entry or a whole one, never a truncated report.
+#
+# No reader-side fallback for a missing header, because there cannot be one: the key hashes
+# this script (see compute_key), so no entry written by a version without the header is ever
+# looked up again. tests/test-git-report.sh test8 pins that.
+CACHE_HEADER="git-report-cache"
+
+write_entry() {
+    local tmp_entry
+    mkdir -p "$cache_dir" || return 1
+    tmp_entry=$(mktemp "$cache_dir/.new.XXXXXX") || return 1
+    {
+        printf '%s at=%s head=%s\n' "$CACHE_HEADER" \
+            "$(date -Is 2>/dev/null || date)" "$(git -C "$self_root" rev-parse HEAD)"
+        cat
+    } > "$tmp_entry" || { rm -f "$tmp_entry"; return 1; }
+    mv "$tmp_entry" "$entry"
+}
+
 if [ "$mode" = "record" ]; then
-    mkdir -p "$cache_dir"
     self_head=$(git -C "$self_root" rev-parse HEAD)
-    printf 'gate passed at %s, recorded at commit time\n' "$self_head" > "$entry"
+    printf 'gate passed at %s, recorded at commit time\n' "$self_head" | write_entry
     exit 0
 fi
 
 if [ -f "$entry" ]; then
-    cat "$entry"
+    # The notice goes to stdout, not stderr: it is part of the report, and its position
+    # relative to the content is only meaningful -- and only pinnable -- in one stream.
+    IFS=' ' read -r _marker at_field head_field < "$entry"
+    printf 'git-report: btw, this report is cached -- produced at %s for HEAD %s, and replayed because nothing in the key has changed since. Nothing was re-run.\n' \
+        "${at_field#at=}" "${head_field#head=}"
+    tail -n +2 "$entry"
     exit 0
 fi
 
@@ -144,15 +177,14 @@ if ! command -v pre-commit >/dev/null 2>&1; then
 fi
 
 tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
 (cd "$self_root" && pre-commit run --all-files --hook-stage pre-commit) > "$tmp" 2>&1
 status=$?
 
 cat "$tmp"
 
 if [ "$status" -eq 0 ]; then
-    mkdir -p "$cache_dir"
-    cp "$tmp" "$entry"
+    write_entry < "$tmp"
 fi
 
-rm -f "$tmp"
 exit "$status"

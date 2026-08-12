@@ -77,6 +77,11 @@ run_report() {
     (cd "$repo" && "$SCRIPT" "$@")
 }
 
+# A cache hit's report is everything after its first line, which is the cached-notice.
+body_after_notice() {
+    printf '%s\n' "$1" | tail -n +2
+}
+
 # --- test 1: clean run caches; second run is a hit and executes no gate -----------
 
 test1() {
@@ -96,7 +101,8 @@ test1() {
     out2=$(run_report "$repo"); status2=$?
     assert_eq "second run exits 0" "0" "$status2"
     assert_eq "second run is a hit (counter unchanged)" "1" "$(counter_value "$counter")"
-    assert_eq "hit prints the same report the miss cached" "$out1" "$out2"
+    assert_eq "hit replays the report the miss cached, below its notice" \
+        "$out1" "$(body_after_notice "$out2")"
 }
 
 # --- test 2: a commit in self busts the key ----------------------------------------
@@ -311,6 +317,46 @@ test9() {
     assert_eq "gate was never invoked" "0" "$(counter_value "$counter")"
 }
 
+# --- test 10: a hit says it is cached, above the content; a fresh run says nothing ---
+
+test10() {
+    echo "test 10: a cache hit says so above the content; a fresh run says nothing"
+    local d="$WORK/t10" repo counter marker
+    repo="$d/self"; counter="$d/counter"; marker="$d/marker"
+    init_repo "$repo"
+    make_fake_gate_config "$repo" "$counter" "$marker"
+    echo x > "$repo/f.txt"
+    commit_all "$repo" init
+
+    local head fresh cached first
+    head=$(git -C "$repo" rev-parse HEAD)
+
+    # Both halves matter: without the fresh run, a notice that always fires would pass.
+    fresh=$(run_report "$repo")
+    case "$fresh" in
+        *"this report is cached"*) fail "a fresh run prints no cached-notice" ;;
+        *) ok "a fresh run prints no cached-notice" ;;
+    esac
+
+    cached=$(run_report "$repo")
+    first=$(printf '%s\n' "$cached" | head -n 1)
+    case "$first" in
+        *"this report is cached"*) ok "the notice is the hit's first line, above the content" ;;
+        *) fail "the notice is the hit's first line, above the content (line 1 was: $first)" ;;
+    esac
+    case "$first" in
+        *"$head"*) ok "the notice names the HEAD the entry was produced at" ;;
+        *) fail "the notice names the HEAD the entry was produced at (got: $first)" ;;
+    esac
+    case "$first" in
+        *"produced at "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*)
+            ok "the notice names when the entry was produced" ;;
+        *) fail "the notice names when the entry was produced (got: $first)" ;;
+    esac
+    assert_eq "the content below the notice is the report the miss printed" \
+        "$fresh" "$(body_after_notice "$cached")"
+}
+
 test1
 test2
 test3
@@ -320,6 +366,7 @@ test6
 test7
 test8
 test9
+test10
 
 echo
 echo "== behaviour -> test mapping =="
@@ -332,6 +379,7 @@ echo "6. --record writes an entry and runs nothing ............... test6"
 echo "7. failing gate caches nothing .............................. test7"
 echo "8. changing git-report itself busts the key ................. test8"
 echo "9. a dirty tree from a git mutate sweep is named as such .... test9"
+echo "10. a hit says it is cached, above the content ............... test10"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed"
 [ "$TESTS_FAILED" -eq 0 ]

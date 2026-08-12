@@ -13,6 +13,19 @@ repo and any repos it declares as dependencies, not just this repo's `HEAD` -- u
 installed/linked against each other so that a dependency's commit changes this repo's behaviour without
 moving this repo's own `HEAD`.
 
+**A cache hit says it is one**, on its first line, naming when the entry was produced and at which `HEAD`:
+
+```
+git-report: btw, this report is cached -- produced at 2026-08-12T16:14:02+09:00 for HEAD c9ce6a68..., and replayed because nothing in the key has changed since. Nothing was re-run.
+```
+
+*Above* the content, never below: a note under a wall of output is read after the reader has already
+believed the numbers are fresh. It goes to stdout along with the report rather than to stderr, because
+its position relative to the content is the whole point of it. Every entry therefore begins with a
+`git-report-cache at=... head=...` header line, and the report is everything after that line -- a hit
+prints the notice, then that body. Entries are written to a temp file in the cache directory and
+renamed, so a reader hitting the same key mid-write sees either no entry or a whole one.
+
 **Dependency file:** a file named `.git-report-deps` at a repo's root, one relative repo path per line,
 blank lines and lines starting with `#` ignored. No file means no dependencies.
 
