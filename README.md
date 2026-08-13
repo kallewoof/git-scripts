@@ -120,8 +120,8 @@ sweep dirties the tree on purpose while a mutation is applied.
 # git mutate
 
 ```
-git mutate <mutations-file> [name...]   # run every mutation, or only the named ones
-git mutate --check <mutations-file>     # guards only: mutate nothing, run no tests
+git mutate <mutations-file|-> [name...] # run every mutation, or only the named ones
+git mutate --check <mutations-file|->   # guards only: mutate nothing, run no tests
 git mutate --recover                    # restore from a stale sweep's snapshot; cmp-verify
   --cmd <shell command>   test command, instead of the pytest hook in .pre-commit-config.yaml
   --timeout <seconds>     per-mutation timeout (default 900)
@@ -132,6 +132,10 @@ guard refuses, and the exit statuses. Nothing below is needed to author a mutati
 the *why*, and a worker who has to come here for the *what* has already been given the wrong interface. The
 example the help prints is extracted and run through the real guards by `tests/test-git-mutate.sh`, so it
 cannot document a mutation the tool would refuse.
+
+Git intercepts `git mutate --help` before an external command can see the option. The installer therefore
+puts a small `git-mutate(1)` page in the user man path; it points `--help` at the complete `git mutate -h`
+output.
 
 **Run it unpiped.** A sweep is slow — one full test run per mutation, plus a baseline — and it prints one
 line per mutation as that mutation finishes, so an unpiped run is a live progress report. Filtering it
@@ -145,7 +149,8 @@ suite, restore the tree, and report **which tests reddened and whether they redd
 an error**. The point of the tool is that last distinction: an assertion kill means a test checks the
 behaviour, an error kill means the mutation merely broke the code and proves nothing about the tests.
 
-**The mutations file** is TOML, so anchors are literal multi-line strings needing no escaping:
+**The mutations file** is TOML, so anchors are literal multi-line strings needing no escaping. Pass `-`
+instead of a path to read the TOML from standard input:
 
 ```toml
 [[mutation]]

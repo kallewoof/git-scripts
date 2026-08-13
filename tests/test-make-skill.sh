@@ -36,7 +36,8 @@ fi
 echo "test: the installer extracts a byte-identical tool"
 
 work=$(mktemp -d)
-if "$here/mutation-first.sh" --project "$work" --bin "$work/bin" >/dev/null 2>&1; then
+if "$here/mutation-first.sh" --project "$work" --bin "$work/bin" --man "$work/man/man1" \
+        >/dev/null 2>&1; then
     if cmp -s "$work/bin/git-mutate" "$here/git-mutate"; then
         ok "extracted git-mutate is byte-identical to the source"
     else
@@ -46,6 +47,19 @@ if "$here/mutation-first.sh" --project "$work" --bin "$work/bin" >/dev/null 2>&1
         ok "extracted git-mutate is executable"
     else
         bad "extracted git-mutate is not executable"
+    fi
+    if cmp -s "$work/man/man1/git-mutate.1" "$here/git-mutate.1"; then
+        ok "extracted git-mutate.1 is byte-identical to the source"
+    else
+        bad "extracted git-mutate.1 DIFFERS from the source"
+    fi
+    help=$(PATH="$work/bin:$PATH" MANPATH="$work/man" GIT_PAGER=cat \
+        git mutate --help 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ] && printf '%s\n' "$help" | grep -qF 'git mutate -h'; then
+        ok "git mutate --help points at git mutate -h"
+    else
+        bad "git mutate --help did not point at -h (status $status): $help"
     fi
     skill="$work/.claude/skills/mutation-first-verification/SKILL.md"
     if head -1 "$skill" 2>/dev/null | grep -qx -- "---"; then

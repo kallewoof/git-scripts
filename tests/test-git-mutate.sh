@@ -92,6 +92,13 @@ mutate() {
     ST=$?
 }
 
+# As mutate(), with the named file connected to the tool's standard input.
+mutate_stdin() {
+    local repo="$1" input="$2"; shift 2
+    OUT=$( (cd "$repo" && "$SCRIPT" "$@" < "$input") 2>&1 )
+    ST=$?
+}
+
 init_repo() {
     local repo="$1"
     git init -q "$repo"
@@ -753,6 +760,17 @@ EOF
     if [ ! -f "$counter" ]; then ok "--check ran no test command"; else fail "--check ran no test command"; fi
     assert_clean_tree "$repo" "--check left the tree untouched"
     assert_no_sweep_state "$repo" "--check took no lock and wrote no marker"
+
+    mutate_stdin "$repo" "$d/mutations.toml" --check - assert-shapes
+    assert_status "--check accepts TOML on standard input" 0
+    assert_contains "stdin input can still select mutations by name" \
+        "git-mutate --check: 1 mutation(s) from -"
+
+    mutate_stdin "$repo" "$d/mutations.toml" --cmd true - assert-shapes
+    assert_status "a full sweep accepts TOML on standard input" 2
+    assert_contains "the stdin mutation is measured" "assert-shapes: reddened nothing."
+    assert_clean_tree "$repo" "the stdin sweep restores the tree"
+    assert_no_sweep_state "$repo" "the stdin sweep leaves no lock or marker"
 
     cat > "$d/bad.toml" <<'EOF'
 [[mutation]]

@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # Build `mutation-first.sh` — a single self-extracting installer carrying the mutation-first
-# verification skill and the `git mutate` tool it depends on.
+# verification skill, the `git mutate` tool it depends on, and the manual-page redirect Git needs
+# for `git mutate --help`.
 #
 # The point of generating rather than hand-writing it: the installer embeds `git-mutate` and the
 # methodology verbatim, and a hand-maintained copy of a 975-line script drifts from the original the
@@ -13,16 +14,18 @@ set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
 tool="$here/git-mutate"
+manpage="$here/git-mutate.1"
 method="${METHODOLOGY:-$here/../rp-stack/context/WOULD_ANYTHING_NOTICE.md}"
 out="${1:-$here/mutation-first.sh}"
 
 [ -f "$tool" ]   || { echo "make-skill: no git-mutate beside this script" >&2; exit 1; }
+[ -f "$manpage" ] || { echo "make-skill: no git-mutate.1 beside this script" >&2; exit 1; }
 [ -f "$method" ] || { echo "make-skill: no methodology at $method (set METHODOLOGY=)" >&2; exit 1; }
 
 # A delimiter that cannot appear in either payload. Checked, not assumed: a collision would end the
 # heredoc early and ship a truncated tool that still looks like a tool.
-for d in MUTATE_PAYLOAD_EOF SKILL_PAYLOAD_EOF; do
-    if grep -qF "$d" "$tool" "$method"; then
+for d in MUTATE_PAYLOAD_EOF MANPAGE_PAYLOAD_EOF SKILL_PAYLOAD_EOF; do
+    if grep -qF "$d" "$tool" "$manpage" "$method"; then
         echo "make-skill: delimiter '$d' occurs in a payload; pick another" >&2
         exit 1
     fi
@@ -34,15 +37,18 @@ cat <<'INSTALLER_HEAD'
 #
 # Mutation-first verification — self-extracting installer.
 #
-# Installs two things:
+# Installs three things:
 #   1. `git-mutate`, an executable placed on your PATH. Claude runs it; it is never read into
 #      context, which is why this file is an installer rather than the skill itself.
-#   2. `SKILL.md`, the method. Small on purpose — it is what loads into context when the skill fires.
+#   2. `git-mutate.1`, the redirect Git needs because it intercepts `git mutate --help` before
+#      invoking external commands.
+#   3. `SKILL.md`, the method. Small on purpose — it is what loads into context when the skill fires.
 #
 # Usage:
 #   ./mutation-first.sh                 install into ./.claude/skills and ~/.local/bin
 #   ./mutation-first.sh --project DIR   install the skill into DIR/.claude/skills
 #   ./mutation-first.sh --bin DIR       install git-mutate into DIR
+#   ./mutation-first.sh --man DIR       install git-mutate.1 into DIR
 #   ./mutation-first.sh --user          install the skill into ~/.claude/skills (all projects)
 #
 # Requires: git, and python3 >= 3.11 (the tool parses TOML with the stdlib `tomllib`).
@@ -52,12 +58,14 @@ set -eu
 SKILL_NAME="mutation-first-verification"
 project="$PWD"
 bindir="$HOME/.local/bin"
+mandir="${XDG_DATA_HOME:-$HOME/.local/share}/man/man1"
 scope="project"
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --project) project="$2"; shift 2 ;;
         --bin)     bindir="$2";  shift 2 ;;
+        --man)     mandir="$2";  shift 2 ;;
         --user)    scope="user"; shift ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
@@ -77,7 +85,7 @@ else
     skilldir="$project/.claude/skills/$SKILL_NAME"
 fi
 
-mkdir -p "$bindir" "$skilldir"
+mkdir -p "$bindir" "$mandir" "$skilldir"
 
 cat > "$bindir/git-mutate" <<'MUTATE_PAYLOAD_EOF'
 INSTALLER_HEAD
@@ -88,8 +96,16 @@ cat <<'INSTALLER_MID'
 MUTATE_PAYLOAD_EOF
 chmod +x "$bindir/git-mutate"
 
-cat > "$skilldir/SKILL.md" <<'SKILL_PAYLOAD_EOF'
+cat > "$mandir/git-mutate.1" <<'MANPAGE_PAYLOAD_EOF'
 INSTALLER_MID
+
+cat "$manpage"
+
+cat <<'INSTALLER_MANPAGE_END'
+MANPAGE_PAYLOAD_EOF
+
+cat > "$skilldir/SKILL.md" <<'SKILL_PAYLOAD_EOF'
+INSTALLER_MANPAGE_END
 
 # --- SKILL.md: frontmatter, then the methodology verbatim -----------------------------------------
 cat <<'FRONTMATTER'
@@ -125,6 +141,7 @@ SKILL_PAYLOAD_EOF
 
 echo "installed:"
 echo "  $bindir/git-mutate"
+echo "  $mandir/git-mutate.1"
 echo "  $skilldir/SKILL.md"
 echo
 case ":$PATH:" in

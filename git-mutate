@@ -5,12 +5,12 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 # Usage:
-#   git mutate <mutations-file> [name...]
+#   git mutate <mutations-file|-> [name...]
 #                         Run every mutation in the file (or only the named ones), one at a
 #                         time: guard it, snapshot the files it touches, apply it, run the
 #                         test command, restore the tree, and classify every failing test as
 #                         an assertion kill or an error kill.
-#   git mutate --check <mutations-file> [name...]
+#   git mutate --check <mutations-file|-> [name...]
 #                         Run every guard and mutate nothing -- a fast "do my anchors still
 #                         match?" loop that runs no tests.
 #   git mutate --recover  Restore the tree from a stale sweep's snapshot and cmp-verify it.
@@ -72,8 +72,8 @@ DEFAULT_TIMEOUT=900
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  git mutate <mutations-file> [name...]   Run every mutation, or only the named ones.
-  git mutate --check <mutations-file>     Run the guards only: mutate nothing, run no tests.
+  git mutate <mutations-file|-> [name...] Run every mutation, or only the named ones.
+  git mutate --check <mutations-file|->   Run the guards only: mutate nothing, run no tests.
   git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
 
   --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
@@ -92,15 +92,16 @@ restore the tree, and classify every failing test as an assertion kill (a test c
 behaviour) or an error kill (the mutation merely broke the code, proving nothing).
 
 Usage:
-  git mutate <mutations-file> [name...]   Run every mutation, or only the named ones.
-  git mutate --check <mutations-file>     Run the guards only: mutate nothing, run no tests.
+  git mutate <mutations-file|-> [name...] Run every mutation, or only the named ones.
+  git mutate --check <mutations-file|->   Run the guards only: mutate nothing, run no tests.
   git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
 
   --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
   --timeout <seconds>     Per-mutation timeout (default 900).
 
-THE MUTATIONS FILE is TOML. A mutation is a name plus a list of edits; 'name', 'file', 'old'
-and 'new' are all required, and the [name...] argument above selects by that 'name':
+THE MUTATIONS FILE is TOML. Pass '-' instead of a path to read it from standard input. A
+mutation is a name plus a list of edits; 'name', 'file', 'old' and 'new' are all required,
+and the [name...] argument above selects by that 'name':
 
   [[mutation]]
   name = "history-never-sent"
@@ -178,6 +179,14 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || { echo "$SELF: --timeout needs an argument" >&2; usage; exit 1; }
             timeout_secs="$2"; shift 2 ;;
         -h|--help) help_text; exit 0 ;;
+        -)
+            if [ -z "$mutations_file" ]; then
+                mutations_file="-"
+            else
+                selected="$selected$1
+"
+            fi
+            shift ;;
         -*) echo "$SELF: unknown option '$1'" >&2; usage; exit 1 ;;
         *)
             if [ -z "$mutations_file" ]; then
@@ -198,7 +207,8 @@ if [ "$mode" = "recover" ]; then
     [ -z "$mutations_file" ] || die "--recover takes no mutations file"
 else
     [ -n "$mutations_file" ] || { usage; exit 1; }
-    [ -f "$mutations_file" ] || die "no such mutations file: '$mutations_file'"
+    [ "$mutations_file" = "-" ] || [ -f "$mutations_file" ] ||
+        die "no such mutations file: '$mutations_file'"
 fi
 
 # ---------------------------------------------------------------------------------------
@@ -235,12 +245,12 @@ SELF_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
 # Bash then only ever reads whole files -- there is no delimiter, quoting or escaping layer
 # anywhere between the anchor as written and the anchor as matched.
 py_parse() {
-    python3 - "$1" "$2" <<'PY'
+    python3 - "$1" "$2" "$3" <<'PY'
 import os
 import sys
 import tomllib
 
-src, out = sys.argv[1], sys.argv[2]
+src, out, label = sys.argv[1], sys.argv[2], sys.argv[3]
 
 def bad(msg):
     sys.exit("git-mutate: %s" % msg)
@@ -249,13 +259,13 @@ try:
     with open(src, "rb") as fh:
         doc = tomllib.load(fh)
 except OSError as exc:
-    bad("cannot read '%s': %s" % (src, exc))
+    bad("cannot read %s: %s" % (label, exc))
 except tomllib.TOMLDecodeError as exc:
-    bad("'%s' is not valid TOML: %s" % (src, exc))
+    bad("%s is not valid TOML: %s" % (label, exc))
 
 muts = doc.get("mutation")
 if not isinstance(muts, list) or not muts:
-    bad("'%s' declares no [[mutation]] tables" % src)
+    bad("%s declares no [[mutation]] tables" % label)
 
 seen = set()
 for i, mut in enumerate(muts, start=1):
@@ -638,7 +648,14 @@ work=$(mktemp -d) || die "cannot create a temporary directory"
 trap 'rm -rf "$work"' EXIT       # replaced by on_exit once the lock is held
 
 mkdir "$work/spec"
-py_parse "$mutations_file" "$work/spec" || exit 1
+mutations_source="$mutations_file"
+mutations_label="'$mutations_file'"
+if [ "$mutations_file" = "-" ]; then
+    mutations_source="$work/stdin.toml"
+    mutations_label="standard input"
+    cat > "$mutations_source" || die "cannot read mutations from standard input"
+fi
+py_parse "$mutations_source" "$work/spec" "$mutations_label" || exit 1
 
 mut_dirs=""
 for d in "$work"/spec/*; do
