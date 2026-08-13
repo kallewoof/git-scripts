@@ -1005,9 +1005,12 @@ test16() {
     assert_contains "the help names the top-level table" "[[mutation]]"
     assert_contains "the help names the edit table" "[[mutation.edit]]"
     assert_contains "the help says the file is TOML" "TOML"
+    assert_contains "the help recommends stdin as the primary workflow" "Prefer a heredoc into 'git mutate -'"
+    assert_contains "the worked example is an executable stdin invocation" "git mutate - <<'TOML'"
+    assert_contains "the help gives the stdin form for guard-only checks" "git mutate --check -"
     assert_contains "the help documents the uniqueness guard" "exactly once"
     assert_contains "the help documents the prose-anchor refusal" "docstring"
-    assert_contains "the help says the file is scratch, not committed" ".gitignore"
+    assert_contains "the help says stdin input is ephemeral" "THE INPUT IS EPHEMERAL"
 
     # Pull the first [[mutation]] block out of the help and dedent it -- whatever it says
     # today -- then build the tree it describes: each file it names, holding exactly the
@@ -1023,7 +1026,7 @@ help_txt, out, root = sys.argv[1], sys.argv[2], sys.argv[3]
 lines = open(help_txt, encoding="utf-8").read().splitlines()
 start = next(i for i, l in enumerate(lines) if l.strip() == "[[mutation]]")
 end = start
-while end < len(lines) and lines[end].strip():
+while end < len(lines) and lines[end].strip() not in ("", "TOML"):
     end += 1
 block = "\n".join(l[2:] if l.startswith("  ") else l for l in lines[start:end]) + "\n"
 with open(out, "w", encoding="utf-8") as fh:

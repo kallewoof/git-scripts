@@ -60,14 +60,17 @@ cat > "$bindir/git-mutate" <<'MUTATE_PAYLOAD_EOF'
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 # Usage:
-#   git mutate <mutations-file|-> [name...]
-#                         Run every mutation in the file (or only the named ones), one at a
+#   git mutate - [name...]
+#                         Read TOML from standard input and run every mutation (or only the
+#                         named ones), one at a
 #                         time: guard it, snapshot the files it touches, apply it, run the
 #                         test command, restore the tree, and classify every failing test as
 #                         an assertion kill or an error kill.
-#   git mutate --check <mutations-file|-> [name...]
+#   git mutate --check - [name...]
 #                         Run every guard and mutate nothing -- a fast "do my anchors still
 #                         match?" loop that runs no tests.
+#   git mutate <mutations-file> [name...]
+#                         A file path is also accepted when another tool already produced one.
 #   git mutate --recover  Restore the tree from a stale sweep's snapshot and cmp-verify it.
 #                         A sweep killed with -9 cannot restore itself; nothing else can
 #                         leave a mutated tree behind. Never automatic: a snapshot of
@@ -87,9 +90,9 @@ cat > "$bindir/git-mutate" <<'MUTATE_PAYLOAD_EOF'
 # every anchor looks identical to one that is working. `head` is worse -- it can SIGPIPE the
 # sweep mid-mutation, which is the one way to leave a tree needing --recover.
 #
-# The tool is stateless. Mutations are passed in for one invocation and forgotten; the file
-# is scratch and belongs in .gitignore, never in a commit. README.md says why a persistent
-# mutations file is not offered -- briefly: anchors are coupled to the code's current text
+# The tool is stateless. Mutations are passed on stdin for one invocation and forgotten; a
+# file path is supported but there is normally no reason to create one. README.md says why a
+# persistent mutations file is not offered -- briefly: anchors are coupled to the code's current text
 # while tests are coupled to its behaviour, so a stale anchor either matches nothing or,
 # worse, matches a comment, reddens nothing, and reports a false finding.
 #
@@ -97,8 +100,8 @@ cat > "$bindir/git-mutate" <<'MUTATE_PAYLOAD_EOF'
 #     0  every selected mutation was measured and killed by at least one assertion
 #     1  usage or environment error -- nothing was measured
 #     2  findings: a mutation reddened nothing, or was reddened only by errors
-#     3  not measured: a mutation was refused, timed out, produced a line we cannot classify, or
-#        failed while matching nothing we can classify at all
+#     3  not measured: a mutation was refused, timed out, failed to compile, produced a
+#        line we cannot classify, or failed while matching nothing we can classify at all
 #     4  restore verification failed -- THE TREE MAY STILL BE MUTATED
 #   130  interrupted; the tree was restored
 # A survivor is a finding (2), never a tool failure -- conflating them would make the tool
@@ -127,11 +130,14 @@ DEFAULT_TIMEOUT=900
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  git mutate <mutations-file|-> [name...] Run every mutation, or only the named ones.
-  git mutate --check <mutations-file|->   Run the guards only: mutate nothing, run no tests.
+  git mutate - [name...]                  Read TOML from stdin; run all or named mutations.
+  git mutate --check - [name...]          Read TOML from stdin; run guards only, no tests.
+  git mutate <mutations-file> [name...]   A file path is also accepted.
   git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
 
   --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
+  --env <name>            Test ecosystem: pytest (default), mvn, go, rust, dotnet.
+  --assertion-pattern <re> Extra regex that marks a message as an assertion kill.
   --timeout <seconds>     Per-mutation timeout (default 900).
 
 For the mutations-file format, and what each guard refuses: git mutate -h
@@ -147,23 +153,30 @@ restore the tree, and classify every failing test as an assertion kill (a test c
 behaviour) or an error kill (the mutation merely broke the code, proving nothing).
 
 Usage:
-  git mutate <mutations-file|-> [name...] Run every mutation, or only the named ones.
-  git mutate --check <mutations-file|->   Run the guards only: mutate nothing, run no tests.
+  git mutate - [name...]                  Read TOML from stdin; run all or named mutations.
+  git mutate --check - [name...]          Read TOML from stdin; run guards only, no tests.
+  git mutate <mutations-file> [name...]   A file path is also accepted.
   git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
 
   --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
+  --env <name>            Test ecosystem: pytest (default), mvn, go, rust, dotnet.
+  --assertion-pattern <re> Extra regex that marks a message as an assertion kill.
   --timeout <seconds>     Per-mutation timeout (default 900).
 
-THE MUTATIONS FILE is TOML. Pass '-' instead of a path to read it from standard input. A
-mutation is a name plus a list of edits; 'name', 'file', 'old' and 'new' are all required,
-and the [name...] argument above selects by that 'name':
+MUTATIONS are TOML. Prefer a heredoc into 'git mutate -': it is visibly one-use, leaves no
+temporary file to clean up, and cannot become a stale mutation suite by accident:
 
+  git mutate - <<'TOML'
   [[mutation]]
   name = "history-never-sent"
   [[mutation.edit]]
   file = "src/autorp/claims.py"
   old = '''        "history": _history_anchor(played),'''
   new = '''        "history": [],'''
+  TOML
+
+'name', 'file', 'old' and 'new' are all required. Arguments after '-' select mutations by
+their 'name'. A file path remains supported when another tool already produced the TOML.
 
 'file' is relative to the repo root. Anchors are matched byte-for-byte against the file's
 bytes: write them as literal ''' strings, so nothing needs escaping and the leading
@@ -185,13 +198,13 @@ rest of the sweep run. A refusal is "not measured", never a survivor:
   - an anchor sitting in a '#' comment, or inside a Python docstring, is refused: mutating
     prose reddens nothing, and would report a defended behaviour as undefended
 
-Run 'git mutate --check <file>' to put a file through every guard in seconds, running no
-tests and touching nothing.
+Use 'git mutate --check -' with the same heredoc form to put the input through every guard
+in seconds, running no tests and touching nothing.
 
-THE FILE IS SCRATCH. Pass it in for one invocation; it belongs in .gitignore, never in a
-commit. Anchors are coupled to the code's current text while tests are coupled to its
-behaviour, so a kept mutations file rots -- and the dangerous rot is not the anchor that
-stops matching, it is the one that comes to match a comment.
+THE INPUT IS EPHEMERAL. Feed it on stdin for one invocation and forget it. Anchors are
+coupled to the code's current text while tests are coupled to its behaviour, so a kept
+mutations file rots -- and the dangerous rot is not the anchor that stops matching, it is
+the one that comes to match a comment.
 
 RUN IT UNPIPED. A sweep is slow -- one full test run per mutation, plus a baseline -- and it
 prints one line per mutation as that mutation finishes, so an unpiped run is a live progress
@@ -203,8 +216,8 @@ Exit status (precedence when several apply: 4 > 3 > 2):
     0  every selected mutation was measured and killed by at least one assertion
     1  usage or environment error -- nothing was measured
     2  findings: a mutation reddened nothing, or was reddened only by errors
-    3  not measured: a mutation was refused, timed out, or produced test output this
-       pytest-shaped classifier cannot read
+    3  not measured: a mutation was refused, timed out, failed to compile, or produced
+       test output this classifier cannot read
     4  restore verification failed -- THE TREE MAY STILL BE MUTATED
   130  interrupted; the tree was restored
 A survivor is a finding (2), never a tool failure.
@@ -220,6 +233,34 @@ die() { echo "$SELF: $*" >&2; exit 1; }
 mode="sweep"
 cmd_override=""
 timeout_secs="$DEFAULT_TIMEOUT"
+assertion_pattern=""
+env_name=""
+
+# Per-project defaults, so a Java or Go repo does not need the same three flags on every run.
+# Lives in .git/info/ because that directory is already the home for per-clone, never-committed
+# git state -- nothing here should reach a commit, for the same reason a mutations file should
+# not: it describes how this checkout is tested, not what the code does.
+#   env = mvn
+#   cmd = cd phase1 && mvn -B test -Dtest=SerdeTimerTest
+#   assertion_pattern = ^MyCustomExpectationError
+#   timeout = 600
+read_project_config() {
+    conf="$(git rev-parse --git-dir 2>/dev/null)/info/git-mutate"
+    [ -f "$conf" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        key="${line%%=*}"; val="${line#*=}"
+        key="$(printf '%s' "$key" | tr -d '[:space:]')"
+        val="${val# }"
+        case "$key" in
+            env)               [ -z "$env_name" ] && env_name="$val" ;;
+            cmd)               [ -z "$cmd_override" ] && cmd_override="$val" ;;
+            assertion_pattern) [ -z "$assertion_pattern" ] && assertion_pattern="$val" ;;
+            timeout)           [ "$timeout_secs" = "$DEFAULT_TIMEOUT" ] && timeout_secs="$val" ;;
+            *) echo "$SELF: $conf: ignoring unknown key '$key'" >&2 ;;
+        esac
+    done < "$conf"
+}
 mutations_file=""
 selected=""          # newline-separated names; empty means "all"
 
@@ -233,6 +274,13 @@ while [ $# -gt 0 ]; do
         --timeout)
             [ $# -ge 2 ] || { echo "$SELF: --timeout needs an argument" >&2; usage; exit 1; }
             timeout_secs="$2"; shift 2 ;;
+        --assertion-pattern)
+            [ $# -ge 2 ] || { echo "$SELF: --assertion-pattern needs an argument" >&2; usage; exit 1; }
+            assertion_pattern="$2"; shift 2 ;;
+        --env)
+            [ $# -ge 2 ] || { echo "$SELF: --env needs an argument" >&2; usage; exit 1; }
+            env_name="$2"; shift 2 ;;
+        --env=*) env_name="${1#--env=}"; shift ;;
         -h|--help) help_text; exit 0 ;;
         -)
             if [ -z "$mutations_file" ]; then
@@ -253,6 +301,17 @@ while [ $# -gt 0 ]; do
             shift ;;
     esac
 done
+
+# After the flags, so an explicit flag always beats the file.
+read_project_config
+[ -n "$env_name" ] || env_name="pytest"
+
+case "$env_name" in
+    pytest|mvn|go|rust|dotnet) ;;
+    *) die "--env takes one of: pytest, mvn, go, rust, dotnet (got '$env_name')" ;;
+esac
+export GIT_MUTATE_ENV="$env_name"
+export GIT_MUTATE_ASSERTION_PATTERN="$assertion_pattern"
 
 case "$timeout_secs" in
     *[!0-9]*|"") die "--timeout takes a whole number of seconds, got '$timeout_secs'" ;;
@@ -491,6 +550,7 @@ PY
 # silently into either bucket).
 py_classify() {
     python3 - "$1" <<'PY'
+import os
 import re
 import sys
 
@@ -523,7 +583,73 @@ def split_id(rest):
 # an error kill here, and a test whose assertion message begins with an exception-like name
 # could fool the assertion test. Both are visible in the reported message text.
 ASSERTION = ("assert", "AssertionError", "Failed:")
+
+# Trap B2: other ecosystems name their assertion failure something that is not "AssertionError"
+# but still ends in "Error"/"Failure", so NAMED_EXC below claims it and *every* genuine assertion
+# kill in that language is reported as an error kill -- a well-tested change slandered wholesale
+# rather than one case at a time. Each of these is an assertion failure in its own vocabulary.
+# Selected by --env; unioned with the base tuple above, since "assert" and "AssertionError" are
+# near-universal and cost nothing to keep.
+ENV_ASSERTION = {
+    "pytest": (),
+    "mvn": (
+        "AssertionFailedError",    # JUnit 5 / opentest4j -- what assertEquals and AssertJ throw
+        "ComparisonFailure",       # JUnit 4
+        "MultipleFailuresError",   # JUnit 5 assertAll
+        "Expecting",               # AssertJ, when it reports without an exception name
+    ),
+    "go": ("Error Trace:", "Not equal:", "expected:"),
+    "rust": ("assertion",),
+    "dotnet": ("AssertionException", "EqualException", "Xunit.Sdk"),
+}
+
+ENV = os.environ.get("GIT_MUTATE_ENV", "pytest")
+ASSERTION = ASSERTION + ENV_ASSERTION.get(ENV, ())
+_extra = os.environ.get("GIT_MUTATE_ASSERTION_PATTERN", "")
+EXTRA_ASSERTION = re.compile(_extra) if _extra else None
 NAMED_EXC = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Exit|Warning|Interrupted)?:")
+
+# Surefire/Failsafe print no FAILED/ERROR summary lines at all -- the per-test outcome lives
+# only in target/*-reports/TEST-*.xml. Reading the console log therefore yields nothing to
+# classify, which reports every mutation as "not measured" no matter how well tested the code
+# is. Under --env mvn, classify from the XML instead and skip the console entirely.
+def classify_surefire():
+    import glob
+    import xml.etree.ElementTree as ET
+
+    ASSERTION_TYPES = (
+        "AssertionError",
+        "AssertionFailedError",
+        "ComparisonFailure",
+        "MultipleFailuresError",
+    )
+    rows = []
+    paths = sorted(
+        glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)
+        + glob.glob("**/target/failsafe-reports/TEST-*.xml", recursive=True)
+    )
+    for path in paths:
+        try:
+            root = ET.parse(path).getroot()
+        except ET.ParseError:
+            continue
+        cls = root.get("name", "?").split(".")[-1]
+        for case in root.iter("testcase"):
+            node = case.find("failure")
+            if node is None:
+                node = case.find("error")
+            if node is None:
+                continue
+            kind_name = (node.get("type") or "").split(".")[-1]
+            msg = (node.get("message") or "").replace("\n", " ").replace("\t", " ").strip()
+            kind = "A" if kind_name in ASSERTION_TYPES else "E"
+            rows.append((kind, "%s::%s" % (cls, case.get("name", "?")), "%s: %s" % (kind_name, msg)))
+    return rows
+
+if ENV == "mvn":
+    for kind, test_id, msg in classify_surefire():
+        print("%s\t%s\t%s" % (kind, test_id, msg))
+    sys.exit(0)
 
 seen = set()
 for raw in open(sys.argv[1], "r", encoding="utf-8", errors="replace"):
@@ -536,7 +662,7 @@ for raw in open(sys.argv[1], "r", encoding="utf-8", errors="replace"):
     if test_id in seen:
         continue
     seen.add(test_id)
-    if msg.startswith(ASSERTION):
+    if msg.startswith(ASSERTION) or (EXTRA_ASSERTION and EXTRA_ASSERTION.search(msg)):
         kind = "A"
     elif head == "ERROR":
         # A collection or teardown error is an error kill whatever it says -- and an
@@ -894,6 +1020,22 @@ RUN_TIMEDOUT=0
 run_test_cmd() {
     local log="$1" st
     RUN_TIMEDOUT=0
+    # Surefire reports persist between runs, and a mutation that fails to compile writes no new
+    # ones. Reading the previous run's passing XML would report that mutation as a survivor --
+    # a false finding, which is the one output this tool must never produce. Clear them first so
+    # "no reports" means "nothing ran", not "nothing failed".
+    #
+    # Deliberately narrow: -type f and a -path that must END at the report file, so the parent
+    # really is target/surefire-reports and not merely some path containing "/target/". Deleting
+    # only the XML the classifier reads means no directory is ever removed, so a repo with its
+    # own docs/target/annual-reports keeps it. No rm, no -rf, no -exec: find's own -delete
+    # cannot be handed a path it did not match.
+    if [ "${GIT_MUTATE_ENV:-pytest}" = "mvn" ]; then
+        find "$root" -type f \
+            \( -path '*/target/surefire-reports/TEST-*.xml' \
+            -o -path '*/target/failsafe-reports/TEST-*.xml' \) \
+            -delete 2>/dev/null
+    fi
     # stdin from /dev/null: the sweep loop reads its mutation list from a here-string, and a
     # test command inheriting that stdin could eat it.
     ( cd "$root" && exec env NO_COLOR=1 COLUMNS=1000 $run_prefix bash -c "$test_cmd" ) \
@@ -1030,10 +1172,37 @@ while IFS= read -r d; do
     n_u=$(awk -F'\t' '$1=="U" {n++} END {print n+0}' "$res.rows")
     printf '%s %s %s\n' "$n_a" "$n_e" "$n_u" > "$res.counts"
 
-    if [ "$n_u" -gt 0 ]; then
+    # A mutation that does not compile was never put to the tests, so nothing was learned about
+    # them. Saying so plainly beats every alternative: "reddened nothing" blames the tests for a
+    # mutation they never saw, and an error kill implies a test ran and threw. In a compiled
+    # language this is common enough that it needs its own sentence, not a bucket to interpret.
+    compile_note=""
+    if [ -s "$work/log.$idx" ]; then
+        compile_note=$(grep -m1 -E "cannot find symbol|COMPILATION ERROR|Unresolved compilation|error: .*expected|SyntaxError|cannot be resolved" \
+            "$work/log.$idx" 2>/dev/null | sed 's/^[[:space:]]*//; s/\x1b\[[0-9;]*m//g' | cut -c1-160)
+    fi
+    if [ -z "$compile_note" ] && [ -s "$res.rows.all" ]; then
+        compile_note=$(awk -F'\t' '$3 ~ /Unresolved compilation|cannot be resolved|cannot find symbol/ {print $3; exit}' "$res.rows.all" | cut -c1-160)
+    fi
+
+    if [ -n "$compile_note" ]; then
+        echo "compilation failed -- not measured"
+        echo "compile-failed" > "$res.status"
+        # Surefire puts "Unresolved compilation problem:" in the message attribute and the
+        # offending symbol in the stack trace, so the note can arrive detail-less; say the
+        # useful half rather than trailing a bare colon.
+        compile_note=$(printf '%s' "$compile_note" | sed 's/[[:space:]]*:[[:space:]]*$//')
+        printf 'error: compilation failed, so the tests never ran against this mutation (%s)' \
+            "$compile_note" > "$res.note"
+    elif [ "$n_u" -gt 0 ]; then
         echo "unclassifiable output -- not measured"
         echo "unclassified" > "$res.status"
-        printf '%s line(s) matched FAILED/ERROR but carry no failure text we can classify' "$n_u" > "$res.note"
+        # Naming one offending line turns "unclassifiable" from a verdict into a lead: it is
+        # almost always a missing " - <message>" suffix, or an assertion type this --env does
+        # not know, and both are obvious the moment you can see the line.
+        sample=$(awk -F'\t' '$1=="U" {print $2 " - " $3; exit}' "$res.rows")
+        printf '%s line(s) matched FAILED/ERROR but carry no failure text we can classify (env=%s); first was: %s' \
+            "$n_u" "$GIT_MUTATE_ENV" "$sample" > "$res.note"
     elif [ ! -s "$res.rows.all" ] && [ "$mut_rc" -ne 0 ]; then
         # The command failed, so this is not a well-defended behaviour -- it is a suite this
         # classifier cannot read. Reporting it as a survivor would be worse than an error: it
@@ -1103,7 +1272,7 @@ section() {
             refused)
                 echo "  $name: REFUSED -- $note"
                 ;;
-            timeout|unclassified)
+            timeout|unclassified|compile-failed)
                 echo "  $name: NOT MEASURED -- $note"
                 ;;
             killed)
@@ -1121,7 +1290,7 @@ section() {
 echo
 echo "======================================================================"
 section "FINDINGS -- read these first" survived error-only
-section "NOT MEASURED -- the sweep is incomplete here" refused unclassified timeout
+section "NOT MEASURED -- the sweep is incomplete here" refused unclassified timeout compile-failed
 section "KILLED BY ASSERTION" killed
 echo
 
@@ -1135,7 +1304,7 @@ count_status() {
 }
 
 n_findings=$(count_status "survived error-only")
-n_unmeasured=$(count_status "refused timeout unclassified")
+n_unmeasured=$(count_status "refused timeout unclassified compile-failed")
 n_killed=$(count_status "killed")
 
 echo "$SELF: $n_killed killed by assertion, $n_findings finding(s), $n_unmeasured not measured."
@@ -1207,13 +1376,10 @@ satisfied by paraphrasing the code, because answering it requires knowing what t
 
 ## The loop
 
-**Use `git mutate` (in `git-scripts`, on `PATH`). Do not hand-roll a harness.** Write the mutations into a
-scratch TOML — never committed, since anchors rot into silent no-ops — and let the tool run them:
-
-```
-git mutate /tmp/muts.toml          # run them all
-git mutate --check /tmp/muts.toml  # validate anchors only, no tests, tree untouched
-```
+**Use `git mutate` (in `git-scripts`, on `PATH`). Do not hand-roll a harness.** Prefer
+one-use TOML on stdin: `git mutate -` runs it, and `git mutate --check -` validates its
+anchors without running tests. Use a heredoc as shown by `git mutate -h`; it leaves no temp
+file to clean up or accidentally preserve after its anchors have gone stale.
 
 **Run it unpiped.** It prints one line per mutation as that mutation finishes, so an unpiped run is a
 live progress report. A `grep`/`head` filter blocks until the whole sweep ends — a run that is stuck or
@@ -1402,6 +1568,9 @@ To make the skill discoverable without being asked for by name, add a line to CL
       behaviour a test names and confirm that test is what fails. A green suite is not evidence
       until something has been broken.
 
-Scope note: the kill classifier reads pytest's summary format. On another test runner the tool
-reports "not measured" rather than scoring your suite -- it declines rather than guessing.
+Scope note: the kill classifier reads pytest's summary format by default. For another ecosystem
+pass --env (mvn, go, rust, dotnet), or set it once per repo in .git/info/git-mutate; --env mvn also
+reads Surefire XML, since Maven prints no summary lines to classify. On a runner it still cannot
+read, the tool reports "not measured" rather than scoring your suite -- it declines rather than
+guessing.
 NEXT

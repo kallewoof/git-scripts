@@ -134,7 +134,24 @@ tail -n +2 "$method" \
           -e 's/\bterea\b/a shared library/g' \
           -e 's/\brp-stack\b/the project/g' \
           -e 's/^Self-contained, and the authority.*$/Self-contained: nothing below depends on any particular repository./' \
-          -e '/^another project; nothing below depends on any particular repo\.$/d'
+          -e '/^another project; nothing below depends on any particular repo\.$/d' \
+    | awk '
+        /^\*\*Use `git mutate`/ {
+            print "**Use `git mutate` (in `git-scripts`, on `PATH`). Do not hand-roll a harness.** Prefer"
+            print "one-use TOML on stdin: `git mutate -` runs it, and `git mutate --check -` validates its"
+            print "anchors without running tests. Use a heredoc as shown by `git mutate -h`; it leaves no temp"
+            print "file to clean up or accidentally preserve after its anchors have gone stale."
+            replacing = 1
+            fence_seen = 0
+            next
+        }
+        replacing && /^```$/ {
+            if (fence_seen) replacing = 0
+            else fence_seen = 1
+            next
+        }
+        !replacing { print }
+    '
 
 cat <<'INSTALLER_TAIL'
 SKILL_PAYLOAD_EOF
@@ -156,8 +173,11 @@ To make the skill discoverable without being asked for by name, add a line to CL
       behaviour a test names and confirm that test is what fails. A green suite is not evidence
       until something has been broken.
 
-Scope note: the kill classifier reads pytest's summary format. On another test runner the tool
-reports "not measured" rather than scoring your suite -- it declines rather than guessing.
+Scope note: the kill classifier reads pytest's summary format by default. For another ecosystem
+pass --env (mvn, go, rust, dotnet), or set it once per repo in .git/info/git-mutate; --env mvn also
+reads Surefire XML, since Maven prints no summary lines to classify. On a runner it still cannot
+read, the tool reports "not measured" rather than scoring your suite -- it declines rather than
+guessing.
 NEXT
 INSTALLER_TAIL
 } > "$out"

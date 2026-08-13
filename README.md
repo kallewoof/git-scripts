@@ -120,8 +120,9 @@ sweep dirties the tree on purpose while a mutation is applied.
 # git mutate
 
 ```
-git mutate <mutations-file|-> [name...] # run every mutation, or only the named ones
-git mutate --check <mutations-file|->   # guards only: mutate nothing, run no tests
+git mutate - [name...]                  # preferred: read one-use TOML from stdin
+git mutate --check - [name...]          # stdin, guards only: mutate nothing, run no tests
+git mutate <mutations-file> [name...]   # file paths remain supported
 git mutate --recover                    # restore from a stale sweep's snapshot; cmp-verify
   --cmd <shell command>   test command, instead of the pytest hook in .pre-commit-config.yaml
   --timeout <seconds>     per-mutation timeout (default 900)
@@ -149,17 +150,22 @@ suite, restore the tree, and report **which tests reddened and whether they redd
 an error**. The point of the tool is that last distinction: an assertion kill means a test checks the
 behaviour, an error kill means the mutation merely broke the code and proves nothing about the tests.
 
-**The mutations file** is TOML, so anchors are literal multi-line strings needing no escaping. Pass `-`
-instead of a path to read the TOML from standard input:
+**Mutations are TOML.** Prefer passing one-use input directly with a heredoc. This leaves no temporary file
+to clean up or accidentally preserve as a stale mutation suite:
 
-```toml
+```bash
+git mutate - <<'TOML'
 [[mutation]]
 name = "anchor-never-sent"
 [[mutation.edit]]
 file = "src/autorp/claims.py"
 old = '''        "history": _history_anchor(played),'''
 new = '''        "history": [],'''
+TOML
 ```
+
+Use the same form with `git mutate --check -` to validate anchors without running tests. A file path remains
+supported when another tool already produced the TOML.
 
 A mutation is a *list* of edits, so a two-part mutation (add something here, drain it there) stays
 declarative instead of needing special-casing in the tool. Note TOML's rule that a newline immediately
@@ -167,8 +173,8 @@ after the opening `'''` is dropped, which is what lets a multi-line anchor start
 
 ## Nothing persistent -- and why a committed mutations file is not offered
 
-**The tool is stateless.** Mutations are passed in for one invocation and forgotten. The file is scratch: it
-belongs in `.gitignore`, never in a commit.
+**The tool is stateless.** Mutations are passed on stdin for one invocation and forgotten. A file path is
+supported, but there is normally no mutation file to create, ignore, clean up, or commit.
 
 The tempting design is a `mutations.toml` checked into each repo and re-run as a suite. It is not offered,
 because anchors are coupled to the code's current *text* while tests are coupled to its *behaviour*, so the
@@ -227,6 +233,30 @@ Blind spots: a helper that raises its own exception type to signal a failed expe
 kill, and an assertion message beginning with something exception-shaped reads as an assertion kill. Both
 are visible in the reported message text.
 
+**Trap three: other ecosystems name their assertion failure something else.** JUnit 5 and AssertJ throw
+`AssertionFailedError`, which does not contain the string `AssertionError` and *does* end in `Error` -- so the
+named-exception rule claims it and **every** Java assertion kill reports as an error kill. Not one case
+slandered, all of them. `--env` selects the vocabulary:
+
+| `--env` | adds |
+|---|---|
+| `pytest` (default) | -- |
+| `mvn` | `AssertionFailedError` (JUnit 5 / opentest4j), `ComparisonFailure` (JUnit 4), `MultipleFailuresError` (`assertAll`), `Expecting` (AssertJ) |
+| `go` | `Error Trace:`, `Not equal:`, `expected:` |
+| `rust` | `assertion` |
+| `dotnet` | `AssertionException`, `EqualException`, `Xunit.Sdk` |
+
+`assert`, `AssertionError:` and `Failed:` stay in every environment, being near-universal. When a language
+names it something else again, `--assertion-pattern <regex>` marks a message as an assertion kill without
+needing a preset.
+
+**`--env mvn` also changes where the verdict is read from.** Surefire and Failsafe print no `FAILED`/`ERROR`
+summary lines at all -- the per-test outcome exists only in `target/surefire-reports/TEST-*.xml`. Reading the
+console log therefore finds nothing to classify and reports *every* mutation as "not measured", however well
+tested the code is. Under `--env mvn` the XML is parsed instead and the console is ignored; `<failure>` and
+`<error>` are **not** used to classify, since Surefire files an `AssertionFailedError` under `<error>` --
+the exception type is what decides.
+
 Four things are set for the child, all load-bearing:
 
 | | why |
@@ -249,6 +279,27 @@ wearing a finding's clothes. The resolution is to run the gate's *own* pytest ho
 selection (`-m "not slow"` and the like, so nothing is narrowed by this tool), minus `--cov*` (a coverage
 floor failing is not a test reddening, and coverage would be paid once per mutation for nothing), plus the
 four settings above.
+
+**Stale reports are cleared first under `--env mvn`.** Surefire's XML persists between runs, and a mutation
+that fails to compile writes none -- so the classifier would read the *previous* run's passing reports and
+score that mutation as a survivor. A false finding is the one output this tool must never produce, so the
+report files are deleted before each run, making "no reports" mean "nothing ran" rather than "nothing
+failed". Deliberately narrow: `find -type f -path '*/target/surefire-reports/TEST-*.xml' -delete` matches
+only the XML the classifier reads, so no directory is ever removed and a repo's own
+`docs/target/annual-reports` is untouched. No `rm`, no `-rf`, no `-exec`.
+
+**Per-project defaults live in `.git/info/git-mutate`.** A Java or Go repo should not need the same three
+flags on every invocation. Keys are `env`, `cmd`, `assertion_pattern` and `timeout`; an explicit flag always
+beats the file, and an unknown key warns rather than being ignored:
+
+```
+env = mvn
+cmd = cd phase1 && mvn -B test -Dtest=SerdeTimerTest
+timeout = 600
+```
+
+`.git/info/` is deliberate: per-clone, never-committed git state. The same reasoning that keeps a mutations
+file out of a commit applies here -- this describes how *this checkout* is tested, not what the code does.
 
 **A baseline run comes first.** If the unmutated suite errors, the sweep refuses: nothing is measurable when
 the suite does not even import, since every mutation would look like a kill. If the unmutated suite merely
@@ -293,12 +344,29 @@ mutation reddened 3, all by NameError"* invite thought.
 | 0 | every selected mutation was measured and killed by at least one assertion |
 | 1 | usage or environment error -- nothing was measured |
 | 2 | **findings**: a mutation reddened nothing, or was reddened only by errors |
-| 3 | **not measured**: a mutation was refused, timed out, produced an unclassifiable line, or failed while matching nothing the classifier recognises at all |
+| 3 | **not measured**: a mutation was refused, timed out, **failed to compile**, produced an unclassifiable line, or failed while matching nothing the classifier recognises at all |
 | 4 | restore verification failed -- the tree may still be mutated |
 | 130 | interrupted; the tree was restored |
 
 Precedence when several apply is 4 > 3 > 2. A survivor is a *finding*, never a tool failure: conflating the
 two would make the tool useless in a pipeline.
+
+**A mutation that does not compile is "not measured", and says so in the compiler's words:**
+
+```
+wont-compile: NOT MEASURED -- error: compilation failed, so the tests never ran
+              against this mutation (Unresolved compilation problem)
+```
+
+In a compiled language this is common, and the two obvious alternatives are both wrong. *"Reddened nothing"*
+blames the tests for a mutation they were never shown; an error kill implies a test ran and threw. Neither
+happened -- the build stopped first, so nothing was learned about the tests either way, which is precisely
+what "not measured" already means. Scoring it as a **finding** would be worse than imprecise: it would train
+readers to skim past findings in exactly the repos where mutations most often fail to build.
+
+**An unclassifiable line now names itself**, since the cause is nearly always a missing `" - <message>"`
+suffix or an assertion type the current `--env` does not know -- both obvious on sight, invisible from a
+count alone.
 
 **Why python3 appears in a bash script:** two operations must not be mis-escaped -- parsing literal
 multi-line anchors, and counting and replacing a literal multi-line substring -- and `sed`/`grep` cannot do
