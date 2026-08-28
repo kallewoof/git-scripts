@@ -1090,6 +1090,280 @@ test13() {
     assert_contains "the usage error names the mutation asked for" "no mutation named 'no-such-mutation'"
 }
 
+# --- test 17: the fast tier narrows without ever inventing a kill --------------------------
+#
+# The tier exists because mutations cluster: the same few tests kill most of them, so after
+# the first kill the rest can try that set first. It is safe only because a kill is monotone
+# -- more tests can add reddened tests, never remove one -- so an assertion kill in the subset
+# settles the verdict, while everything else falls through to the full suite. These pin both
+# halves: that it fires and agrees with --no-fast, and that a finding never comes from it.
+
+# A suite big enough that a subset is visibly not the whole thing, with two separate killers.
+make_cluster_fixture() {
+    local repo="$1" i
+    init_repo "$repo"
+    mkdir -p "$repo/tests"
+    : > "$repo/conftest.py"
+    cat > "$repo/mod.py" <<'EOF'
+def walk():
+    steps = [244, 331, 721]
+    return steps
+
+
+def render(name):
+    return "hello " + name
+
+
+def unchecked(n):
+    return n * 2
+EOF
+    cat > "$repo/tests/test_mod.py" <<'EOF'
+from mod import render, walk
+
+
+def test_walk_returns_the_steps():
+    assert walk() == [244, 331, 721]
+
+
+def test_render_greets_by_name():
+    assert render("bo") == "hello bo"
+EOF
+    for i in $(seq 1 30); do
+        printf '\n\ndef test_padding_%s():\n    assert 1 == 1\n' "$i" >> "$repo/tests/test_mod.py"
+    done
+    commit_all "$repo" "cluster fixture"
+}
+
+write_cluster_mutations() {
+    cat > "$1" <<'EOF'
+[[mutation]]
+name = "walk-first"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [999, 331, 721]'''
+
+[[mutation]]
+name = "walk-second"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return steps'''
+new = '''    return steps[:2]'''
+
+[[mutation]]
+name = "render-broken"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return "hello " + name'''
+new = '''    return "hello"'''
+
+[[mutation]]
+name = "survivor"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 3'''
+EOF
+}
+
+# mod.walk is checked by a test that only passes because an earlier test primed module state.
+# Run alone it fails -- so an unguarded fast tier would score it as the NEXT mutation's kill
+# and swallow a survivor. This is the fixture that makes that failure reachable.
+make_order_dependent_fixture() {
+    local repo="$1"
+    init_repo "$repo"
+    mkdir -p "$repo/tests"
+    : > "$repo/conftest.py"
+    cat > "$repo/mod.py" <<'EOF'
+STATE = {}
+
+
+def prime():
+    STATE["ready"] = True
+
+
+def walk():
+    steps = [244, 331, 721]
+    return steps
+
+
+def unchecked(n):
+    return n * 2
+EOF
+    cat > "$repo/tests/test_mod.py" <<'EOF'
+from mod import STATE, prime, walk
+
+
+def test_a_primes_the_state():
+    prime()
+    assert STATE["ready"] is True
+
+
+def test_b_needs_the_primed_state_and_walk():
+    assert STATE.get("ready") is True
+    assert walk() == [244, 331, 721]
+EOF
+    commit_all "$repo" "order dependent fixture"
+}
+
+write_iso_mutations() {
+    cat > "$1" <<'EOF'
+[[mutation]]
+name = "break-walk"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [999, 331, 721]'''
+
+[[mutation]]
+name = "must-survive"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 3'''
+EOF
+}
+
+test17() {
+    echo "test 17: the fast tier narrows the sweep without ever inventing a kill"
+    need_pytest || return 0
+    local d="$WORK/t17" repo="$WORK/t17/repo" iso="$WORK/t17/iso" fast="" slow=""
+    mkdir -p "$d"
+    make_cluster_fixture "$repo"
+    write_cluster_mutations "$d/mutations.toml"
+
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/mutations.toml"
+    fast="$OUT"
+    assert_status "a sweep with the fast tier still exits 2 for the survivor" 2
+    assert_contains "the header says the fast tier is on" "fast tier: on"
+    assert_contains "a later mutation in the cluster is settled by the primed kill set" \
+        "by assertion in the 1-test candidate set -- full suite not run"
+    assert_contains "and the report says the full suite was not run for it" \
+        "The full suite was not run: one assertion kill settles it"
+
+    # The finding must come from a complete run, never from the subset.
+    assert_contains "the survivor is still reported as reddening nothing" \
+        "survivor: reddened nothing."
+    # Line-scoped on purpose: a glob over the whole transcript would match the "candidate set"
+    # wording of a DIFFERENT mutation further down the report.
+    if printf '%s\n' "$fast" | grep "survivor" | grep -q "candidate set"; then
+        fail "the survivor verdict came from the subset, not the full suite"
+    else
+        ok "the survivor verdict did not come from the subset"
+    fi
+
+    mutate "$repo" --no-fast --cmd "python3 -m pytest -q" "$d/mutations.toml"
+    slow="$OUT"
+    assert_status "--no-fast reaches the same exit status" 2
+    assert_eq "the fast tier changes no verdict: the summary line is identical" \
+        "$(printf '%s' "$slow" | sed -n 's/.*: \([0-9]* killed by assertion.*\)/\1/p')" \
+        "$(printf '%s' "$fast" | sed -n 's/.*: \([0-9]* killed by assertion.*\)/\1/p')"
+
+    # A test that passes in the suite but fails alone must not become the next mutation's kill.
+    make_order_dependent_fixture "$iso"
+    write_iso_mutations "$d/iso.toml"
+    mutate "$iso" --cmd "python3 -m pytest -q" "$d/iso.toml"
+    assert_contains "a test red only in isolation is not credited as a kill" \
+        "must-survive: reddened nothing."
+    assert_status "so the survivor is still a finding (exit 2)" 2
+
+    # Appending ids to a command that names its own paths would widen the run; refuse to.
+    mutate "$repo" --cmd "python3 -m pytest -q tests/" "$d/mutations.toml" survivor
+    assert_contains "a command naming its own path turns the fast tier off, and says why" \
+        "already names a path or test id"
+    mutate "$repo" --env go --cmd "python3 -m pytest -q" "$d/mutations.toml" survivor
+    assert_contains "a non-pytest env turns the fast tier off, and says why" \
+        "only the pytest env selects by test id"
+    mutate "$repo" --no-fast --cmd "python3 -m pytest -q" "$d/mutations.toml" survivor
+    assert_contains "--no-fast says so plainly in the header" \
+        "fast tier: off (disabled with --no-fast)"
+}
+
+
+# --- test 18: the caller's 'tests' hint is a hint, and never a filter ----------------------
+#
+# 'tests' says "I expect these to fail". It only decides what the fast tier tries FIRST, so
+# it can be wrong, stale, or absent without changing a single verdict. What it buys is the
+# first mutation of a sweep, which otherwise pays a full run before anything is primed.
+
+write_hinted_mutations() {
+    cat > "$1" <<'EOF'
+[[mutation]]
+name = "hinted-kill"
+tests = ["tests/test_mod.py::test_walk_returns_the_steps"]
+[[mutation.edit]]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [999, 331, 721]'''
+
+[[mutation]]
+name = "stale-hint"
+tests = ["tests/test_mod.py::test_renamed_last_week"]
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return "hello " + name'''
+new = '''    return "hello"'''
+
+[[mutation]]
+name = "hinted-survivor"
+tests = ["tests/test_mod.py::test_walk_returns_the_steps"]
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 3'''
+EOF
+}
+
+test18() {
+    echo "test 18: a 'tests' hint steers the fast tier without steering any verdict"
+    need_pytest || return 0
+    local d="$WORK/t18" repo="$WORK/t18/repo"
+    mkdir -p "$d"
+    make_cluster_fixture "$repo"
+    write_hinted_mutations "$d/mutations.toml"
+
+    mutate "$repo" --check "$d/mutations.toml"
+    assert_status "--check accepts a mutation carrying 'tests'" 0
+    assert_contains "and --check says how many tests it expects to fail" \
+        "[expects 1 test(s) to fail]"
+
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/mutations.toml"
+    # The point of the hint: mutation 1 needs no priming run first.
+    assert_contains "the FIRST mutation is settled by the hint, with nothing primed yet" \
+        "[1/3] hinted-kill ... reddened 1 by assertion in the 1-test candidate set"
+    # A stale id makes pytest collect nothing at all, so it must be said out loud.
+    assert_contains "a stale hint is reported rather than passing as a silent slowdown" \
+        "stale-hint: selected no test that could be collected"
+    assert_contains "and the stale-hinted mutation is still measured, by the full suite" \
+        "stale-hint: reddened 1 -- 1 by assertion, 0 by error."
+    # A hint pointing at a test the mutation cannot redden must not manufacture anything.
+    assert_contains "a hint cannot turn a survivor into a kill" \
+        "hinted-survivor: reddened nothing."
+    assert_status "so the sweep still exits 2 for the finding" 2
+
+    # Same file, hints removed: every verdict must be identical.
+    sed '/^tests = /d' "$d/mutations.toml" > "$d/nohints.toml"
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/nohints.toml"
+    assert_status "dropping every hint changes no exit status" 2
+    assert_contains "and no verdict: the survivor is still the survivor" \
+        "hinted-survivor: reddened nothing."
+
+    # The parser refuses a malformed hint rather than quietly ignoring it.
+    cat > "$d/bad.toml" <<'EOF'
+[[mutation]]
+name = "bad-hint"
+tests = "tests/test_mod.py::test_walk_returns_the_steps"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 3'''
+EOF
+    mutate "$repo" --check "$d/bad.toml"
+    assert_status "a 'tests' that is not an array is a usage error" 1
+    assert_contains "and it says what 'tests' must be" "must be a non-empty array of test ids"
+}
+
+
 test1
 test2
 test3
@@ -1106,6 +1380,8 @@ test13
 test14
 test15
 test16
+test17
+test18
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1125,6 +1401,8 @@ echo "13. exit status separates clean, finding and broken measurement ... test13
 echo "14. a failing, unparseable run is 'not measured', never a survivor . test14"
 echo "15. an unreadable failing baseline refuses to sweep, naming --cmd .. test15"
 echo "16. -h teaches the file format, and its example passes the guards . test16"
+echo "17. the fast tier narrows the sweep but never invents a kill ...... test17"
+echo "18. a caller's 'tests' hint steers the tier, never a verdict ...... test18"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
 [ "$TESTS_FAILED" -eq 0 ]

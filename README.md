@@ -289,8 +289,8 @@ only the XML the classifier reads, so no directory is ever removed and a repo's 
 `docs/target/annual-reports` is untouched. No `rm`, no `-rf`, no `-exec`.
 
 **Per-project defaults live in `.git/info/git-mutate`.** A Java or Go repo should not need the same three
-flags on every invocation. Keys are `env`, `cmd`, `assertion_pattern` and `timeout`; an explicit flag always
-beats the file, and an unknown key warns rather than being ignored:
+flags on every invocation. Keys are `env`, `cmd`, `assertion_pattern`, `timeout`, `fast`, `fast_cmd` and `fast_max`; an explicit flag
+always beats the file, and an unknown key warns rather than being ignored:
 
 ```
 env = mvn
@@ -308,6 +308,85 @@ cannot be a kill. And if the unmutated suite exits non-zero while matching no li
 recognises at all, the sweep refuses too, naming the command and pointing at `--cmd`: that is not "no
 pre-existing failures", it is a suite this pytest-shaped classifier cannot read, and every mutation
 afterwards would be unmeasurable.
+
+## The fast tier: narrowing that cannot invent a kill
+
+A sweep is one full test run per mutation, plus a baseline, so its cost is `(n + 1) x suite`. The obvious
+saving -- run only the tests that could plausibly notice -- is also the obvious way to manufacture a false
+finding: a subset that misses the reddening prints *"reddened nothing"*, which is exactly the output this
+tool exists to prevent.
+
+What makes narrowing safe here is an asymmetry in the verdicts themselves. **A kill is monotone.** Running
+more tests can add reddened tests; it can never remove one. So if a subset already contains one assertion
+kill, the full suite's verdict is provably the same `killed` -- only the row list is shorter. The verdicts
+that require completeness are `survived` and `error-only`, and those are precisely the findings.
+
+So the tier short-circuits in one direction only:
+
+| subset result | what happens |
+|---|---|
+| at least one assertion kill | verdict is `killed`, full suite not run |
+| no assertion kill | full unnarrowed suite |
+| a line the classifier cannot read (`U`) | full unnarrowed suite |
+| a compile failure | full unnarrowed suite |
+
+Every **finding** therefore still comes from a complete run. A badly chosen subset costs time, never
+correctness -- which is what lets the subset be chosen by a heuristic at all.
+
+**The subset primes itself.** Mutations in a real sweep cluster: they are written against one behaviour, so
+the same handful of tests kills most of them. Every assertion kill from a full run is remembered, and later
+mutations try that set first. No coverage instrumentation, no dependency graph, no plugin -- the sweep learns
+its own subset as it goes, and the set is capped (`--fast-max`, default 25) so it stays quick.
+
+**A test that fails only in isolation would be a false kill.** Shared module state, ordering, a fixture
+another test primed -- run alone, such a test is red for reasons that have nothing to do with the mutation,
+and crediting it would swallow a survivor. So each distinct kill set is priced once against a *clean* tree
+and whatever is red there is excluded, exactly as the full baseline is. Memoized on the set's contents, so
+it costs a couple of tiny runs per sweep. Note the direction of this failure: it hides a finding rather than
+inventing one, which is still wrong, and it is the reason the guard is not optional.
+
+**It turns itself off, loudly, rather than guess.** Appending test ids to `pytest tests/` runs all of
+`tests/` *and* the ids -- slower than the full run it replaced. So the resolved command is parsed, and the
+tier stays off, with a printed reason, whenever ids cannot simply be appended: a non-pytest `--env`, a
+command that is not pytest-shaped, one that already names its own paths, or an option the parser cannot
+prove is not a value. `--fast-cmd '<cmd> {}'` drives it manually; `--no-fast` disables it.
+
+One consequence worth knowing: `--timeout` bounds a single run, and an escalating mutation makes two, so a
+mutation that escalates can take up to twice the timeout in wall clock (three times if its kill set is being
+priced that iteration).
+
+
+### Telling it what you expect to fail
+
+A `[[mutation]]` may carry the ids you expect this mutation to redden. The fast tier tries them
+first:
+
+```toml
+[[mutation]]
+name = "history-never-sent"
+tests = ["tests/test_claims.py::test_history_is_sent"]
+[[mutation.edit]]
+file = "src/autorp/claims.py"
+old = '''        "history": _history_anchor(played),'''
+new = '''        "history": [],'''
+```
+
+It is a **hint, never a filter.** It changes only which tests run first. A hint that reddens nothing
+falls through to the full suite like any other subset, so a wrong or stale one costs time and never a
+verdict -- the same asymmetry the tier rests on everywhere else. Dropping every `tests` line from a
+mutations file changes no result, only the wall clock.
+
+What it actually buys is the *first* mutation of a sweep. Without a hint the tier has nothing primed
+yet, so mutation 1 always pays a full run; with one, it can be settled in seconds, and its kill then
+primes the rest. On a clustered eight-mutation sweep over a four-second suite: 40s unhinted with
+`--no-fast`, 12s with the tier priming itself, 9s with every mutation hinted.
+
+One sharp edge, which is why a bad hint is reported rather than ignored: **pytest collects nothing at
+all when any id fails to match** -- it exits 4 and drops the valid ids alongside the bad one. A single
+renamed test therefore disables the tier for that mutation, and the only symptom would be a sweep that
+is quietly slower than it should be. So the sweep collects those and says so at the end, naming each
+mutation. The verdicts remain sound; the hint does not.
+
 
 ## The tree, and saying so
 
