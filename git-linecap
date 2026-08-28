@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Maximum allowed line length
+MAX_LENGTH=1000
+
+# Find staged files and check added/modified lines using git diff
+# -z outputs null-terminated file names, handled safely
+git diff --cached --name-only -z | xargs -0 -I {} \
+  git diff --cached -U0 -- "{}" | grep '^[+][^+]' | while read -r line; do
+    # Remove the leading '+' character from the diff line
+    content="${line#+}"
+    if [ ${#content} -gt $MAX_LENGTH ]; then
+      echo "Error: Line exceeds $MAX_LENGTH characters in staged changes:"
+      echo "  $content"
+      exit 1
+    fi
+  done
