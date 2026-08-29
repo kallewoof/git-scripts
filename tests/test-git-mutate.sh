@@ -1364,6 +1364,151 @@ EOF
 }
 
 
+# --- test 20: a green baseline that ran nothing refuses, and a stale report cannot rescue it -
+
+# The mirror of test 15. There the baseline failed unreadably; here it *passes*, having
+# executed no tests at all -- the shape a mistyped selector produces, since Surefire takes a
+# comma-separated list and an unmatched selector plus -Dsurefire.failIfNoSpecifiedTests=false
+# exits green having run nothing. Left unguarded, every mutation afterwards reports "reddened
+# nothing", which reads as a survivor and is a measurement that never happened.
+#
+# The third case is the one with teeth: Surefire's XML persists on disk, so a run that executes
+# nothing leaves the previous run's reports in place. Counting those would report the earlier
+# run's total, the guard would not fire, and the sweep would proceed on a stale measurement.
+make_surefire_fixture() {
+    local repo="$1" tests_attr="$2"
+    init_repo "$repo"
+
+    cat > "$repo/mod.py" <<'EOF'
+def add(a, b):
+    return a + b
+EOF
+
+    mkdir -p "$repo/target/surefire-reports"
+    if [ -n "$tests_attr" ]; then
+        cat > "$repo/runner.sh" <<EOF
+#!/bin/bash
+d="\$(cd "\$(dirname "\$0")" && pwd)"
+mkdir -p "\$d/target/surefire-reports"
+printf '<testsuite name="Mod" tests="%s" failures="0" errors="0" skipped="0"/>\n' "$tests_attr" \
+    > "\$d/target/surefire-reports/TEST-Mod.xml"
+exit 0
+EOF
+    else
+        cat > "$repo/runner.sh" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    fi
+    chmod +x "$repo/runner.sh"
+
+    printf '%s\n' \
+        '[[mutation]]' \
+        'name = "add-subtracts"' \
+        '[[mutation.edit]]' \
+        'file = "mod.py"' \
+        "old = \"\"\"    return a + b\"\"\"" \
+        "new = \"\"\"    return a - b\"\"\"" \
+        > "$repo/mutations.toml"
+    commit_all "$repo" "surefire fixture"
+}
+
+test20() {
+    echo "test 20: a green baseline that executed no tests refuses, and a stale report cannot rescue it"
+    local d="$WORK/t20"
+    mkdir -p "$d"
+
+    make_surefire_fixture "$d/none" ""
+    mutate "$d/none" --env mvn --cmd "$d/none/runner.sh" "$d/none/mutations.toml"
+    assert_status "a green baseline that ran nothing refuses (exit 1), it does not sweep" 1
+    assert_contains "the refusal says how many tests ran" "executed 0 tests"
+    assert_contains "the refusal explains why a survivor would be fiction" "reddened nothing"
+    assert_contains "the refusal points at the selector, which is the usual cause" "comma-separated"
+    assert_no_sweep_state "$d/none" "a refused baseline leaves no lock or marker"
+
+    make_surefire_fixture "$d/some" "2"
+    mutate "$d/some" --env mvn --cmd "$d/some/runner.sh" "$d/some/mutations.toml"
+    assert_missing "a baseline that really ran tests is not refused" "executed 0 tests"
+
+    make_surefire_fixture "$d/stale" ""
+    mkdir -p "$d/stale/target/surefire-reports"
+    printf '<testsuite name="Old" tests="7" failures="0" errors="0" skipped="0"/>\n' \
+        > "$d/stale/target/surefire-reports/TEST-Old.xml"
+    touch -d "2020-01-01 00:00:00" "$d/stale/target/surefire-reports/TEST-Old.xml"
+    mutate "$d/stale" --env mvn --cmd "$d/stale/runner.sh" "$d/stale/mutations.toml"
+    assert_status "a previous run's report does not count as this run's measurement" 1
+    assert_contains "the stale report is not mistaken for tests this run executed" "executed 0 tests"
+}
+
+# --- test 19: an expectation that did not come true is said out loud ----------------------
+#
+# The case this exists for: you name test_x, test_y does the killing instead. The verdict is
+# a clean "killed by assertion" and the sweep exits 0, so without this the fact that your
+# expectation was wrong is invisible -- you would have to notice that the test named in the
+# report is not the test you named, across every mutation in the sweep.
+
+write_expectation_mutations() {
+    cat > "$1" <<'EOF'
+[[mutation]]
+name = "wrong-expectation"
+tests = ["tests/test_mod.py::test_walk_returns_the_steps"]
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return "hello " + name'''
+new = '''    return "hello"'''
+
+[[mutation]]
+name = "right-expectation"
+tests = ["tests/test_mod.py::test_walk_returns_the_steps"]
+[[mutation.edit]]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [999, 331, 721]'''
+EOF
+}
+
+test19() {
+    echo "test 19: an expectation the run did not bear out is reported, without changing the verdict"
+    need_pytest || return 0
+    local d="$WORK/t19" repo="$WORK/t19/repo"
+    mkdir -p "$d"
+    make_cluster_fixture "$repo"
+    write_expectation_mutations "$d/mutations.toml"
+
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/mutations.toml"
+    assert_status "every mutation was killed by an assertion, so the sweep is clean (exit 0)" 0
+    assert_contains "the section names the mutation and the test that did not fail" \
+        "wrong-expectation: expected 'tests/test_mod.py::test_walk_returns_the_steps' to fail; it passed."
+    assert_contains "the summary counts the unmet expectation" "1 expectation(s) not met"
+    assert_contains "and says the verdict itself still stands" \
+        "What is wrong here is the expectation, not the measurement."
+    # The mutation was still killed -- by the OTHER test. The expectation is what was wrong.
+    assert_contains "the mutation is still reported as killed, by the test that did redden" \
+        "test_render_greets_by_name"
+    # An expectation that came true is not mentioned at all.
+    case "$OUT" in
+        *"right-expectation: expected"*)
+            fail "an expectation that came true was reported anyway" ;;
+        *) ok "an expectation that came true is not mentioned" ;;
+    esac
+
+    # A hint that reddens only by error is not a met expectation either.
+    cat > "$d/erroring.toml" <<'EOF'
+[[mutation]]
+name = "hint-errors-only"
+tests = ["tests/test_mod.py::test_walk_returns_the_steps"]
+[[mutation.edit]]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = undefined_name'''
+EOF
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/erroring.toml"
+    assert_contains "a hint that only errors is not counted as met, and says why" \
+        "failed only by error, which proves nothing about the behaviour"
+    assert_status "an error-only kill is still a finding (exit 2), unchanged by the expectation" 2
+}
+
+
 test1
 test2
 test3
@@ -1382,6 +1527,8 @@ test15
 test16
 test17
 test18
+test19
+test20
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1403,6 +1550,8 @@ echo "15. an unreadable failing baseline refuses to sweep, naming --cmd .. test1
 echo "16. -h teaches the file format, and its example passes the guards . test16"
 echo "17. the fast tier narrows the sweep but never invents a kill ...... test17"
 echo "18. a caller's 'tests' hint steers the tier, never a verdict ...... test18"
+echo "19. an expectation that did not come true is reported .......... test19"
+echo "20. a green baseline that ran nothing refuses; stale reports uncounted  test20"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
 [ "$TESTS_FAILED" -eq 0 ]

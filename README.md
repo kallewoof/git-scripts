@@ -388,6 +388,24 @@ is quietly slower than it should be. So the sweep collects those and says so at 
 mutation. The verdicts remain sound; the hint does not.
 
 
+**It also checks your expectation.** If a test you named does not fail, the sweep says so under
+`EXPECTATIONS NOT MET`:
+
+```
+== EXPECTATIONS NOT MET -- a test you named did not fail ==
+  hint-was-wrong: expected 'tests/test_mod.py::test_score_of_zero' to fail; it passed.
+```
+
+The case worth having is when the mutation is killed *anyway*, by a different test. Then the report
+reads `killed by assertion`, names a test that is not the one you named, and the sweep exits 0 -- so
+"I thought `test_x` covered this, and actually `test_y` does" is invisible unless it is said. A hint
+that reddens only by error does not count as met either, and says so.
+
+This never changes a verdict or an exit status. *This behaviour is undefended* and *your guess about
+which test defends it was wrong* are different claims; folding the second into the first would make a
+clean sweep unreadable in exactly the way a score does.
+
+
 ## The tree, and saying so
 
 The snapshot is taken **by the tool, immediately before it mutates, from the tree it is about to change.** A

@@ -155,6 +155,14 @@ otherwise pays a full run before anything is primed. Note that pytest collects N
 any id fails to match, so one stale id disables the tier for that mutation -- the sweep says
 so at the end rather than letting it pass as a silent slowdown.
 
+Naming 'tests' also buys a check on yourself. If a test you named does not fail, the sweep
+says so under EXPECTATIONS NOT MET -- including when the mutation was killed anyway, by some
+other test. That case is the one worth having: the verdict reads "killed by assertion", the
+sweep exits 0, and without this line the fact that the test you believed defends this
+behaviour does not would never surface. It never changes a verdict or the exit status: "this
+behaviour is undefended" and "your guess about which test defends it was wrong" are different
+claims, and folding them together would make a clean sweep unreadable.
+
 A mutation may list several [[mutation.edit]] tables. That is how a two-part change -- add
 something here, drain it there -- stays one mutation, applied and reported as one.
 
@@ -572,6 +580,70 @@ PY
 # Classify a captured test log into TSV rows: <kind>\t<test id>\t<message>, kind being
 # A (assertion kill), E (error kill) or U (unclassifiable -- reported loudly, never folded
 # silently into either bucket).
+# Tests the last run actually executed, or -1 when this ecosystem gives us nothing to count.
+#
+# A green run that executed nothing is not "no test distinguishes the mutation" -- it is a
+# command that measures nothing, and every mutation after it would be scored against a
+# measurement that never happened. The guard for it lives at the baseline, beside the one for
+# an unreadable failure.
+#
+# $2 is a timestamp taken before the run. Surefire reports persist on disk, so a run that
+# executes no tests leaves the *previous* run's XML in place; counting those would report the
+# earlier run's total and defeat the whole check.
+py_count_tests() {
+    python3 - "$1" "$2" <<'PYCOUNT'
+import glob
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+ENV = os.environ.get("GIT_MUTATE_ENV", "pytest")
+log_path, since = sys.argv[1], float(sys.argv[2])
+
+if ENV == "mvn":
+    total, saw_fresh_report = 0, False
+    for path in sorted(
+        glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)
+        + glob.glob("**/target/failsafe-reports/TEST-*.xml", recursive=True)
+    ):
+        try:
+            if os.path.getmtime(path) < since:
+                continue
+            root = ET.parse(path).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        saw_fresh_report = True
+        total += int(root.get("tests") or 0)
+    print(total if saw_fresh_report else 0)
+    sys.exit(0)
+
+try:
+    text = open(log_path, errors="replace").read()
+except OSError:
+    print(-1)
+    sys.exit(0)
+
+if ENV == "pytest":
+    if re.search(r"\bno tests ran\b", text):
+        print(0)
+        sys.exit(0)
+    collected = re.findall(r"\bcollected (\d+) items?", text)
+    if collected:
+        print(max(int(x) for x in collected))
+        sys.exit(0)
+    total, found = 0, False
+    for word in ("passed", "failed", "errors", "error", "skipped", "xfailed", "xpassed"):
+        for value in re.findall(r"(\d+) %s\b" % word, text):
+            total += int(value)
+            found = True
+    print(total if found else -1)
+    sys.exit(0)
+
+print(-1)
+PYCOUNT
+}
+
 py_classify() {
     python3 - "$1" <<'PY'
 import os
@@ -1262,6 +1334,7 @@ echo
 
 baseline_ids="$work/baseline.ids"
 : > "$baseline_ids"
+baseline_started=$(date +%s)
 run_test_cmd "$work/baseline.log"
 baseline_rc=$?
 py_classify "$work/baseline.log" > "$work/baseline.rows"
@@ -1278,6 +1351,27 @@ recognises as FAILED/ERROR ('$test_cmd'). The classifier is pytest-shaped: it ca
 real failure from another runner's output, so no mutation afterwards would be measurable.
 Pass a pytest-compatible command with --cmd."
 fi
+# A green baseline that executed no tests is the mirror of the unreadable-failure case above:
+# nothing is red because nothing ran. Left alone, every mutation afterwards reports "reddened
+# nothing", which reads as a survivor and is in fact a measurement that never happened. A
+# selector typo is the usual cause -- Surefire takes a comma-separated list, and an unmatched
+# selector combines with -Dsurefire.failIfNoSpecifiedTests=false into a silent green run.
+# Only a *green* baseline: a failing or erroring one is already refused by the guards around
+# this one, and they say something more specific than "0 tests ran".
+baseline_tests=-1
+if [ "$baseline_rc" -eq 0 ]; then
+    baseline_tests=$(py_count_tests "$work/baseline.log" "$baseline_started" 2>/dev/null)
+    case "$baseline_tests" in
+        ''|*[!0-9-]*) baseline_tests=-1 ;;
+    esac
+fi
+if [ "$baseline_tests" = "0" ]; then
+    die "the unmutated test command executed 0 tests ('$test_cmd'). Nothing is red because
+nothing ran, so every mutation would report 'reddened nothing' -- a survivor that was never
+measured. Check the test selector: Surefire takes a comma-separated list, and an unmatched
+selector plus -Dsurefire.failIfNoSpecifiedTests=false exits green having run nothing."
+fi
+
 if grep -q '^E' "$work/baseline.rows"; then
     {
         echo "$SELF: the unmutated suite is red with errors:"
@@ -1312,6 +1406,7 @@ while IFS= read -r d; do
     name=$(cat "$d/name")
     res="$work/res/$idx"
     printf '%s' "$name" > "$res.name"
+    [ -f "$d/tests" ] && cp "$d/tests" "$res.hints"
     printf '[%d/%d] %s ... ' "$i" "$n_selected" "$name"
 
     plan="$work/plan.$idx"
@@ -1510,6 +1605,50 @@ done <<< "$mut_dirs"
 # number, "this mutation reddened nothing" invites thought.
 # ---------------------------------------------------------------------------------------
 
+# An expectation the caller stated and the run did not bear out. This is NOT a finding about
+# the code -- the mutation may well have been killed, by some other test -- it is a finding
+# about the caller's model of their own suite, and today it is invisible: the report says
+# "killed by assertion", names a test, and never mentions that it is not the test you named.
+#
+# Deliberately kept out of the exit status. "This behaviour is undefended" (2) and "your guess
+# about which test defends it was wrong" are different claims, and folding the second into the
+# first would make a clean sweep unreadable in exactly the way a score does.
+n_unmet=0
+expectations() {
+    local f res status name id kind any=0
+    for f in "$work"/res/*.status; do
+        [ -f "$f" ] || continue
+        res="${f%.status}"
+        [ -f "$res.hints" ] || continue
+        status=$(cat "$f")
+        # Only where a verdict was actually measured: after a refusal or a compile failure the
+        # hint obviously did not redden, and saying so would be noise, not news.
+        case "$status" in killed|survived|error-only) ;; *) continue ;; esac
+        name=$(cat "$res.name")
+        while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            awk -F'\t' -v want="$id" '$1=="A" && $2==want {f=1} END {exit !f}' "$res.rows" && continue
+            if awk -F'\t' -v want="$id" '$1=="E" && $2==want {f=1} END {exit !f}' "$res.rows"; then
+                kind="failed only by error, which proves nothing about the behaviour"
+            else
+                kind="passed"
+            fi
+            if [ "$any" -eq 0 ]; then
+                echo
+                echo "== EXPECTATIONS NOT MET -- a test you named did not fail =="
+                any=1
+            fi
+            n_unmet=$((n_unmet + 1))
+            echo "  $name: expected '$id' to fail; it $kind."
+        done < "$res.hints"
+    done
+    if [ "$any" -eq 1 ]; then
+        echo "      Each mutation's own verdict above stands -- something else may well have"
+        echo "      killed it. What is wrong here is the expectation, not the measurement."
+    fi
+    return 0
+}
+
 print_rows() {
     local res="$1" want="$2" label="$3"
     [ -f "$res.rows" ] || return 0
@@ -1587,6 +1726,7 @@ echo "======================================================================"
 section "FINDINGS -- read these first" survived error-only
 section "NOT MEASURED -- the sweep is incomplete here" refused unclassified timeout compile-failed
 section "KILLED BY ASSERTION" killed
+expectations
 echo
 
 count_status() {
@@ -1602,7 +1742,9 @@ n_findings=$(count_status "survived error-only")
 n_unmeasured=$(count_status "refused timeout unclassified compile-failed")
 n_killed=$(count_status "killed")
 
-echo "$SELF: $n_killed killed by assertion, $n_findings finding(s), $n_unmeasured not measured."
+unmet_note=""
+[ "$n_unmet" -gt 0 ] && unmet_note=", $n_unmet expectation(s) not met"
+echo "$SELF: $n_killed killed by assertion, $n_findings finding(s), $n_unmeasured not measured$unmet_note."
 
 if [ "$n_unmeasured" -gt 0 ]; then
     exit 3
