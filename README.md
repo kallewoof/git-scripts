@@ -465,12 +465,34 @@ readers to skim past findings in exactly the repos where mutations most often fa
 suffix or an assertion type the current `--env` does not know -- both obvious on sight, invisible from a
 count alone.
 
-**Why python3 appears in a bash script:** two operations must not be mis-escaped -- parsing literal
-multi-line anchors, and counting and replacing a literal multi-line substring -- and `sed`/`grep` cannot do
-either without quoting the anchor, which is exactly how a previous harness came to print `ANCHOR 0x --
-skipped` for every mutation. Those two, plus the summary-line regex, are embedded `python3` heredocs using
-only the standard library (`tomllib`, so python 3.11+); orchestration, locking, snapshot/restore and
-reporting are bash. Run `tests/test-git-mutate.sh` to exercise all of it against throwaway repos.
+**The implementation is python3 (3.11+, standard library only).** It began as bash, and grew a data model
+bash had nowhere to put: a ten-field per-mutation record emulated in sidecar files, ~116 `awk`/`sed`/`grep`
+invocations doing work a language with values does natively, and the three most delicate operations --
+parsing literal multi-line anchors, counting and replacing a literal multi-line substring, and classifying
+the summary line -- already living in embedded `python3` heredocs, because `sed`/`grep` cannot do them
+without quoting the anchor, which is exactly how a previous harness came to print `ANCHOR 0x -- skipped`
+for every mutation.
+
+`git-mutate-bash` is that earlier implementation, kept as a reference. Both pass the same suite, byte for
+byte, on the same fixtures -- the tests are written against the CLI (stdout, stderr, exit status, tree
+state), never against internals, which is what made the conversion checkable rather than hopeful. Run
+`tests/test-git-mutate.sh` to exercise either; `GIT_MUTATE_BIN=./git-mutate-bash tests/test-git-mutate.sh`
+picks the other one.
+
+**Cached bytecode is invalidated on every write.** CPython validates a `.pyc` against its source's
+`(mtime, size)`. A mutation like `A = 1` -> `A = 2` preserves the size, and a sweep is fast enough --
+especially with the fast tier -- that the write lands inside the same mtime second as the existing `.pyc`.
+The test run then imports the *previous* bytecode and the sweep measures code that is not in the tree.
+When the stale bytecode happens to be the unmutated original, the mutation reddens nothing and reports a
+false finding, which is the one output this tool must never produce. So the `__pycache__` entry for any
+`.py` the sweep rewrites is deleted -- on the restore as well as on the apply, since a stale *mutated*
+`.pyc` would otherwise poison the next clean run, including the fast tier's isolation baseline. Scoped to
+`.py`: a compiled language rebuilds through its own build tool, which does its own staleness check.
+
+This was a real defect, not a hypothetical: four single-digit constant edits on one file reported each
+other's values, differently on each run and in both implementations. `test21` pins it by observation --
+each edit must produce its own distinct assertion message -- because pinning the mechanism would only
+test the fix rather than the property.
 
 # Other resources
 

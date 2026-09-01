@@ -1,0 +1,1784 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Karl-Johan Alm
+# Distributed under the MIT software license, see the accompanying
+# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+
+# Usage:
+#   git mutate - [name...]
+#                         Read TOML from standard input and run every mutation (or only the
+#                         named ones), one at a
+#                         time: guard it, snapshot the files it touches, apply it, run the
+#                         test command, restore the tree, and classify every failing test as
+#                         an assertion kill or an error kill.
+#   git mutate --check - [name...]
+#                         Run every guard and mutate nothing -- a fast "do my anchors still
+#                         match?" loop that runs no tests.
+#   git mutate <mutations-file> [name...]
+#                         A file path is also accepted when another tool already produced one.
+#   git mutate --recover  Restore the tree from a stale sweep's snapshot and cmp-verify it.
+#                         A sweep killed with -9 cannot restore itself; nothing else can
+#                         leave a mutated tree behind. Never automatic: a snapshot of
+#                         unknown age restoring silently would be a data-loss bug wearing a
+#                         safety mechanism's clothing.
+#
+#   --cmd <shell command> Test command, instead of the pytest hook found in
+#                         .pre-commit-config.yaml.
+#   --timeout <seconds>   Per-mutation timeout, default 900. A timeout is reported as
+#                         "not measured", never as "reddened nothing".
+#   --no-fast             Disable the fast tier; run the full suite for every mutation.
+#   --fast-cmd <template> Subset command for the fast tier; '{}' takes the test ids.
+#   --fast-max <n>        Cap on the primed kill set, default 25.
+#
+# Run it UNPIPED. A sweep is slow -- one full test run per mutation, plus a baseline -- and
+# it prints one line per mutation as that mutation finishes, so an unpiped run is a live
+# progress report. Piping it through `grep`/`head` buys nothing (the sweep is not spammy:
+# three header lines, one line per mutation, then the report) and costs everything: the
+# filter blocks until the whole sweep ends, so a run that is stuck, timing out, or refusing
+# every anchor looks identical to one that is working. `head` is worse -- it can SIGPIPE the
+# sweep mid-mutation, which is the one way to leave a tree needing --recover.
+#
+# The tool is stateless. Mutations are passed on stdin for one invocation and forgotten; a
+# file path is supported but there is normally no reason to create one. README.md says why a
+# persistent mutations file is not offered -- briefly: anchors are coupled to the code's current text
+# while tests are coupled to its behaviour, so a stale anchor either matches nothing or,
+# worse, matches a comment, reddens nothing, and reports a false finding.
+#
+# Exit status (precedence when several apply: 4 > 3 > 2):
+#     0  every selected mutation was measured and killed by at least one assertion
+#     1  usage or environment error -- nothing was measured
+#     2  findings: a mutation reddened nothing, or was reddened only by errors
+#     3  not measured: a mutation was refused, timed out, failed to compile, produced a
+#        line we cannot classify, or failed while matching nothing we can classify at all
+#     4  restore verification failed -- THE TREE MAY STILL BE MUTATED
+#   130  interrupted; the tree was restored
+# A survivor is a finding (2), never a tool failure -- conflating them would make the tool
+# useless in a pipeline.
+
+set -u
+
+SELF="git-mutate"
+MARKER_NAME="MUTATION-SWEEP-IN-PROGRESS"
+LOCK_BASENAME="git-mutate.lock"
+DEFAULT_TIMEOUT=900
+DEFAULT_FAST_MAX=25
+
+# Appended to any test command that looks like pytest. All four are load-bearing:
+#   -p no:randomly  test order must be identical across mutations or the reddened sets are
+#                   not comparable. Harmless when the plugin is absent.
+#   --tb=line       makes the classification substrate exist: one summary line per failure,
+#                   carrying the test id and the failure text.
+#   -rfE            pytest's default report chars already include f and E; saying it out
+#                   loud means a repo's own -r setting cannot take the summary away.
+#   COLUMNS/NO_COLOR are set in the child environment, see run_test_cmd.
+
+# Two texts, on purpose. usage() is the terse reminder printed beside an error, on stderr.
+# help_text() is the whole interface, on stdout, and it carries the mutations-file format:
+# a caller that has to go and find a README to learn the TOML schema will instead guess it,
+# and the tool's own help is the only copy that cannot be installed without it.
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  git mutate - [name...]                  Read TOML from stdin; run all or named mutations.
+  git mutate --check - [name...]          Read TOML from stdin; run guards only, no tests.
+  git mutate <mutations-file> [name...]   A file path is also accepted.
+  git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
+
+  --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
+  --env <name>            Test ecosystem: pytest (default), mvn, go, rust, dotnet.
+  --assertion-pattern <re> Extra regex that marks a message as an assertion kill.
+  --timeout <seconds>     Per-mutation timeout (default 900).
+  --no-fast               Run the full suite for every mutation (see THE FAST TIER).
+  --fast-cmd <template>   Subset command; '{}' is replaced by the test ids.
+  --fast-max <n>          Cap the primed kill set (default 25).
+
+For the mutations-file format, and what each guard refuses: git mutate -h
+EOF
+}
+
+help_text() {
+    cat <<'EOF'
+git mutate -- break the code on purpose, and report whether the tests noticed.
+
+For each mutation: guard it, snapshot the files it touches, apply it, run the test command,
+restore the tree, and classify every failing test as an assertion kill (a test checks this
+behaviour) or an error kill (the mutation merely broke the code, proving nothing).
+
+Usage:
+  git mutate - [name...]                  Read TOML from stdin; run all or named mutations.
+  git mutate --check - [name...]          Read TOML from stdin; run guards only, no tests.
+  git mutate <mutations-file> [name...]   A file path is also accepted.
+  git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
+
+  --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
+  --env <name>            Test ecosystem: pytest (default), mvn, go, rust, dotnet.
+  --assertion-pattern <re> Extra regex that marks a message as an assertion kill.
+  --timeout <seconds>     Per-mutation timeout (default 900).
+  --no-fast               Run the full suite for every mutation (see THE FAST TIER).
+  --fast-cmd <template>   Subset command; '{}' is replaced by the test ids.
+  --fast-max <n>          Cap the primed kill set (default 25).
+
+MUTATIONS are TOML. Prefer a heredoc into 'git mutate -': it is visibly one-use, leaves no
+temporary file to clean up, and cannot become a stale mutation suite by accident:
+
+  git mutate - <<'TOML'
+  [[mutation]]
+  name = "history-never-sent"
+  [[mutation.edit]]
+  file = "src/autorp/claims.py"
+  old = '''        "history": _history_anchor(played),'''
+  new = '''        "history": [],'''
+  TOML
+
+'name', 'file', 'old' and 'new' are all required; 'tests' is optional. Arguments after '-' select mutations by
+their 'name'. A file path remains supported when another tool already produced the TOML.
+
+'file' is relative to the repo root. Anchors are matched byte-for-byte against the file's
+bytes: write them as literal ''' strings, so nothing needs escaping and the leading
+indentation is part of the anchor. TOML drops a newline immediately after the opening ''',
+which is what lets a multi-line anchor start on its own line:
+
+  old = '''
+        if not allowed:
+            raise PermissionError(name)'''
+
+A mutation may also carry 'tests': the ids you expect to fail, tried first by the fast tier.
+
+  [[mutation]]
+  name = "history-never-sent"
+  tests = ["tests/test_claims.py::test_history_is_sent"]
+
+It is a HINT, never a filter. It only changes which tests run FIRST; a hint that reddens
+nothing falls through to the full suite exactly like any other subset, so a wrong or stale
+hint costs time and never a verdict. Its real value is the first mutation of a sweep, which
+otherwise pays a full run before anything is primed. Note that pytest collects NOTHING when
+any id fails to match, so one stale id disables the tier for that mutation -- the sweep says
+so at the end rather than letting it pass as a silent slowdown.
+
+Naming 'tests' also buys a check on yourself. If a test you named does not fail, the sweep
+says so under EXPECTATIONS NOT MET -- including when the mutation was killed anyway, by some
+other test. That case is the one worth having: the verdict reads "killed by assertion", the
+sweep exits 0, and without this line the fact that the test you believed defends this
+behaviour does not would never surface. It never changes a verdict or the exit status: "this
+behaviour is undefended" and "your guess about which test defends it was wrong" are different
+claims, and folding them together would make a clean sweep unreadable.
+
+A mutation may list several [[mutation.edit]] tables. That is how a two-part change -- add
+something here, drain it there -- stays one mutation, applied and reported as one.
+
+THE GUARDS. Each refuses that one mutation loudly, names the offending edit, and lets the
+rest of the sweep run. A refusal is "not measured", never a survivor:
+  - every edit's 'old' must occur exactly once in its file, with no privileged first edit
+  - 'new' must differ from 'old'
+  - once every edit is applied, the file must actually differ from the tree
+  - an anchor sitting in a '#' comment, or inside a Python docstring, is refused: mutating
+    prose reddens nothing, and would report a defended behaviour as undefended
+
+Use 'git mutate --check -' with the same heredoc form to put the input through every guard
+in seconds, running no tests and touching nothing.
+
+THE FAST TIER. Mutations in one sweep cluster -- they are written against one behaviour, so
+the same few tests kill most of them. Once a test has killed by assertion, later mutations run
+just that set first. An assertion kill there ENDS that mutation: running more tests can only
+add reddened tests, never remove one, so the full suite's verdict is provably the same
+'killed'. Only the row list is shorter, and the report says so.
+
+Nothing else short-circuits. No assertion kill, a line the classifier cannot read, or a
+compile failure all fall through to the full unnarrowed suite -- so every FINDING still comes
+from a complete run. A badly primed set costs time, never a false survivor.
+
+The set is re-priced against a CLEAN tree whenever it changes, and anything red there is
+excluded: a test that passes in the suite but fails alone must not be credited as a kill.
+
+It turns itself off, loudly, when it cannot narrow: a non-pytest --env, a command that is not
+pytest-shaped, or one that already names its own paths (appending ids to 'pytest tests/' would
+widen the run, not narrow it). Use --fast-cmd to drive it yourself, --no-fast to be rid of it.
+
+THE INPUT IS EPHEMERAL. Feed it on stdin for one invocation and forget it. Anchors are
+coupled to the code's current text while tests are coupled to its behaviour, so a kept
+mutations file rots -- and the dangerous rot is not the anchor that stops matching, it is
+the one that comes to match a comment.
+
+RUN IT UNPIPED. A sweep is slow -- one full test run per mutation, plus a baseline -- and it
+prints one line per mutation as that mutation finishes, so an unpiped run is a live progress
+report. A grep/head filter blocks until the sweep ends, making a run that is stuck, timing
+out or refusing every anchor look exactly like one that is working. 'head' is worse: it can
+SIGPIPE the sweep mid-mutation, the one way to leave a tree needing --recover.
+
+Exit status (precedence when several apply: 4 > 3 > 2):
+    0  every selected mutation was measured and killed by at least one assertion
+    1  usage or environment error -- nothing was measured
+    2  findings: a mutation reddened nothing, or was reddened only by errors
+    3  not measured: a mutation was refused, timed out, failed to compile, or produced
+       test output this classifier cannot read
+    4  restore verification failed -- THE TREE MAY STILL BE MUTATED
+  130  interrupted; the tree was restored
+A survivor is a finding (2), never a tool failure.
+EOF
+}
+
+die() { echo "$SELF: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------------------
+
+mode="sweep"
+cmd_override=""
+timeout_secs="$DEFAULT_TIMEOUT"
+assertion_pattern=""
+env_name=""
+fast_mode="auto"          # auto | on | off
+fast_cmd_template=""      # '{}' marks where the test ids go
+fast_max="$DEFAULT_FAST_MAX"
+
+# Per-project defaults, so a Java or Go repo does not need the same three flags on every run.
+# Lives in .git/info/ because that directory is already the home for per-clone, never-committed
+# git state -- nothing here should reach a commit, for the same reason a mutations file should
+# not: it describes how this checkout is tested, not what the code does.
+#   env = mvn
+#   cmd = cd phase1 && mvn -B test -Dtest=SerdeTimerTest
+#   assertion_pattern = ^MyCustomExpectationError
+#   timeout = 600
+#   fast = off
+#   fast_cmd = pytest -m "not slow" {}
+#   fast_max = 25
+read_project_config() {
+    conf="$(git rev-parse --git-dir 2>/dev/null)/info/git-mutate"
+    [ -f "$conf" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        key="${line%%=*}"; val="${line#*=}"
+        key="$(printf '%s' "$key" | tr -d '[:space:]')"
+        val="${val# }"
+        case "$key" in
+            env)               [ -z "$env_name" ] && env_name="$val" ;;
+            cmd)               [ -z "$cmd_override" ] && cmd_override="$val" ;;
+            assertion_pattern) [ -z "$assertion_pattern" ] && assertion_pattern="$val" ;;
+            timeout)           [ "$timeout_secs" = "$DEFAULT_TIMEOUT" ] && timeout_secs="$val" ;;
+            fast)              [ "$fast_mode" = "auto" ] && fast_mode="$val" ;;
+            fast_cmd)          [ -z "$fast_cmd_template" ] && fast_cmd_template="$val" ;;
+            fast_max)          [ "$fast_max" = "$DEFAULT_FAST_MAX" ] && fast_max="$val" ;;
+            *) echo "$SELF: $conf: ignoring unknown key '$key'" >&2 ;;
+        esac
+    done < "$conf"
+}
+mutations_file=""
+selected=""          # newline-separated names; empty means "all"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) mode="check"; shift ;;
+        --recover) mode="recover"; shift ;;
+        --cmd)
+            [ $# -ge 2 ] || { echo "$SELF: --cmd needs an argument" >&2; usage; exit 1; }
+            cmd_override="$2"; shift 2 ;;
+        --timeout)
+            [ $# -ge 2 ] || { echo "$SELF: --timeout needs an argument" >&2; usage; exit 1; }
+            timeout_secs="$2"; shift 2 ;;
+        --assertion-pattern)
+            [ $# -ge 2 ] || { echo "$SELF: --assertion-pattern needs an argument" >&2; usage; exit 1; }
+            assertion_pattern="$2"; shift 2 ;;
+        --env)
+            [ $# -ge 2 ] || { echo "$SELF: --env needs an argument" >&2; usage; exit 1; }
+            env_name="$2"; shift 2 ;;
+        --env=*) env_name="${1#--env=}"; shift ;;
+        --no-fast) fast_mode="off"; shift ;;
+        --fast-cmd)
+            [ $# -ge 2 ] || { echo "$SELF: --fast-cmd needs an argument" >&2; usage; exit 1; }
+            fast_cmd_template="$2"; shift 2 ;;
+        --fast-max)
+            [ $# -ge 2 ] || { echo "$SELF: --fast-max needs an argument" >&2; usage; exit 1; }
+            fast_max="$2"; shift 2 ;;
+        -h|--help) help_text; exit 0 ;;
+        -)
+            if [ -z "$mutations_file" ]; then
+                mutations_file="-"
+            else
+                selected="$selected$1
+"
+            fi
+            shift ;;
+        -*) echo "$SELF: unknown option '$1'" >&2; usage; exit 1 ;;
+        *)
+            if [ -z "$mutations_file" ]; then
+                mutations_file="$1"
+            else
+                selected="$selected$1
+"
+            fi
+            shift ;;
+    esac
+done
+
+# After the flags, so an explicit flag always beats the file.
+read_project_config
+[ -n "$env_name" ] || env_name="pytest"
+
+case "$env_name" in
+    pytest|mvn|go|rust|dotnet) ;;
+    *) die "--env takes one of: pytest, mvn, go, rust, dotnet (got '$env_name')" ;;
+esac
+export GIT_MUTATE_ENV="$env_name"
+export GIT_MUTATE_ASSERTION_PATTERN="$assertion_pattern"
+
+case "$timeout_secs" in
+    *[!0-9]*|"") die "--timeout takes a whole number of seconds, got '$timeout_secs'" ;;
+esac
+
+case "$fast_mode" in
+    auto|on|off) ;;
+    *) die "fast takes 'on' or 'off' (got '$fast_mode')" ;;
+esac
+case "$fast_max" in
+    *[!0-9]*|"") die "--fast-max takes a whole number, got '$fast_max'" ;;
+esac
+
+if [ "$mode" = "recover" ]; then
+    [ -z "$mutations_file" ] || die "--recover takes no mutations file"
+else
+    [ -n "$mutations_file" ] || { usage; exit 1; }
+    [ "$mutations_file" = "-" ] || [ -f "$mutations_file" ] ||
+        die "no such mutations file: '$mutations_file'"
+fi
+
+# ---------------------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------------------
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
+git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || die "cannot locate the git directory"
+lock="$git_dir/$LOCK_BASENAME"
+marker="$root/$MARKER_NAME"
+
+# python3 does two things bash cannot do without reintroducing the escaping bugs this tool
+# exists to remove: parse TOML (so multi-line anchors are literal, not escaped), and count
+# and replace a literal multi-line substring. Everything else here is bash.
+command -v python3 >/dev/null 2>&1 ||
+    die "python3 not found on PATH (needed to parse TOML and to count/replace literal multi-line anchors)"
+python3 -c 'import tomllib' >/dev/null 2>&1 ||
+    die "this python3 has no tomllib, which needs 3.11+ ($(python3 -V 2>&1))"
+
+run_prefix=""
+command -v setsid >/dev/null 2>&1 && run_prefix="setsid"
+command -v timeout >/dev/null 2>&1 && run_prefix="$run_prefix timeout -k 5 $timeout_secs" ||
+    echo "$SELF: 'timeout' not found; running without a per-mutation timeout." >&2
+
+SELF_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+
+# ---------------------------------------------------------------------------------------
+# Embedded python helpers
+# ---------------------------------------------------------------------------------------
+
+# Parse the mutations file into a directory of literal files:
+#   <spec>/NNN/name              the mutation name
+#   <spec>/NNN/edits/MM/{file,old,new}
+# Bash then only ever reads whole files -- there is no delimiter, quoting or escaping layer
+# anywhere between the anchor as written and the anchor as matched.
+py_parse() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import os
+import sys
+import tomllib
+
+src, out, label = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def bad(msg):
+    sys.exit("git-mutate: %s" % msg)
+
+try:
+    with open(src, "rb") as fh:
+        doc = tomllib.load(fh)
+except OSError as exc:
+    bad("cannot read %s: %s" % (label, exc))
+except tomllib.TOMLDecodeError as exc:
+    bad("%s is not valid TOML: %s" % (label, exc))
+
+muts = doc.get("mutation")
+if not isinstance(muts, list) or not muts:
+    bad("%s declares no [[mutation]] tables" % label)
+
+seen = set()
+for i, mut in enumerate(muts, start=1):
+    if not isinstance(mut, dict):
+        bad("mutation %d is not a table" % i)
+    name = mut.get("name")
+    if not isinstance(name, str) or not name.strip():
+        bad("mutation %d has no 'name'" % i)
+    if any(c in name for c in "/\t\n"):
+        bad("mutation name %r may not contain '/', a tab or a newline" % name)
+    if name in seen:
+        bad("duplicate mutation name %r -- names identify mutations in the report" % name)
+    seen.add(name)
+
+    edits = mut.get("edit")
+    if not isinstance(edits, list) or not edits:
+        bad("mutation %r has no [[mutation.edit]] tables" % name)
+
+    mdir = os.path.join(out, "%03d" % i)
+    os.makedirs(mdir)
+    with open(os.path.join(mdir, "name"), "wb") as fh:
+        fh.write(name.encode("utf-8"))
+
+    # Optional: the caller's own "I expect these to fail". A hint, never a filter -- it only
+    # decides which tests the fast tier tries FIRST, and a hint that reddens nothing falls
+    # through to the full suite like any other subset. So a wrong hint costs time, not truth.
+    hints = mut.get("tests")
+    if hints is not None:
+        if not isinstance(hints, list) or not hints:
+            bad("mutation %r: 'tests' must be a non-empty array of test ids" % name)
+        for t in hints:
+            if not isinstance(t, str) or not t.strip():
+                bad("mutation %r: every entry in 'tests' must be a non-empty string" % name)
+            if any(c in t for c in "\t\n"):
+                bad("mutation %r: test id %r may not contain a tab or a newline" % (name, t))
+        with open(os.path.join(mdir, "tests"), "wb") as fh:
+            fh.write(("\n".join(hints) + "\n").encode("utf-8"))
+
+    for j, edit in enumerate(edits, start=1):
+        if not isinstance(edit, dict):
+            bad("mutation %r edit %d is not a table" % (name, j))
+        for key in ("file", "old", "new"):
+            if not isinstance(edit.get(key), str):
+                bad("mutation %r edit %d is missing a string '%s'" % (name, j, key))
+        rel = edit["file"]
+        if not rel or os.path.isabs(rel) or any(c in rel for c in "\t\n"):
+            bad("mutation %r edit %d: file %r must be a relative path with no tab or newline"
+                % (name, j, rel))
+        if os.path.normpath(rel).startswith(".."):
+            bad("mutation %r edit %d: file %r escapes the repository" % (name, j, rel))
+        if not edit["old"]:
+            bad("mutation %r edit %d: 'old' is empty; there is no such thing as an anchor "
+                "that matches everywhere" % (name, j))
+        edir = os.path.join(mdir, "edits", "%02d" % j)
+        os.makedirs(edir)
+        for key in ("file", "old", "new"):
+            with open(os.path.join(edir, key), "wb") as fh:
+                fh.write(edit[key].encode("utf-8"))
+PY
+}
+
+# Guard one mutation and plan it. Touches nothing in the tree: on success it writes the
+# post-mutation content of each affected file to <plan>/new/NNN with <plan>/files listing
+# the relative paths in first-touch order, and bash writes those buffers only after it has
+# taken the snapshot. On refusal it prints one line saying why and exits 10.
+#
+# Every edit is guarded, with no privileged first one. Edits are applied to an in-memory
+# buffer in declaration order, and each edit's uniqueness is checked against the buffer as
+# it will actually be patched -- so a second edit whose anchor became ambiguous (or vanished)
+# because of the first is caught too.
+py_plan() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import os
+import sys
+
+root, spec, plan = sys.argv[1], sys.argv[2], sys.argv[3]
+
+REFUSE = 10
+
+def refuse(msg):
+    print(msg)
+    sys.exit(REFUSE)
+
+def read_text(path):
+    with open(path, "rb") as fh:
+        return fh.read().decode("utf-8", "surrogateescape")
+
+def comment_verdict(buf, idx, old, rel=""):
+    """Crude, stated heuristic for 'this anchor is prose, not code'.
+
+    Catches: an anchor preceded by a '#' on its own line, an anchor that is itself a '#'
+    comment, and -- in '.py' only -- an anchor inside a triple-quoted block (the real case:
+    a stale anchor that now matches only a docstring, mutating prose, reddening nothing,
+    and reporting a false finding).
+    Misses: // and /* */ comments, and '#' inside a string literal on the same line. It
+    can also false-positive on a file whose triple quotes are unbalanced by a raw string.
+
+    Triple quotes are not Python's alone -- TOML has them too -- so the test is scoped by
+    what the block MEANS, with the file suffix as the crude proxy. In Python a triple-quoted
+    block at statement level is usually prose ABOUT the code. In TOML, `key = \"\"\"...\"\"\"`
+    is a value: for a prompt preset it IS the artifact under test, and mutating it is exactly
+    right. Refusing those left real behaviours unmeasured and reported as such -- a worse
+    outcome than the false accept it guards against, which merely reddens nothing and is
+    surfaced prominently as a survivor. The '#' tests stay on for every file type: TOML
+    comments are '#' too.
+    """
+    line_start = buf.rfind("\n", 0, idx) + 1
+    if "#" in buf[line_start:idx]:
+        return "the anchor sits after a '#' on its line (comment)"
+    if old.lstrip().startswith("#"):
+        return "the anchor is itself a '#' comment"
+    if rel.endswith(".py"):
+        before = buf[:idx]
+        if before.count('"""') % 2 or before.count("'''") % 2:
+            return "the anchor sits inside a triple-quoted block (docstring or string literal)"
+    return None
+
+edits = []
+edir = os.path.join(spec, "edits")
+for sub in sorted(os.listdir(edir)):
+    d = os.path.join(edir, sub)
+    edits.append((read_text(os.path.join(d, "file")),
+                  read_text(os.path.join(d, "old")),
+                  read_text(os.path.join(d, "new"))))
+
+total = len(edits)
+orig = {}
+bufs = {}
+order = []
+
+for j, (rel, old, new) in enumerate(edits, start=1):
+    where = "edit %d/%d" % (j, total)
+    if rel not in bufs:
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            refuse("%s: '%s' is not a file in this repository" % (where, rel))
+        try:
+            orig[rel] = read_text(path)
+        except OSError as exc:
+            refuse("%s: cannot read '%s': %s" % (where, rel, exc))
+        bufs[rel] = orig[rel]
+        order.append(rel)
+
+    if new == old:
+        refuse("%s: 'new' is identical to 'old' in '%s' -- a no-op by construction" % (where, rel))
+
+    count = bufs[rel].count(old)
+    if count != 1:
+        refuse("%s: anchor occurs %dx in '%s', must occur exactly once%s"
+               % (where, count, rel,
+                  " (an earlier edit of this mutation may have changed it)" if j > 1 else ""))
+
+    idx = bufs[rel].index(old)
+    verdict = comment_verdict(bufs[rel], idx, old, rel)
+    if verdict is not None:
+        line_no = bufs[rel].count("\n", 0, idx) + 1
+        refuse("%s: %s (%s:%d) -- mutating prose proves nothing; pick an anchor in code"
+               % (where, verdict, rel, line_no))
+
+    bufs[rel] = bufs[rel][:idx] + new + bufs[rel][idx + len(old):]
+
+# The backstop. count == 1 and new != old still do not prove the tree changed; this does,
+# and it catches cases neither of those anticipate (for instance two edits that cancel out).
+# A mutation that leaves the tree byte-identical and then reports "reddened nothing" is the
+# worst output this tool can produce, because it is indistinguishable from a real finding.
+changed = [rel for rel in order if bufs[rel] != orig[rel]]
+if not changed:
+    refuse("every edit applied, yet the file content is byte-identical to the tree -- "
+           "this mutation changes nothing")
+
+os.makedirs(os.path.join(plan, "new"))
+with open(os.path.join(plan, "files"), "wb") as fh:
+    for rel in order:
+        fh.write((rel + "\n").encode("utf-8"))
+for n, rel in enumerate(order, start=1):
+    with open(os.path.join(plan, "new", "%03d" % n), "wb") as fh:
+        fh.write(bufs[rel].encode("utf-8", "surrogateescape"))
+PY
+}
+
+# Classify a captured test log into TSV rows: <kind>\t<test id>\t<message>, kind being
+# A (assertion kill), E (error kill) or U (unclassifiable -- reported loudly, never folded
+# silently into either bucket).
+# Tests the last run actually executed, or -1 when this ecosystem gives us nothing to count.
+#
+# A green run that executed nothing is not "no test distinguishes the mutation" -- it is a
+# command that measures nothing, and every mutation after it would be scored against a
+# measurement that never happened. The guard for it lives at the baseline, beside the one for
+# an unreadable failure.
+#
+# $2 is a timestamp taken before the run. Surefire reports persist on disk, so a run that
+# executes no tests leaves the *previous* run's XML in place; counting those would report the
+# earlier run's total and defeat the whole check.
+py_count_tests() {
+    python3 - "$1" "$2" <<'PYCOUNT'
+import glob
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+ENV = os.environ.get("GIT_MUTATE_ENV", "pytest")
+log_path, since = sys.argv[1], float(sys.argv[2])
+
+if ENV == "mvn":
+    total, saw_fresh_report = 0, False
+    for path in sorted(
+        glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)
+        + glob.glob("**/target/failsafe-reports/TEST-*.xml", recursive=True)
+    ):
+        try:
+            if os.path.getmtime(path) < since:
+                continue
+            root = ET.parse(path).getroot()
+        except (OSError, ET.ParseError):
+            continue
+        saw_fresh_report = True
+        total += int(root.get("tests") or 0)
+    print(total if saw_fresh_report else 0)
+    sys.exit(0)
+
+try:
+    text = open(log_path, errors="replace").read()
+except OSError:
+    print(-1)
+    sys.exit(0)
+
+if ENV == "pytest":
+    if re.search(r"\bno tests ran\b", text):
+        print(0)
+        sys.exit(0)
+    collected = re.findall(r"\bcollected (\d+) items?", text)
+    if collected:
+        print(max(int(x) for x in collected))
+        sys.exit(0)
+    total, found = 0, False
+    for word in ("passed", "failed", "errors", "error", "skipped", "xfailed", "xpassed"):
+        for value in re.findall(r"(\d+) %s\b" % word, text):
+            total += int(value)
+            found = True
+    print(total if found else -1)
+    sys.exit(0)
+
+print(-1)
+PYCOUNT
+}
+
+py_classify() {
+    python3 - "$1" <<'PY'
+import os
+import re
+import sys
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+# Trap A: pytest colorizes depending on the environment, and the line then really begins
+# "\x1b[31mFAILED". Escape codes also sit *inside* the test id, so stripping has to happen
+# before the id is extracted, not merely before the prefix is matched.
+def strip(line):
+    return ANSI.sub("", line.rstrip("\n"))
+
+def split_id(rest):
+    # "FAILED <id> - <message>". A parametrized id can itself contain " - ", so prefer the
+    # last "] - " when the id is parametrized; otherwise the first " - ".
+    at = rest.rfind("] - ")
+    if at != -1:
+        return rest[:at + 1], rest[at + 4:]
+    at = rest.find(" - ")
+    if at != -1:
+        return rest[:at], rest[at + 3:]
+    return rest, ""
+
+# Trap B: pytest *rewrites* assertions, so a genuine assertion failure usually carries no
+# exception name at all ("assert [244, 331] == [244, 434]"), sometimes carries
+# "AssertionError:" (explicit message, or a repr pytest truncated), and carries "Failed:"
+# for pytest.fail and for pytest.raises not raising. All three are assertion kills.
+# Classifying on the string "AssertionError" scores the bare ones as error kills and
+# quietly slanders a well-tested change.
+# Blind spot: a helper that raises its own exception type to signal a failed expectation is
+# an error kill here, and a test whose assertion message begins with an exception-like name
+# could fool the assertion test. Both are visible in the reported message text.
+ASSERTION = ("assert", "AssertionError", "Failed:")
+
+# Trap B2: other ecosystems name their assertion failure something that is not "AssertionError"
+# but still ends in "Error"/"Failure", so NAMED_EXC below claims it and *every* genuine assertion
+# kill in that language is reported as an error kill -- a well-tested change slandered wholesale
+# rather than one case at a time. Each of these is an assertion failure in its own vocabulary.
+# Selected by --env; unioned with the base tuple above, since "assert" and "AssertionError" are
+# near-universal and cost nothing to keep.
+ENV_ASSERTION = {
+    "pytest": (),
+    "mvn": (
+        "AssertionFailedError",    # JUnit 5 / opentest4j -- what assertEquals and AssertJ throw
+        "ComparisonFailure",       # JUnit 4
+        "MultipleFailuresError",   # JUnit 5 assertAll
+        "Expecting",               # AssertJ, when it reports without an exception name
+    ),
+    "go": ("Error Trace:", "Not equal:", "expected:"),
+    "rust": ("assertion",),
+    "dotnet": ("AssertionException", "EqualException", "Xunit.Sdk"),
+}
+
+ENV = os.environ.get("GIT_MUTATE_ENV", "pytest")
+ASSERTION = ASSERTION + ENV_ASSERTION.get(ENV, ())
+_extra = os.environ.get("GIT_MUTATE_ASSERTION_PATTERN", "")
+EXTRA_ASSERTION = re.compile(_extra) if _extra else None
+NAMED_EXC = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Exit|Warning|Interrupted)?:")
+
+# Surefire/Failsafe print no FAILED/ERROR summary lines at all -- the per-test outcome lives
+# only in target/*-reports/TEST-*.xml. Reading the console log therefore yields nothing to
+# classify, which reports every mutation as "not measured" no matter how well tested the code
+# is. Under --env mvn, classify from the XML instead and skip the console entirely.
+def classify_surefire():
+    import glob
+    import xml.etree.ElementTree as ET
+
+    ASSERTION_TYPES = (
+        "AssertionError",
+        "AssertionFailedError",
+        "ComparisonFailure",
+        "MultipleFailuresError",
+    )
+    rows = []
+    paths = sorted(
+        glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)
+        + glob.glob("**/target/failsafe-reports/TEST-*.xml", recursive=True)
+    )
+    for path in paths:
+        try:
+            root = ET.parse(path).getroot()
+        except ET.ParseError:
+            continue
+        cls = root.get("name", "?").split(".")[-1]
+        for case in root.iter("testcase"):
+            node = case.find("failure")
+            if node is None:
+                node = case.find("error")
+            if node is None:
+                continue
+            kind_name = (node.get("type") or "").split(".")[-1]
+            msg = (node.get("message") or "").replace("\n", " ").replace("\t", " ").strip()
+            kind = "A" if kind_name in ASSERTION_TYPES else "E"
+            rows.append((kind, "%s::%s" % (cls, case.get("name", "?")), "%s: %s" % (kind_name, msg)))
+    return rows
+
+if ENV == "mvn":
+    for kind, test_id, msg in classify_surefire():
+        print("%s\t%s\t%s" % (kind, test_id, msg))
+    sys.exit(0)
+
+seen = set()
+for raw in open(sys.argv[1], "r", encoding="utf-8", errors="replace"):
+    line = strip(raw)
+    match = re.match(r"^(FAILED|ERROR)\s+(\S.*)$", line)
+    if not match:
+        continue
+    head, rest = match.group(1), match.group(2)
+    test_id, msg = split_id(rest)
+    if test_id in seen:
+        continue
+    seen.add(test_id)
+    if msg.startswith(ASSERTION) or (EXTRA_ASSERTION and EXTRA_ASSERTION.search(msg)):
+        kind = "A"
+    elif head == "ERROR":
+        # A collection or teardown error is an error kill whatever it says -- and an
+        # import-time error produces these and no FAILED lines at all. An import failure
+        # keeps its reason out of the summary line, so say so rather than printing nothing.
+        kind = "E"
+        if not msg:
+            msg = "collection error (pytest keeps the reason out of the summary line)"
+    elif msg and NAMED_EXC.match(msg):
+        kind = "E"
+    else:
+        kind = "U"
+    print("%s\t%s\t%s" % (kind, test_id, msg))
+PY
+}
+
+# Decide whether test ids can simply be appended to the resolved test command. Appending is
+# only a narrowing when the command names no path of its own: `pytest tests/ <id>` runs all of
+# tests/ AND the id, which is slower than the full run it was meant to replace. Anything this
+# cannot read for certain is refused, and the fast tier stays off -- guessing here costs the
+# user time on every mutation, silently.
+py_fast_probe() {
+    python3 - "$1" <<'PY'
+import shlex
+import sys
+
+try:
+    toks = shlex.split(sys.argv[1])
+except ValueError as exc:
+    sys.exit("the test command cannot be tokenised (%s)" % exc)
+
+idx = None
+for i, t in enumerate(toks):
+    if t == "pytest" or t.endswith("/pytest"):
+        idx = i
+        break
+    if t == "-m" and i + 1 < len(toks) and toks[i + 1] == "pytest":
+        idx = i + 1
+        break
+if idx is None:
+    sys.exit("no bare 'pytest' token in the test command")
+
+# Options that consume the following token when not written as --opt=value.
+VALUE = {"-k", "-m", "-p", "-n", "-c", "-o", "-W", "-r", "--tb", "--maxfail", "--timeout",
+         "--rootdir", "--junitxml", "--deselect", "--ignore", "--import-mode", "--log-level",
+         "--durations", "--confcutdir", "--override-ini", "--dist", "--numprocesses",
+         "--basetemp", "--cov", "--cov-report", "--cov-fail-under"}
+
+rest = toks[idx + 1:]
+i = 0
+while i < len(rest):
+    t = rest[i]
+    if t == "--":
+        i += 1
+        continue
+    if t.startswith("-"):
+        if "=" in t or t in ("-x", "-q", "-v", "-s", "-l"):
+            i += 1
+            continue
+        if t in VALUE:
+            i += 2
+            continue
+        if t.startswith("--") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+            sys.exit("cannot tell whether '%s' takes a value, so appending test ids might "
+                     "not narrow the run" % t)
+        i += 1
+        continue
+    sys.exit("the test command already names a path or test id ('%s'); appending ids would "
+             "widen the run, not narrow it" % t)
+PY
+}
+
+# ---------------------------------------------------------------------------------------
+# Lock, marker, snapshot, restore
+# ---------------------------------------------------------------------------------------
+
+work=""
+holding_lock=0
+RUN_PID=""
+
+# Restores every file the manifest names -- not only the ones the current mutation touched.
+# Unconditional restore cleans up after a mutation that died mid-write, and costs nothing.
+# Each restore is cmp-verified; a mismatch is the loudest thing this tool can say.
+restore_all() {
+    local manifest="$lock/manifest" n rel snap failed=0
+    [ -f "$manifest" ] || return 0
+    while IFS=$'\t' read -r n rel || [ -n "$n" ]; do
+        [ -n "$n" ] || continue
+        snap="$lock/snap/$n"
+        if [ ! -f "$snap" ]; then
+            echo "$SELF: MISSING SNAPSHOT for '$rel' ($snap) -- cannot restore it" >&2
+            failed=1
+            continue
+        fi
+        cp -p "$snap" "$root/$rel" 2>/dev/null || {
+            echo "$SELF: FAILED TO WRITE '$rel' back from $snap" >&2
+            failed=1
+            continue
+        }
+        cmp -s "$snap" "$root/$rel" || {
+            echo "$SELF: RESTORE VERIFICATION FAILED for '$rel' (snapshot: $snap)" >&2
+            failed=1
+            continue
+        }
+        invalidate_bytecode "$rel"
+    done < "$manifest"
+    return "$failed"
+}
+
+# Snapshot a file, unless it is already in the manifest. The first snapshot of a path is the
+# authoritative one: it was taken from the tree before this sweep touched anything.
+snapshot_file() {
+    local rel="$1" manifest="$lock/manifest" n
+    if [ -f "$manifest" ] && cut -f2 "$manifest" | grep -Fxq -- "$rel"; then
+        return 0
+    fi
+    mkdir -p "$lock/snap"
+    n=0
+    [ -f "$manifest" ] && n=$(wc -l < "$manifest" | tr -d ' ')
+    n=$(printf '%04d' "$((n + 1))")
+    cp -p "$root/$rel" "$lock/snap/$n" || return 1
+    printf '%s\t%s\n' "$n" "$rel" >> "$manifest"
+}
+
+# Drop any cached bytecode for a source file we just rewrote.
+#
+# CPython validates a cached .pyc against the source's (mtime, size). A mutation like
+# 'A = 1' -> 'A = 2' preserves the size, and a sweep is fast enough -- especially with the fast
+# tier -- that the write can land inside the same mtime second as the existing .pyc. The test
+# run then imports the PREVIOUS bytecode, so the sweep measures code that is not in the tree.
+# When the stale bytecode happens to be the unmutated original, the mutation reddens nothing
+# and reports a false finding: the one output this tool must never produce.
+#
+# Called on the RESTORE too, not only on the apply: a stale *mutated* .pyc left behind would
+# poison the next clean run, including the fast tier's isolation baseline.
+#
+# find, not rm with a glob, for the same reason the surefire cleanup uses it: -maxdepth 1,
+# -type f and a -name that must end in .pyc mean this cannot be handed a path it did not match.
+invalidate_bytecode() {
+    local rel="$1" dir base stem
+    case "$rel" in *.py) ;; *) return 0 ;; esac
+    dir=$(dirname "$root/$rel")
+    base=$(basename "$rel")
+    stem="${base%.py}"
+    [ -d "$dir/__pycache__" ] && find "$dir/__pycache__" -maxdepth 1 -type f \
+        -name "$stem.*.pyc" -delete 2>/dev/null
+    [ -f "$dir/$stem.pyc" ] && rm -f "$dir/$stem.pyc"
+    return 0
+}
+
+kill_run() {
+    [ -n "$RUN_PID" ] || return 0
+    # Kill the process group we started, by the pgid we own. Never a name match: a
+    # `pkill -f <script>` in an earlier harness matched its own backgrounded shell and
+    # killed the job before it patched anything.
+    local pgid
+    pgid=$(ps -o pgid= -p "$RUN_PID" 2>/dev/null | tr -d ' ')
+    if [ -n "$pgid" ] && [ -n "$SELF_PGID" ] && [ "$pgid" != "$SELF_PGID" ]; then
+        kill -TERM "-$pgid" 2>/dev/null
+        sleep 1
+        kill -KILL "-$pgid" 2>/dev/null
+    else
+        kill -TERM "$RUN_PID" 2>/dev/null
+    fi
+    RUN_PID=""
+    return 0
+}
+
+release() {
+    [ "$holding_lock" -eq 1 ] || return 0
+    rm -f "$marker"
+    rm -rf "$lock"
+    holding_lock=0
+}
+
+on_exit() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    kill_run
+    if [ "$holding_lock" -eq 1 ]; then
+        if ! restore_all; then
+            cat >&2 <<EOF
+
+$SELF: ============================================================================
+$SELF: RESTORE FAILED. THE WORKING TREE MAY STILL BE MUTATED.
+$SELF: Snapshots are in $lock/snap (see $lock/manifest).
+$SELF: The lock and marker are being kept on purpose so nothing else samples this
+$SELF: tree; 'git mutate --recover' retries the restore. Do NOT commit until it is clean.
+$SELF: ============================================================================
+EOF
+            [ -n "$work" ] && rm -rf "$work"
+            exit 4
+        fi
+        release
+    fi
+    [ -n "$work" ] && rm -rf "$work"
+    exit "$rc"
+}
+
+on_signal() {
+    local sig="$1"
+    echo "" >&2
+    echo "$SELF: $sig received -- killing the test command and restoring the tree." >&2
+    kill_run
+    exit 130
+}
+
+# ---------------------------------------------------------------------------------------
+# --recover
+# ---------------------------------------------------------------------------------------
+
+if [ "$mode" = "recover" ]; then
+    [ -d "$lock" ] || die "no sweep state at $lock -- nothing to recover"
+    pid=$(sed -n 's/^pid=//p' "$lock/info" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        die "a sweep is still running (pid $pid). Refusing to restore under a live sweep."
+    fi
+    if [ ! -f "$lock/manifest" ]; then
+        echo "$SELF: the stale sweep had snapshotted nothing; clearing its lock and marker." >&2
+        rm -f "$marker"
+        rm -rf "$lock"
+        exit 0
+    fi
+    echo "$SELF: restoring from the snapshot the stale sweep took:"
+    while IFS=$'\t' read -r n rel || [ -n "$n" ]; do
+        [ -n "$n" ] || continue
+        if cmp -s "$lock/snap/$n" "$root/$rel"; then
+            echo "  already identical  $rel"
+        else
+            echo "  restoring          $rel"
+        fi
+    done < "$lock/manifest"
+    holding_lock=1
+    if ! restore_all; then
+        echo "$SELF: RESTORE FAILED; lock kept at $lock." >&2
+        exit 4
+    fi
+    release
+    echo "$SELF: tree restored and cmp-verified; lock and marker cleared."
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------------------
+# Parse the mutations file and pick the mutations to run
+# ---------------------------------------------------------------------------------------
+
+work=$(mktemp -d) || die "cannot create a temporary directory"
+trap 'rm -rf "$work"' EXIT       # replaced by on_exit once the lock is held
+
+mkdir "$work/spec"
+mutations_source="$mutations_file"
+mutations_label="'$mutations_file'"
+if [ "$mutations_file" = "-" ]; then
+    mutations_source="$work/stdin.toml"
+    mutations_label="standard input"
+    cat > "$mutations_source" || die "cannot read mutations from standard input"
+fi
+py_parse "$mutations_source" "$work/spec" "$mutations_label" || exit 1
+
+mut_dirs=""
+for d in "$work"/spec/*; do
+    name=$(cat "$d/name")
+    if [ -n "$selected" ] && ! printf '%s' "$selected" | grep -Fxq -- "$name"; then
+        continue
+    fi
+    mut_dirs="$mut_dirs$d
+"
+done
+
+if [ -n "$selected" ]; then
+    while IFS= read -r want; do
+        [ -n "$want" ] || continue
+        found=0
+        for d in "$work"/spec/*; do
+            [ "$(cat "$d/name")" = "$want" ] && found=1
+        done
+        [ "$found" -eq 1 ] || die "no mutation named '$want' in $mutations_file"
+    done <<< "$selected"
+fi
+
+[ -n "$mut_dirs" ] || die "no mutations selected"
+n_selected=$(printf '%s' "$mut_dirs" | grep -c .)
+
+# ---------------------------------------------------------------------------------------
+# --check: guards only. Mutates nothing, runs nothing, needs no lock.
+# ---------------------------------------------------------------------------------------
+
+if [ "$mode" = "check" ]; then
+    echo "$SELF --check: $n_selected mutation(s) from $mutations_file (no tests run, tree untouched)"
+    refused=0
+    i=0
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        i=$((i + 1))
+        name=$(cat "$d/name")
+        plan="$work/plan.$i"
+        mkdir -p "$plan"
+        if out=$(py_plan "$root" "$d" "$plan" 2>&1); then
+            hint=""
+            [ -f "$d/tests" ] && hint="  [expects $(grep -c . "$d/tests") test(s) to fail]"
+            echo "  ok       $name  ($(tr '\n' ' ' < "$plan/files"))$hint"
+        else
+            echo "  REFUSED  $name  ${out:-(no reason given)}"
+            refused=$((refused + 1))
+        fi
+    done <<< "$mut_dirs"
+    echo
+    if [ "$refused" -gt 0 ]; then
+        echo "$SELF: $refused mutation(s) would be refused; nothing was measured."
+        exit 3
+    fi
+    echo "$SELF: every anchor is unique, in code, and changes the file."
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------------------
+# Take the lock. A second concurrent sweep in the same repo must refuse rather than
+# interleave: two sweeps mutating one tree would attribute each other's edits.
+# ---------------------------------------------------------------------------------------
+
+if ! mkdir "$lock" 2>/dev/null; then
+    pid=$(sed -n 's/^pid=//p' "$lock/info" 2>/dev/null)
+    started=$(sed -n 's/^started=//p' "$lock/info" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        die "a 'git mutate' sweep is already in flight in '$root' (pid $pid, since ${started:-unknown}).
+    Refusing to interleave: the tree can only hold one mutation at a time."
+    fi
+    {
+        echo "$SELF: a previous sweep (pid ${pid:-unknown}, since ${started:-unknown}) left state at"
+        echo "$SELF:   $lock"
+        echo "$SELF: and is no longer running -- it was killed hard enough that it could not restore."
+        if [ -f "$lock/manifest" ]; then
+            echo "$SELF: it had snapshotted these files, which may still be mutated:"
+            cut -f2 "$lock/manifest" | sed "s/^/$SELF:   /"
+        fi
+        echo "$SELF: run 'git mutate --recover' to restore them from that snapshot and cmp-verify."
+        echo "$SELF: Refusing to restore automatically: a snapshot of unknown age restoring silently"
+        echo "$SELF: would revert real work under the guise of a safety mechanism."
+    } >&2
+    exit 1
+fi
+holding_lock=1
+trap on_exit EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+
+{
+    echo "pid=$$"
+    echo "host=$(hostname 2>/dev/null)"
+    echo "started=$(date -Is 2>/dev/null || date)"
+    echo "mutations=$mutations_file"
+} > "$lock/info"
+
+# The marker is untracked and deliberately NOT gitignored: its whole job is to be glaring in
+# `git status`, so that anything sampling this repo mid-sweep -- git report, another worker,
+# a human -- sees why the tree is dirty instead of concluding a mutation was left behind.
+cat > "$marker" <<EOF
+A 'git mutate' sweep is in flight in this repository.
+
+  pid:        $$
+  host:       $(hostname 2>/dev/null)
+  started:    $(date -Is 2>/dev/null || date)
+  mutations:  $mutations_file
+
+While a mutation is applied, tracked files in this tree are MODIFIED on purpose and the test
+gate is RED. Do not conclude anything about this repository's state until the sweep finishes
+and this file disappears.
+
+If no such process is running, the sweep was killed before it could restore: run
+'git mutate --recover' to put the tree back from the snapshot it took.
+
+This file is untracked and deliberately not gitignored -- it exists to show up in
+'git status'. 'git mutate' removes it when the sweep ends.
+EOF
+
+# ---------------------------------------------------------------------------------------
+# Resolve the test command
+# ---------------------------------------------------------------------------------------
+
+# The tension: a narrow test subset is fast but can miss a mutation reddening something
+# outside it, while the whole pre-commit gate is slow and -- worse -- not measurable, since
+# ruff or basedpyright failing reddens the gate while reddening no test, which would print
+# as "reddened nothing": a broken measurement wearing a finding's clothes. Resolution: run
+# the gate's *own* pytest hook, with the gate's own selection (so nothing is narrowed by
+# us), minus coverage (a coverage floor failing is not a test reddening, and it taxes every
+# mutation), plus the flags that make classification possible.
+resolve_test_cmd() {
+    local cfg="$root/.pre-commit-config.yaml" entries count
+    if [ -n "$cmd_override" ]; then
+        test_cmd="$cmd_override"
+        test_cmd_source="--cmd"
+    else
+        [ -f "$cfg" ] || {
+            echo "$SELF: no --cmd given, and no .pre-commit-config.yaml in '$root' to take a test command from." >&2
+            return 1
+        }
+        entries=$(sed -n 's/^[[:space:]]*entry:[[:space:]]*//p' "$cfg" | grep -E '(^|[[:space:]/])pytest([[:space:]]|$)')
+        count=$(printf '%s' "$entries" | grep -c .)
+        if [ "$count" -eq 0 ]; then
+            echo "$SELF: no pytest hook in $cfg. Pass the test command with --cmd." >&2
+            return 1
+        fi
+        if [ "$count" -gt 1 ]; then
+            echo "$SELF: $cfg has $count pytest hooks:" >&2
+            printf '%s\n' "$entries" | sed "s/^/$SELF:   /" >&2
+            echo "$SELF: refusing to guess which one measures behaviour. Pass one with --cmd." >&2
+            return 1
+        fi
+        # Drop coverage: a --cov-fail-under failing is not a test reddening, and coverage
+        # would be paid once per mutation for nothing.
+        test_cmd=$(printf '%s' "$entries" | sed -E 's/(^|[[:space:]])--cov[^[:space:]]*//g; s/[[:space:]]+$//')
+        test_cmd_source=".pre-commit-config.yaml"
+    fi
+    # Add the flags classification depends on, unless the command already sets them. Only
+    # for a pytest command: any other command is run exactly as given.
+    case "$test_cmd" in
+        *pytest*)
+            case "$test_cmd" in *"-p no:randomly"*) ;; *) test_cmd="$test_cmd -p no:randomly" ;; esac
+            case "$test_cmd" in *--tb=*) ;; *) test_cmd="$test_cmd --tb=line" ;; esac
+            case "$test_cmd" in *" -r"*) ;; *) test_cmd="$test_cmd -rfE" ;; esac
+            ;;
+    esac
+    return 0
+}
+
+test_cmd=""
+test_cmd_source=""
+resolve_test_cmd || exit 1
+
+# ---------------------------------------------------------------------------------------
+# The fast tier
+#
+# Mutations in a real sweep cluster: they are written against one behaviour, so the same
+# handful of tests kills most of them. Once a mutation has been killed we know those test
+# ids, and for every later mutation we can run just them first.
+#
+# The rule that makes this safe is monotonicity: running MORE tests can only add reddened
+# tests, never remove one. So one assertion kill in the subset proves the full suite would
+# also report 'killed' -- the verdict is identical, only the row list is shorter. Nothing
+# else short-circuits. A subset that produces no assertion kill, or produces a line we
+# cannot classify, or a compile failure, falls through to the full unnarrowed suite, so
+# every FINDING this tool prints still comes from a complete run. That asymmetry is the
+# whole design: a wrong subset costs time, never a false survivor.
+# ---------------------------------------------------------------------------------------
+
+fast_enabled=0
+fast_why=""
+fast_iso_ids=""
+
+resolve_fast_cmd() {
+    local probe
+    if [ "$fast_mode" = "off" ]; then
+        fast_why="disabled with --no-fast"
+        return 0
+    fi
+    if [ -n "$fast_cmd_template" ]; then
+        case "$fast_cmd_template" in
+            *"{}"*) ;;
+            *) die "--fast-cmd needs a '{}' where the test ids go" ;;
+        esac
+        fast_enabled=1
+        return 0
+    fi
+    if [ "$env_name" != "pytest" ]; then
+        fast_why="only the pytest env selects by test id (--env $env_name); pass --fast-cmd"
+        return 0
+    fi
+    case "$test_cmd" in
+        *pytest*) ;;
+        *) fast_why="the test command is not pytest-shaped; pass --fast-cmd" ; return 0 ;;
+    esac
+    if ! probe=$(py_fast_probe "$test_cmd" 2>&1); then
+        fast_why="$probe"
+        return 0
+    fi
+    fast_cmd_template="$test_cmd {}"
+    fast_enabled=1
+    return 0
+}
+resolve_fast_cmd
+
+# Build the subset command by substituting the id list for '{}'. Every id is %q-quoted: a
+# parametrized node id can contain spaces, brackets and quotes, and it is handed to bash -c.
+fast_cmd_for() {
+    local file="$1" ids="" id pre post
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        ids="$ids $(printf '%q' "$id")"
+    done < "$file"
+    [ -n "$ids" ] || return 1
+    pre="${fast_cmd_template%%'{}'*}"
+    post="${fast_cmd_template#*'{}'}"
+    printf '%s%s%s' "$pre" "$ids" "$post"
+}
+
+# Remember the tests that killed by assertion. Capped: the point of the subset is that it is
+# quick, and a mutation that reddens 400 tests would otherwise prime a subset as slow as the
+# suite. First-seen order, because the earliest kills come from the same cluster as the rest.
+record_killers() {
+    local rows="$1" id n
+    [ "$fast_enabled" -eq 1 ] || return 0
+    [ -f "$rows" ] || return 0
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        grep -Fxq -- "$id" "$work/killers" 2>/dev/null && continue
+        n=$(grep -c . "$work/killers" 2>/dev/null) || n=0
+        [ "$n" -ge "$fast_max" ] && return 0
+        printf '%s\n' "$id" >> "$work/killers"
+    done < <(awk -F'\t' '$1=="A" {print $2}' "$rows")
+}
+
+# A test can pass in the full suite and fail when run alone -- shared state, ordering, a
+# fixture another test primed. Scored naively that would be this mutation's kill, and would
+# hide a finding. So each distinct kill set is run once against the CLEAN tree and whatever
+# is red there is excluded, exactly as the full baseline is. Memoized on the set's contents:
+# the set stabilises after the first mutation or two, so this costs a couple of tiny runs.
+ensure_iso_baseline() {
+    local file="$1" key fcmd
+    key=$(sort "$file" | cksum | tr -cd '0-9')
+    fast_iso_ids="$work/iso.$key.ids"
+    [ -f "$fast_iso_ids" ] && return 0
+    fcmd=$(fast_cmd_for "$file") || { fast_iso_ids=""; return 1; }
+    run_test_cmd "$work/iso.$key.log" "$fcmd"
+    if [ "$RUN_TIMEDOUT" -eq 1 ]; then
+        echo "$SELF: the primed kill set timed out on a clean tree; fast tier off from here." >&2
+        fast_enabled=0
+        fast_iso_ids=""
+        return 1
+    fi
+    py_classify "$work/iso.$key.log" | cut -f2 | sort -u > "$fast_iso_ids"
+    return 0
+}
+
+# ---------------------------------------------------------------------------------------
+# Running the test command
+# ---------------------------------------------------------------------------------------
+
+RUN_TIMEDOUT=0
+
+# NO_COLOR and COLUMNS are belt to the ANSI-stripping braces, and COLUMNS is load-bearing in
+# its own right: pytest truncates each summary line to the terminal width, and a pipe means
+# 80 columns, which silently eats the failure text of any test with a long id -- leaving a
+# line we cannot classify at all.
+run_test_cmd() {
+    local log="$1" cmd="${2:-$test_cmd}" st
+    RUN_TIMEDOUT=0
+    # Surefire reports persist between runs, and a mutation that fails to compile writes no new
+    # ones. Reading the previous run's passing XML would report that mutation as a survivor --
+    # a false finding, which is the one output this tool must never produce. Clear them first so
+    # "no reports" means "nothing ran", not "nothing failed".
+    #
+    # Deliberately narrow: -type f and a -path that must END at the report file, so the parent
+    # really is target/surefire-reports and not merely some path containing "/target/". Deleting
+    # only the XML the classifier reads means no directory is ever removed, so a repo with its
+    # own docs/target/annual-reports keeps it. No rm, no -rf, no -exec: find's own -delete
+    # cannot be handed a path it did not match.
+    if [ "${GIT_MUTATE_ENV:-pytest}" = "mvn" ]; then
+        find "$root" -type f \
+            \( -path '*/target/surefire-reports/TEST-*.xml' \
+            -o -path '*/target/failsafe-reports/TEST-*.xml' \) \
+            -delete 2>/dev/null
+    fi
+    # stdin from /dev/null: the sweep loop reads its mutation list from a here-string, and a
+    # test command inheriting that stdin could eat it.
+    ( cd "$root" && exec env NO_COLOR=1 COLUMNS=1000 $run_prefix bash -c "$cmd" ) \
+        < /dev/null > "$log" 2>&1 &
+    RUN_PID=$!
+    # Backgrounding plus wait, rather than running in the foreground, is what lets a ^C run
+    # the trap immediately instead of after the test command finishes.
+    wait "$RUN_PID"
+    st=$?
+    RUN_PID=""
+    [ "$st" -eq 124 ] && RUN_TIMEDOUT=1
+    return "$st"
+}
+
+# ---------------------------------------------------------------------------------------
+# Baseline: what is red before any mutation
+# ---------------------------------------------------------------------------------------
+
+echo "$SELF: $n_selected mutation(s) from $mutations_file"
+echo "$SELF: test command ($test_cmd_source): $test_cmd"
+if [ "$fast_enabled" -eq 1 ]; then
+    echo "$SELF: fast tier: on -- once a test has killed, later mutations try that set first;"
+    echo "$SELF:            an assertion kill there is conclusive. Findings still come from"
+    echo "$SELF:            the full suite. --no-fast turns this off."
+else
+    echo "$SELF: fast tier: off (${fast_why:-unavailable}); every mutation runs the full suite."
+    n_hinted=0
+    while IFS= read -r hd; do
+        [ -n "$hd" ] || continue
+        [ -f "$hd/tests" ] && n_hinted=$((n_hinted + 1))
+    done <<< "$mut_dirs"
+    if [ "$n_hinted" -gt 0 ]; then
+        echo "$SELF: NOTE: $n_hinted mutation(s) carry a 'tests' hint, which only the fast tier reads." >&2
+    fi
+fi
+echo "$SELF: sweep in flight; '$MARKER_NAME' marks this tree as transiently dirty."
+echo
+
+baseline_ids="$work/baseline.ids"
+: > "$baseline_ids"
+baseline_started=$(date +%s)
+run_test_cmd "$work/baseline.log"
+baseline_rc=$?
+py_classify "$work/baseline.log" > "$work/baseline.rows"
+if [ "$RUN_TIMEDOUT" -eq 1 ]; then
+    die "the unmutated test command timed out after ${timeout_secs}s. Nothing can be measured; raise --timeout."
+fi
+# A failing baseline that matches no FAILED/ERROR line at all is not "no pre-existing
+# failures" -- it is a suite this classifier cannot read, and every mutation afterwards would
+# be scored against a measurement that was never real. Refuse before sweeping, the same way an
+# ambiguous or missing pytest hook refuses below.
+if [ "$baseline_rc" -ne 0 ] && [ ! -s "$work/baseline.rows" ]; then
+    die "the unmutated test command exited $baseline_rc but produced no line this classifier
+recognises as FAILED/ERROR ('$test_cmd'). The classifier is pytest-shaped: it cannot tell a
+real failure from another runner's output, so no mutation afterwards would be measurable.
+Pass a pytest-compatible command with --cmd."
+fi
+# A green baseline that executed no tests is the mirror of the unreadable-failure case above:
+# nothing is red because nothing ran. Left alone, every mutation afterwards reports "reddened
+# nothing", which reads as a survivor and is in fact a measurement that never happened. A
+# selector typo is the usual cause -- Surefire takes a comma-separated list, and an unmatched
+# selector combines with -Dsurefire.failIfNoSpecifiedTests=false into a silent green run.
+# Only a *green* baseline: a failing or erroring one is already refused by the guards around
+# this one, and they say something more specific than "0 tests ran".
+baseline_tests=-1
+if [ "$baseline_rc" -eq 0 ]; then
+    baseline_tests=$(py_count_tests "$work/baseline.log" "$baseline_started" 2>/dev/null)
+    case "$baseline_tests" in
+        ''|*[!0-9-]*) baseline_tests=-1 ;;
+    esac
+fi
+if [ "$baseline_tests" = "0" ]; then
+    die "the unmutated test command executed 0 tests ('$test_cmd'). Nothing is red because
+nothing ran, so every mutation would report 'reddened nothing' -- a survivor that was never
+measured. Check the test selector: Surefire takes a comma-separated list, and an unmatched
+selector plus -Dsurefire.failIfNoSpecifiedTests=false exits green having run nothing."
+fi
+
+if grep -q '^E' "$work/baseline.rows"; then
+    {
+        echo "$SELF: the unmutated suite is red with errors:"
+        awk -F'\t' '$1=="E" {print "  " $2 "  " $3}' "$work/baseline.rows" | sed "s/^/$SELF:/"
+        echo "$SELF: nothing is measurable while the suite errors -- every mutation would look like a kill."
+    } >&2
+    exit 1
+fi
+awk -F'\t' '$1!="E" {print $2}' "$work/baseline.rows" > "$baseline_ids"
+n_baseline=$(wc -l < "$baseline_ids" | tr -d ' ')
+if [ "$n_baseline" -gt 0 ]; then
+    {
+        echo "$SELF: WARNING: $n_baseline test(s) already fail before any mutation:"
+        sed "s/^/$SELF:   /" "$baseline_ids"
+        echo "$SELF: they are excluded from every mutation's kills -- a test already red cannot be a kill."
+        echo
+    } >&2
+fi
+
+# ---------------------------------------------------------------------------------------
+# The sweep
+# ---------------------------------------------------------------------------------------
+
+mkdir "$work/res"
+: > "$work/killers"
+
+i=0
+while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    i=$((i + 1))
+    idx=$(printf '%03d' "$i")
+    name=$(cat "$d/name")
+    res="$work/res/$idx"
+    printf '%s' "$name" > "$res.name"
+    [ -f "$d/tests" ] && cp "$d/tests" "$res.hints"
+    printf '[%d/%d] %s ... ' "$i" "$n_selected" "$name"
+
+    plan="$work/plan.$idx"
+    mkdir -p "$plan"
+    if ! why=$(py_plan "$root" "$d" "$plan" 2>&1); then
+        echo "REFUSED: $why"
+        echo "refused" > "$res.status"
+        printf '%s' "$why" > "$res.note"
+        continue
+    fi
+
+    # This mutation's candidate set: the caller's own "I expect these to fail" first, then
+    # everything that has killed so far in this sweep. The hint is what lets the tier fire on
+    # the FIRST mutation, before anything has been primed. Deduped, first-seen order kept.
+    subset="$work/subset.$idx"
+    : > "$subset"
+    [ -f "$d/tests" ] && cat "$d/tests" >> "$subset"
+    [ -s "$work/killers" ] && cat "$work/killers" >> "$subset"
+    awk 'length && !seen[$0]++' "$subset" > "$subset.uniq" && mv "$subset.uniq" "$subset"
+
+    # Price the candidate set on a CLEAN tree before anything is applied, so a test that
+    # only fails in isolation is excluded rather than credited to this mutation.
+    if [ "$fast_enabled" -eq 1 ] && [ -s "$subset" ]; then
+        ensure_iso_baseline "$subset"
+    fi
+
+    # Snapshot at mutation time, from the tree about to change -- never a snapshot directory
+    # populated earlier by something else, which would revert legitimate work on restore.
+    snap_ok=1
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        snapshot_file "$rel" || { snap_ok=0; break; }
+    done < "$plan/files"
+    if [ "$snap_ok" -ne 1 ]; then
+        echo "REFUSED: could not snapshot the files this mutation touches"
+        echo "refused" > "$res.status"
+        printf '%s' "could not snapshot the files this mutation touches" > "$res.note"
+        continue
+    fi
+
+    # Apply. Writing through cat keeps the file's inode and mode.
+    n=0
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        n=$((n + 1))
+        cat "$plan/new/$(printf '%03d' "$n")" > "$root/$rel"
+        invalidate_bytecode "$rel"
+    done < "$plan/files"
+
+    # The fast tier. Only a clean assertion kill short-circuits: n_u > 0, a compile note, or
+    # no assertion at all must reach the full suite, so the verdict precedence below is the
+    # same one a mutation gets when the fast tier never ran.
+    fast_hit=0
+    if [ "$fast_enabled" -eq 1 ] && [ -s "$subset" ] && [ -n "$fast_iso_ids" ]; then
+        if fcmd=$(fast_cmd_for "$subset"); then
+            run_test_cmd "$work/log.$idx.fast" "$fcmd"
+            f_rc=$?
+            # pytest exits 4 and collects NOTHING when any id fails to match -- one typo in a
+            # 'tests' hint therefore drops the whole subset, valid ids included, and the tier
+            # would silently never fire. That is exactly the kind of quiet uselessness this
+            # tool refuses elsewhere, so it is collected and said out loud after the sweep.
+            if [ "$f_rc" -eq 4 ] || grep -q "no match in any of\|ERROR: not found:" "$work/log.$idx.fast" 2>/dev/null; then
+                printf '%s: selected no test that could be collected\n' "$name" >> "$work/hintwarn"
+            fi
+            if [ "$RUN_TIMEDOUT" -ne 1 ]; then
+                py_classify "$work/log.$idx.fast" > "$res.rows.fast.all"
+                sort -u "$baseline_ids" "$fast_iso_ids" > "$work/excl.$idx"
+                # The awk filter below reads the exclusion list as its first file. An EMPTY
+                # first file makes NR==FNR true for the first record of the SECOND one, which
+                # silently eats a row -- here, the one assertion kill the subset exists to
+                # find. Guarded exactly as the baseline filter below it is.
+                if [ -s "$work/excl.$idx" ]; then
+                    awk -F'\t' 'NR==FNR {seen[$0]=1; next} !($2 in seen)' \
+                        "$work/excl.$idx" "$res.rows.fast.all" > "$res.rows.fast"
+                else
+                    cp "$res.rows.fast.all" "$res.rows.fast"
+                fi
+                f_a=$(awk -F'\t' '$1=="A" {n++} END {print n+0}' "$res.rows.fast")
+                f_u=$(awk -F'\t' '$1=="U" {n++} END {print n+0}' "$res.rows.fast")
+                f_c=""
+                if [ -s "$work/log.$idx.fast" ]; then
+                    f_c=$(grep -m1 -E "cannot find symbol|COMPILATION ERROR|Unresolved compilation|error: .*expected|SyntaxError|cannot be resolved" \
+                        "$work/log.$idx.fast" 2>/dev/null)
+                fi
+                if [ "$f_a" -gt 0 ] && [ "$f_u" -eq 0 ] && [ -z "$f_c" ]; then
+                    fast_hit=1
+                fi
+            fi
+        fi
+    fi
+
+    if [ "$fast_hit" -eq 1 ]; then
+        mut_rc=1
+        timed_out=0
+    else
+        run_test_cmd "$work/log.$idx"
+        mut_rc=$?
+        timed_out="$RUN_TIMEDOUT"
+    fi
+
+    # Restore before doing anything else with the result, so that even a bug in the
+    # reporting below cannot leave the tree mutated.
+    if ! restore_all; then
+        exit 4
+    fi
+
+    if [ "$fast_hit" -eq 1 ]; then
+        cp "$res.rows.fast" "$res.rows"
+        cp "$res.rows.fast.all" "$res.rows.all"
+        n_a=$(awk -F'\t' '$1=="A" {n++} END {print n+0}' "$res.rows")
+        n_e=$(awk -F'\t' '$1=="E" {n++} END {print n+0}' "$res.rows")
+        printf '%s %s 0\n' "$n_a" "$n_e" > "$res.counts"
+        : > "$res.fast"
+        echo "killed" > "$res.status"
+        record_killers "$res.rows"
+        echo "reddened $n_a by assertion in the $(grep -c . "$subset")-test candidate set -- full suite not run"
+        continue
+    fi
+
+    if [ "$timed_out" -eq 1 ]; then
+        echo "TIMED OUT after ${timeout_secs}s -- not measured"
+        echo "timeout" > "$res.status"
+        printf 'the test command timed out after %ss; this mutation was not measured' "$timeout_secs" > "$res.note"
+        continue
+    fi
+
+    py_classify "$work/log.$idx" > "$res.rows.all"
+    if [ "$n_baseline" -gt 0 ]; then
+        awk -F'\t' 'NR==FNR {seen[$0]=1; next} !($2 in seen)' "$baseline_ids" "$res.rows.all" > "$res.rows"
+    else
+        cp "$res.rows.all" "$res.rows"
+    fi
+
+    n_a=$(awk -F'\t' '$1=="A" {n++} END {print n+0}' "$res.rows")
+    n_e=$(awk -F'\t' '$1=="E" {n++} END {print n+0}' "$res.rows")
+    n_u=$(awk -F'\t' '$1=="U" {n++} END {print n+0}' "$res.rows")
+    printf '%s %s %s\n' "$n_a" "$n_e" "$n_u" > "$res.counts"
+    record_killers "$res.rows"
+
+    # A mutation that does not compile was never put to the tests, so nothing was learned about
+    # them. Saying so plainly beats every alternative: "reddened nothing" blames the tests for a
+    # mutation they never saw, and an error kill implies a test ran and threw. In a compiled
+    # language this is common enough that it needs its own sentence, not a bucket to interpret.
+    compile_note=""
+    if [ -s "$work/log.$idx" ]; then
+        compile_note=$(grep -m1 -E "cannot find symbol|COMPILATION ERROR|Unresolved compilation|error: .*expected|SyntaxError|cannot be resolved" \
+            "$work/log.$idx" 2>/dev/null | sed 's/^[[:space:]]*//; s/\x1b\[[0-9;]*m//g' | cut -c1-160)
+    fi
+    if [ -z "$compile_note" ] && [ -s "$res.rows.all" ]; then
+        compile_note=$(awk -F'\t' '$3 ~ /Unresolved compilation|cannot be resolved|cannot find symbol/ {print $3; exit}' "$res.rows.all" | cut -c1-160)
+    fi
+
+    if [ -n "$compile_note" ]; then
+        echo "compilation failed -- not measured"
+        echo "compile-failed" > "$res.status"
+        # Surefire puts "Unresolved compilation problem:" in the message attribute and the
+        # offending symbol in the stack trace, so the note can arrive detail-less; say the
+        # useful half rather than trailing a bare colon.
+        compile_note=$(printf '%s' "$compile_note" | sed 's/[[:space:]]*:[[:space:]]*$//')
+        printf 'error: compilation failed, so the tests never ran against this mutation (%s)' \
+            "$compile_note" > "$res.note"
+    elif [ "$n_u" -gt 0 ]; then
+        echo "unclassifiable output -- not measured"
+        echo "unclassified" > "$res.status"
+        # Naming one offending line turns "unclassifiable" from a verdict into a lead: it is
+        # almost always a missing " - <message>" suffix, or an assertion type this --env does
+        # not know, and both are obvious the moment you can see the line.
+        sample=$(awk -F'\t' '$1=="U" {print $2 " - " $3; exit}' "$res.rows")
+        printf '%s line(s) matched FAILED/ERROR but carry no failure text we can classify (env=%s); first was: %s' \
+            "$n_u" "$GIT_MUTATE_ENV" "$sample" > "$res.note"
+    elif [ ! -s "$res.rows.all" ] && [ "$mut_rc" -ne 0 ]; then
+        # The command failed, so this is not a well-defended behaviour -- it is a suite this
+        # classifier cannot read. Reporting it as a survivor would be worse than an error: it
+        # reads as a real finding in the tool whose whole purpose is to prevent exactly that.
+        # Tested against the UNFILTERED classify output, not the baseline-excluded one: a
+        # mutation that only reddens an already-baseline-red test also exits non-zero, but the
+        # classifier read it fine -- the baseline filter emptying res.rows there is by design,
+        # not a sign of an unreadable format.
+        echo "test command exited $mut_rc but matched nothing -- not measured"
+        echo "unclassified" > "$res.status"
+        printf 'the test command exited %s but produced no FAILED/ERROR line this pytest-shaped classifier recognises; pass a pytest-compatible command with --cmd' "$mut_rc" > "$res.note"
+    elif [ "$n_a" -eq 0 ] && [ "$n_e" -eq 0 ]; then
+        echo "reddened nothing"
+        echo "survived" > "$res.status"
+    elif [ "$n_a" -eq 0 ]; then
+        echo "reddened $n_e, all by error -- proves nothing"
+        echo "error-only" > "$res.status"
+    else
+        echo "reddened $((n_a + n_e)): $n_a by assertion, $n_e by error"
+        echo "killed" > "$res.status"
+    fi
+done <<< "$mut_dirs"
+
+# ---------------------------------------------------------------------------------------
+# Report. Findings first: a mutation that reddened nothing, or only by error, is the thing
+# worth thinking about. No percentage and no score -- "killed 9/10" invites chasing a
+# number, "this mutation reddened nothing" invites thought.
+# ---------------------------------------------------------------------------------------
+
+# An expectation the caller stated and the run did not bear out. This is NOT a finding about
+# the code -- the mutation may well have been killed, by some other test -- it is a finding
+# about the caller's model of their own suite, and today it is invisible: the report says
+# "killed by assertion", names a test, and never mentions that it is not the test you named.
+#
+# Deliberately kept out of the exit status. "This behaviour is undefended" (2) and "your guess
+# about which test defends it was wrong" are different claims, and folding the second into the
+# first would make a clean sweep unreadable in exactly the way a score does.
+n_unmet=0
+expectations() {
+    local f res status name id kind any=0
+    for f in "$work"/res/*.status; do
+        [ -f "$f" ] || continue
+        res="${f%.status}"
+        [ -f "$res.hints" ] || continue
+        status=$(cat "$f")
+        # Only where a verdict was actually measured: after a refusal or a compile failure the
+        # hint obviously did not redden, and saying so would be noise, not news.
+        case "$status" in killed|survived|error-only) ;; *) continue ;; esac
+        name=$(cat "$res.name")
+        while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            awk -F'\t' -v want="$id" '$1=="A" && $2==want {f=1} END {exit !f}' "$res.rows" && continue
+            if awk -F'\t' -v want="$id" '$1=="E" && $2==want {f=1} END {exit !f}' "$res.rows"; then
+                kind="failed only by error, which proves nothing about the behaviour"
+            else
+                kind="passed"
+            fi
+            if [ "$any" -eq 0 ]; then
+                echo
+                echo "== EXPECTATIONS NOT MET -- a test you named did not fail =="
+                any=1
+            fi
+            n_unmet=$((n_unmet + 1))
+            echo "  $name: expected '$id' to fail; it $kind."
+        done < "$res.hints"
+    done
+    if [ "$any" -eq 1 ]; then
+        echo "      Each mutation's own verdict above stands -- something else may well have"
+        echo "      killed it. What is wrong here is the expectation, not the measurement."
+    fi
+    return 0
+}
+
+print_rows() {
+    local res="$1" want="$2" label="$3"
+    [ -f "$res.rows" ] || return 0
+    awk -F'\t' -v want="$want" -v label="$label" \
+        '$1==want {printf "      %-9s %s -- %s\n", label, $2, $3}' "$res.rows"
+}
+
+# Statuses are printed in the order given, not in file order: a mutation that reddened
+# nothing is the finding worth reading first.
+section() {
+    local title="$1" any=0 want f res status name note
+    shift
+    for want in "$@"; do
+    for f in "$work"/res/*.status; do
+        [ -f "$f" ] || continue
+        res="${f%.status}"
+        status=$(cat "$f")
+        [ "$status" = "$want" ] || continue
+        if [ "$any" -eq 0 ]; then
+            echo
+            echo "== $title =="
+            any=1
+        fi
+        name=$(cat "$res.name")
+        note=""
+        [ -f "$res.note" ] && note=$(cat "$res.note")
+        case "$status" in
+            survived)
+                echo "  $name: reddened nothing."
+                echo "      No test in this run distinguishes the mutated code from the original."
+                ;;
+            error-only)
+                read -r a e u < "$res.counts"
+                echo "  $name: reddened $e, ALL BY ERROR -- proves nothing."
+                echo "      An error kill says the mutation broke the code, not that a test checks the behaviour."
+                print_rows "$res" E error
+                ;;
+            refused)
+                echo "  $name: REFUSED -- $note"
+                ;;
+            timeout|unclassified|compile-failed)
+                echo "  $name: NOT MEASURED -- $note"
+                ;;
+            killed)
+                read -r a e u < "$res.counts"
+                if [ -f "$res.fast" ]; then
+                    echo "  $name: reddened $a by assertion in the candidate set."
+                    echo "      The full suite was not run: one assertion kill settles it, and more tests"
+                    echo "      can only add kills. The rows below are that subset's, not the suite's."
+                else
+                    echo "  $name: reddened $((a + e)) -- $a by assertion, $e by error."
+                fi
+                print_rows "$res" A assertion
+                print_rows "$res" E error
+                ;;
+        esac
+    done
+    done
+    return 0
+}
+
+if [ -s "$work/hintwarn" ]; then
+    {
+        echo
+        echo "$SELF: a 'tests' hint selected nothing pytest could collect, so these mutations"
+        echo "$SELF: fell through to the full suite. The verdicts are sound; the hint is not:"
+        sed "s/^/$SELF:   /" "$work/hintwarn"
+        echo "$SELF: pytest collects NOTHING when any id fails to match, so one stale id"
+        echo "$SELF: disables the fast tier for that mutation entirely."
+    } >&2
+fi
+
+echo
+echo "======================================================================"
+section "FINDINGS -- read these first" survived error-only
+section "NOT MEASURED -- the sweep is incomplete here" refused unclassified timeout compile-failed
+section "KILLED BY ASSERTION" killed
+expectations
+echo
+
+count_status() {
+    local wanted="$1" f n=0
+    for f in "$work"/res/*.status; do
+        [ -f "$f" ] || continue
+        case " $wanted " in *" $(cat "$f") "*) n=$((n + 1)) ;; esac
+    done
+    echo "$n"
+}
+
+n_findings=$(count_status "survived error-only")
+n_unmeasured=$(count_status "refused timeout unclassified compile-failed")
+n_killed=$(count_status "killed")
+
+unmet_note=""
+[ "$n_unmet" -gt 0 ] && unmet_note=", $n_unmet expectation(s) not met"
+echo "$SELF: $n_killed killed by assertion, $n_findings finding(s), $n_unmeasured not measured$unmet_note."
+
+if [ "$n_unmeasured" -gt 0 ]; then
+    exit 3
+fi
+if [ "$n_findings" -gt 0 ]; then
+    exit 2
+fi
+exit 0

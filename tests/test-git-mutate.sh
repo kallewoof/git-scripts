@@ -15,7 +15,7 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="$HERE/../git-mutate"
+SCRIPT="${GIT_MUTATE_BIN:-$HERE/../git-mutate}"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -1509,6 +1509,107 @@ EOF
 }
 
 
+# --- test 21: a size-preserving mutation is measured against ITS OWN code ------------------
+#
+# CPython validates a cached .pyc against the source's (mtime, size). 'A = 1' -> 'A = 2'
+# preserves the size, and a sweep is fast enough -- especially with the fast tier -- that the
+# write lands inside the same mtime second as the existing .pyc. The test run then imports the
+# PREVIOUS bytecode, so the sweep measures code that is not in the tree. When the stale
+# bytecode happens to be the unmutated original, the mutation reddens nothing and reports a
+# false finding: the one output this tool must never produce.
+#
+# Pinned by observation rather than by mechanism: four single-digit constant edits, each of
+# which must produce its own distinct assertion message. Stale bytecode makes the messages
+# repeat, because the value reported belongs to whichever mutation was compiled last.
+make_bytecode_fixture() {
+    local repo="$1"
+    init_repo "$repo"
+    mkdir -p "$repo/tests"
+    : > "$repo/conftest.py"
+    cat > "$repo/mod.py" <<'EOF'
+A = 1
+B = 2
+C = 3
+D = 4
+
+
+def score(n):
+    base = n * A
+    bump = base + B
+    trim = bump - C
+    return trim + D
+EOF
+    cat > "$repo/tests/test_mod.py" <<'EOF'
+from mod import score
+
+
+def test_score_is_exact():
+    assert score(10) == 13
+EOF
+    commit_all "$repo" "bytecode fixture"
+    # Warm __pycache__ so a cached .pyc for the unmutated module really is on disk before the
+    # sweep starts. Without this the first mutation would compile from source anyway and the
+    # race the test exists to pin would not be reachable.
+    (cd "$repo" && python3 -m pytest -q >/dev/null 2>&1)
+}
+
+write_bytecode_mutations() {
+    cat > "$1" <<'EOF'
+[[mutation]]
+name = "bump-a"
+[[mutation.edit]]
+file = "mod.py"
+old = '''A = 1'''
+new = '''A = 2'''
+
+[[mutation]]
+name = "bump-b"
+[[mutation.edit]]
+file = "mod.py"
+old = '''B = 2'''
+new = '''B = 9'''
+
+[[mutation]]
+name = "bump-c"
+[[mutation.edit]]
+file = "mod.py"
+old = '''C = 3'''
+new = '''C = 8'''
+
+[[mutation]]
+name = "bump-d"
+[[mutation.edit]]
+file = "mod.py"
+old = '''D = 4'''
+new = '''D = 7'''
+EOF
+}
+
+test21() {
+    echo "test 21: a size-preserving mutation is measured against its own code, not a stale .pyc"
+    need_pytest || return 0
+    local d="$WORK/t21" repo="$WORK/t21/repo"
+    mkdir -p "$d"
+    make_bytecode_fixture "$repo"
+    write_bytecode_mutations "$d/mutations.toml"
+
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/mutations.toml"
+    assert_status "every size-preserving mutation is killed by the assertion it should be" 0
+    # score(10) = 10*A + B - C + D, so each edit has one correct answer and no other.
+    assert_contains "bump-a is measured as A=2, not as a cached A=1"  "assert 23 == 13"
+    assert_contains "bump-b is measured as B=9"                       "assert 20 == 13"
+    assert_contains "bump-c is measured as C=8"                       "assert 8 == 13"
+    assert_contains "bump-d is measured as D=7"                       "assert 16 == 13"
+
+    # The same four, with the fast tier off: the window is wider but the guarantee is the same.
+    mutate "$repo" --no-fast --cmd "python3 -m pytest -q" "$d/mutations.toml"
+    assert_contains "and again with --no-fast: A=2"  "assert 23 == 13"
+    assert_contains "and again with --no-fast: B=9"  "assert 20 == 13"
+    assert_contains "and again with --no-fast: C=8"  "assert 8 == 13"
+    assert_contains "and again with --no-fast: D=7"  "assert 16 == 13"
+}
+
+
 test1
 test2
 test3
@@ -1529,6 +1630,7 @@ test17
 test18
 test19
 test20
+test21
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1551,6 +1653,7 @@ echo "16. -h teaches the file format, and its example passes the guards . test16
 echo "17. the fast tier narrows the sweep but never invents a kill ...... test17"
 echo "18. a caller's 'tests' hint steers the tier, never a verdict ...... test18"
 echo "19. an expectation that did not come true is reported .......... test19"
+echo "21. a size-preserving mutation is measured, not a stale .pyc ... test21"
 echo "20. a green baseline that ran nothing refuses; stale reports uncounted  test20"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
