@@ -168,25 +168,12 @@ supported when another tool already produced the TOML. Note TOML's rule that a n
 opening `'''` is dropped, which is what lets a multi-line anchor start on its own line.
 
 **Several edits, one mutation.** A two-part change -- add something here, drain it there -- stays one
-mutation, applied and reported as one, by moving the edits into `[[mutation.edit]]` tables:
-
-```toml
-[[mutation]]
-name = "history-added-but-never-sent"
-[[mutation.edit]]
-file = "src/autorp/claims.py"
-old = '''        "history": _history_anchor(played),'''
-new = '''        "history": [],'''
-[[mutation.edit]]
-file = "src/autorp/prose.py"
-old = '''    played = _replay(history)'''
-new = '''    played = []'''
-```
-
-Internally a mutation is always a *list* of edits, so a two-part change stays declarative instead of needing
-special-casing in the tool; the flat spelling is that list with one element. One `[[mutation]]` may not use
-both spellings -- a mutation carrying `[[mutation.edit]]` *and* a top-level `file` is refused rather than
-guessed at, since either reading silently drops an edit.
+mutation, applied and reported as one: list `[[mutation.edit]]` tables instead of the three keys, each table
+carrying its own `file`, `old` and `new`. Internally a mutation is always a *list* of edits, so a two-part
+change stays declarative instead of needing special-casing in the tool; the flat spelling is that list with
+one element, which is why the two produce byte-identical output. One `[[mutation]]` may not use both
+spellings -- carrying `[[mutation.edit]]` *and* a top-level `file` is refused rather than guessed at, since
+either reading silently drops an edit.
 
 ## Nothing persistent -- and why a committed mutations file is not offered
 

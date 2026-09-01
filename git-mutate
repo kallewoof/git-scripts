@@ -117,21 +117,9 @@ behaviour is undefended" and "your guess about which test defends it was wrong" 
 claims, and folding them together would make a clean sweep unreadable.
 
 SEVERAL EDITS AT ONCE. A two-part change -- add something here, drain it there -- stays one
-mutation, applied and reported as one, by moving the edits into [[mutation.edit]] tables:
-
-  [[mutation]]
-  name = "history-added-but-never-sent"
-  [[mutation.edit]]
-  file = "src/autorp/claims.py"
-  old = '''        "history": _history_anchor(played),'''
-  new = '''        "history": [],'''
-  [[mutation.edit]]
-  file = "src/autorp/prose.py"
-  old = '''    played = _replay(history)'''
-  new = '''    played = []'''
-
-The two spellings are the same thing, and one [[mutation]] may not use both: a mutation that
-carries [[mutation.edit]] *and* a top-level 'file' is refused rather than guessed at.
+mutation, applied and reported as one: list [[mutation.edit]] tables instead of the three
+keys, each table carrying its own 'file', 'old' and 'new'. One [[mutation]] may not use both
+spellings -- carrying [[mutation.edit]] *and* a top-level 'file' is refused, not guessed at.
 
 THE GUARDS. Each refuses that one mutation loudly, names the offending edit, and lets the
 rest of the sweep run. A refusal is "not measured", never a survivor:
