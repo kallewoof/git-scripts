@@ -157,7 +157,6 @@ to clean up or accidentally preserve as a stale mutation suite:
 git mutate - <<'TOML'
 [[mutation]]
 name = "anchor-never-sent"
-[[mutation.edit]]
 file = "src/autorp/claims.py"
 old = '''        "history": _history_anchor(played),'''
 new = '''        "history": [],'''
@@ -165,11 +164,29 @@ TOML
 ```
 
 Use the same form with `git mutate --check -` to validate anchors without running tests. A file path remains
-supported when another tool already produced the TOML.
+supported when another tool already produced the TOML. Note TOML's rule that a newline immediately after the
+opening `'''` is dropped, which is what lets a multi-line anchor start on its own line.
 
-A mutation is a *list* of edits, so a two-part mutation (add something here, drain it there) stays
-declarative instead of needing special-casing in the tool. Note TOML's rule that a newline immediately
-after the opening `'''` is dropped, which is what lets a multi-line anchor start on its own line.
+**Several edits, one mutation.** A two-part change -- add something here, drain it there -- stays one
+mutation, applied and reported as one, by moving the edits into `[[mutation.edit]]` tables:
+
+```toml
+[[mutation]]
+name = "history-added-but-never-sent"
+[[mutation.edit]]
+file = "src/autorp/claims.py"
+old = '''        "history": _history_anchor(played),'''
+new = '''        "history": [],'''
+[[mutation.edit]]
+file = "src/autorp/prose.py"
+old = '''    played = _replay(history)'''
+new = '''    played = []'''
+```
+
+Internally a mutation is always a *list* of edits, so a two-part change stays declarative instead of needing
+special-casing in the tool; the flat spelling is that list with one element. One `[[mutation]]` may not use
+both spellings -- a mutation carrying `[[mutation.edit]]` *and* a top-level `file` is refused rather than
+guessed at, since either reading silently drops an edit.
 
 ## Nothing persistent -- and why a committed mutations file is not offered
 
@@ -365,7 +382,6 @@ first:
 [[mutation]]
 name = "history-never-sent"
 tests = ["tests/test_claims.py::test_history_is_sent"]
-[[mutation.edit]]
 file = "src/autorp/claims.py"
 old = '''        "history": _history_anchor(played),'''
 new = '''        "history": [],'''

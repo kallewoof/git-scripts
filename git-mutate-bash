@@ -124,7 +124,6 @@ temporary file to clean up, and cannot become a stale mutation suite by accident
   git mutate - <<'TOML'
   [[mutation]]
   name = "history-never-sent"
-  [[mutation.edit]]
   file = "src/autorp/claims.py"
   old = '''        "history": _history_anchor(played),'''
   new = '''        "history": [],'''
@@ -163,8 +162,22 @@ behaviour does not would never surface. It never changes a verdict or the exit s
 behaviour is undefended" and "your guess about which test defends it was wrong" are different
 claims, and folding them together would make a clean sweep unreadable.
 
-A mutation may list several [[mutation.edit]] tables. That is how a two-part change -- add
-something here, drain it there -- stays one mutation, applied and reported as one.
+SEVERAL EDITS AT ONCE. A two-part change -- add something here, drain it there -- stays one
+mutation, applied and reported as one, by moving the edits into [[mutation.edit]] tables:
+
+  [[mutation]]
+  name = "history-added-but-never-sent"
+  [[mutation.edit]]
+  file = "src/autorp/claims.py"
+  old = '''        "history": _history_anchor(played),'''
+  new = '''        "history": [],'''
+  [[mutation.edit]]
+  file = "src/autorp/prose.py"
+  old = '''    played = _replay(history)'''
+  new = '''    played = []'''
+
+The two spellings are the same thing, and one [[mutation]] may not use both: a mutation that
+carries [[mutation.edit]] *and* a top-level 'file' is refused rather than guessed at.
 
 THE GUARDS. Each refuses that one mutation loudly, names the offending edit, and lets the
 rest of the sweep run. A refusal is "not measured", never a survivor:
@@ -411,8 +424,24 @@ for i, mut in enumerate(muts, start=1):
         bad("duplicate mutation name %r -- names identify mutations in the report" % name)
     seen.add(name)
 
+    # Two spellings of the same thing. The overwhelming majority of mutations are a single
+    # edit, and making those carry a [[mutation.edit]] table is ceremony that buys nothing:
+    # 'file'/'old'/'new' sit directly in the [[mutation]]. The table form stays for the case it
+    # was invented for -- several edits applied as one mutation. They do not mix inside one
+    # [[mutation]]: there is no sensible reading of a mutation that has both, and guessing one
+    # would silently drop an edit.
     edits = mut.get("edit")
-    if not isinstance(edits, list) or not edits:
+    inline = [k for k in ("file", "old", "new") if k in mut]
+    if edits is not None and inline:
+        bad("mutation %r gives both [[mutation.edit]] and a top-level %s -- use one form "
+            "or the other" % (name, ", ".join("'%s'" % k for k in inline)))
+    flat = edits is None
+    if flat:
+        if not inline:
+            bad("mutation %r has no edit: give it 'file', 'old' and 'new' directly, or "
+                "one or more [[mutation.edit]] tables" % name)
+        edits = [mut]
+    elif not isinstance(edits, list) or not edits:
         bad("mutation %r has no [[mutation.edit]] tables" % name)
 
     mdir = os.path.join(out, "%03d" % i)
@@ -436,20 +465,22 @@ for i, mut in enumerate(muts, start=1):
             fh.write(("\n".join(hints) + "\n").encode("utf-8"))
 
     for j, edit in enumerate(edits, start=1):
+        # The flat form has no edit number to report, and inventing "edit 1/1" for it would
+        # point the reader at a table that is not in their file.
+        where = "mutation %r" % name if flat else "mutation %r edit %d" % (name, j)
         if not isinstance(edit, dict):
-            bad("mutation %r edit %d is not a table" % (name, j))
+            bad("%s is not a table" % where)
         for key in ("file", "old", "new"):
             if not isinstance(edit.get(key), str):
-                bad("mutation %r edit %d is missing a string '%s'" % (name, j, key))
+                bad("%s is missing a string '%s'" % (where, key))
         rel = edit["file"]
         if not rel or os.path.isabs(rel) or any(c in rel for c in "\t\n"):
-            bad("mutation %r edit %d: file %r must be a relative path with no tab or newline"
-                % (name, j, rel))
+            bad("%s: file %r must be a relative path with no tab or newline" % (where, rel))
         if os.path.normpath(rel).startswith(".."):
-            bad("mutation %r edit %d: file %r escapes the repository" % (name, j, rel))
+            bad("%s: file %r escapes the repository" % (where, rel))
         if not edit["old"]:
-            bad("mutation %r edit %d: 'old' is empty; there is no such thing as an anchor "
-                "that matches everywhere" % (name, j))
+            bad("%s: 'old' is empty; there is no such thing as an anchor that matches "
+                "everywhere" % where)
         edir = os.path.join(mdir, "edits", "%02d" % j)
         os.makedirs(edir)
         for key in ("file", "old", "new"):

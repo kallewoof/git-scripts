@@ -1037,7 +1037,8 @@ mut = doc["mutation"][0]
 assert isinstance(mut.get("name"), str) and mut["name"], "the example has no name"
 
 files = {}
-for edit in mut["edit"]:                         # ...carrying every key the parser requires
+edits = mut.get("edit") or [mut]                 # either spelling of the same thing
+for edit in edits:                               # ...carrying every key the parser requires
     for key in ("file", "old", "new"):
         assert isinstance(edit.get(key), str), "the example edit has no string %r" % key
     files.setdefault(edit["file"], []).append(edit["old"])
@@ -1610,6 +1611,115 @@ test21() {
 }
 
 
+# --- test 22: the flat spelling of a single-edit mutation --------------------------------
+#
+# Nearly every mutation is one edit, and making those carry a [[mutation.edit]] table is
+# ceremony that buys nothing. 'file'/'old'/'new' may sit directly in the [[mutation]]. The
+# table form stays for what it was invented for: several edits applied as one mutation.
+# The two are the same thing, so the test that matters is that they produce the same output
+# byte for byte -- not that the flat one merely parses.
+
+write_flat_pair() {
+    local flat="$1" table="$2"
+    cat > "$flat" <<'EOF'
+[[mutation]]
+name = "walk-broken"
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [244, 331, 434]'''
+
+[[mutation]]
+name = "unchecked-doubling"
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 3'''
+EOF
+    cat > "$table" <<'EOF'
+[[mutation]]
+name = "walk-broken"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [244, 331, 434]'''
+
+[[mutation]]
+name = "unchecked-doubling"
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 3'''
+EOF
+}
+
+test22() {
+    echo "test 22: a single-edit mutation may drop [[mutation.edit]], and means the same thing"
+    need_pytest || return 0
+    local d="$WORK/t22" repo="$WORK/t22/repo" flat_out="" table_out=""
+    mkdir -p "$d"
+    make_fixture "$repo"
+    write_flat_pair "$d/flat.toml" "$d/table.toml"
+
+    # Fed on stdin so the header says "from -" for both, and the transcripts are comparable.
+    mutate_stdin "$repo" "$d/flat.toml" --cmd pytest -
+    flat_out="$OUT"
+    assert_status "the flat spelling sweeps and reports a finding, like any other file" 2
+    assert_contains "the flat spelling kills what it should" \
+        "walk-broken: reddened 1 -- 1 by assertion, 0 by error."
+    assert_contains "and surfaces the survivor it should" "unchecked-doubling: reddened nothing."
+
+    mutate_stdin "$repo" "$d/table.toml" --cmd pytest -
+    table_out="$OUT"
+    assert_status "the table spelling reaches the same exit status" 2
+    assert_eq "the two spellings produce byte-identical output" "$table_out" "$flat_out"
+
+    # 'tests' still works where it always did.
+    cat > "$d/hinted.toml" <<'EOF'
+[[mutation]]
+name = "flat-with-hint"
+tests = ["tests/test_mod.py::test_walk_returns_the_steps"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [244, 331, 434]'''
+EOF
+    mutate "$repo" --check "$d/hinted.toml"
+    assert_status "a flat mutation may still carry 'tests'" 0
+    assert_contains "and --check reads the hint from it" "[expects 1 test(s) to fail]"
+
+    # A mutation that uses both spellings has no sensible reading; guessing would drop an edit.
+    cat > "$d/mixed.toml" <<'EOF'
+[[mutation]]
+name = "mixed"
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 3'''
+[[mutation.edit]]
+file = "mod.py"
+old = '''    return "plain"'''
+new = '''    return "other"'''
+EOF
+    mutate "$repo" --check "$d/mixed.toml"
+    assert_status "mixing the two spellings is a usage error, not a silent choice" 1
+    assert_contains "and it names both halves of the contradiction" \
+        "gives both [[mutation.edit]] and a top-level 'file', 'old', 'new'"
+
+    # Neither spelling present at all.
+    printf '%s\n' '[[mutation]]' 'name = "empty"' > "$d/empty.toml"
+    mutate "$repo" --check "$d/empty.toml"
+    assert_status "a mutation with no edit at all is refused" 1
+    assert_contains "and the refusal teaches both spellings" \
+        "give it 'file', 'old' and 'new' directly, or one or more [[mutation.edit]] tables"
+
+    # A half-written flat mutation reports itself without inventing an edit number.
+    printf '%s\n' '[[mutation]]' 'name = "partial"' 'file = "mod.py"' "old = '''x'''" \
+        > "$d/partial.toml"
+    mutate "$repo" --check "$d/partial.toml"
+    assert_status "a flat mutation missing a key is refused" 1
+    assert_contains "and says so without pointing at a table that is not there" \
+        "mutation 'partial' is missing a string 'new'"
+    assert_missing "so no phantom edit number appears" "mutation 'partial' edit 1"
+}
+
+
 test1
 test2
 test3
@@ -1631,6 +1741,7 @@ test18
 test19
 test20
 test21
+test22
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1653,6 +1764,7 @@ echo "16. -h teaches the file format, and its example passes the guards . test16
 echo "17. the fast tier narrows the sweep but never invents a kill ...... test17"
 echo "18. a caller's 'tests' hint steers the tier, never a verdict ...... test18"
 echo "19. an expectation that did not come true is reported .......... test19"
+echo "22. a single-edit mutation may drop [[mutation.edit]] ....... test22"
 echo "21. a size-preserving mutation is measured, not a stale .pyc ... test21"
 echo "20. a green baseline that ran nothing refuses; stale reports uncounted  test20"
 echo
