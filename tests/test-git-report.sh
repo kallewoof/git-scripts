@@ -599,6 +599,61 @@ test16() {
     assert_eq "an ignored file does not bust the key" "3" "$(counter_value "$counter")"
 }
 
+# --- test 17: the cache is pruned every 30 days, keeping the 10 most recent --------
+
+test17() {
+    echo "test 17: entries are pruned after 30 days, keeping the 10 most recent"
+    local d="$WORK/t17" repo counter marker cache stamp i name out
+    repo="$d/self"; counter="$d/counter"; marker="$d/marker"
+    init_repo "$repo"
+    make_fake_gate_config "$repo" "$counter" "$marker"
+    echo x > "$repo/f.txt"
+    commit_all "$repo" init
+    cache="$repo/.git/info/git-report"
+    stamp="$cache/last-cleanup"
+
+    # A brand new cache directory has nothing to clean, so the first run that sees one starts
+    # the clock instead of sweeping.
+    run_report "$repo" > /dev/null
+    out=$(run_report "$repo" 2>&1 >/dev/null)
+    assert_eq "a run inside the interval says nothing" "" "$out"
+    if [ -f "$stamp" ]; then ok "the stamp is laid down without a sweep"; else fail "the stamp is laid down without a sweep"; fi
+
+    # 25 entries, oldest first, one day apart, plus the three names a sweep must never touch.
+    for i in $(seq 1 25); do
+        name=$(printf '%064d' "$i" | tr '0-9' 'abcdef0123')
+        echo "entry $i" > "$cache/$name"
+        touch -d "$((2000 + i))-01-01 00:00" "$cache/$name"
+    done
+    echo "tree=deadbeef" > "$cache/pending"
+    echo "half-written" > "$cache/.new.ABCDEF"
+    printf 'epoch=%s at=long-ago\n' "$(( $(date +%s) - 31 * 24 * 60 * 60 ))" > "$stamp"
+
+    # The real entry from the run above is the newest of the lot, so the ten survivors are it
+    # plus entries 17..25.
+    out=$(run_report "$repo" 2>&1 >/dev/null)
+    assert_eq "the sweep announces itself" "report cleanup" "$out"
+    assert_eq "ten entries survive" "10" \
+        "$(find "$cache" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9a-f]{64}' | wc -l)"
+    assert_eq "the oldest entry is gone" "" "$(cat "$cache/$(printf '%064d' 1 | tr '0-9' 'abcdef0123')" 2>/dev/null)"
+    assert_eq "the newest of the backdated entries survives" "entry 25" \
+        "$(cat "$cache/$(printf '%064d' 25 | tr '0-9' 'abcdef0123')" 2>/dev/null)"
+
+    # A key is 64 hex characters; nothing else in the directory is, and none of it is a report.
+    assert_eq "the sweep leaves 'pending' alone" "tree=deadbeef" "$(cat "$cache/pending" 2>/dev/null)"
+    assert_eq "the sweep leaves a concurrent write's temp file alone" "half-written" \
+        "$(cat "$cache/.new.ABCDEF" 2>/dev/null)"
+
+    # And the cache still works: the surviving entry for this state is still a hit.
+    assert_eq "the gate has run once in all of this" "1" "$(counter_value "$counter")"
+    run_report "$repo" > /dev/null
+    assert_eq "the surviving entry is still a cache hit" "1" "$(counter_value "$counter")"
+
+    # The stamp is reset by the sweep, so the next run is inside the interval again.
+    out=$(run_report "$repo" 2>&1 >/dev/null)
+    assert_eq "the sweep does not repeat on the next run" "" "$out"
+}
+
 test1
 test2
 test3
@@ -615,6 +670,7 @@ test13
 test14
 test15
 test16
+test17
 
 echo
 echo "== behaviour -> test mapping =="
@@ -634,6 +690,7 @@ echo "13. no capture for this tree is said plainly ................. test13"
 echo "14. no capture while a mutation sweep is in flight ........... test14"
 echo "15. the real wiring, end to end through pre-commit ........... test15"
 echo "16. untracked dependency content is keyed, not just its name . test16"
+echo "17. the cache is pruned every 30 days, 10 most recent kept ... test17"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed"
 [ "$TESTS_FAILED" -eq 0 ]

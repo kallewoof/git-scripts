@@ -25,6 +25,9 @@
 # change what this repo's tests do even though this repo's own HEAD hasn't moved. See
 # README.md for the full design.
 #
+# Cache retention: entries accumulate one per distinct key, so every 30 days a run says
+# "report cleanup" on stderr and keeps only the 10 most recently written entries.
+#
 # Dependency file: a file named below at a repo's root, one relative repo path per
 # line, blank lines and lines starting with '#' ignored. Absent file means no
 # dependencies.
@@ -64,6 +67,12 @@ cache_dir="$self_root/.git/info/git-report"
 # Where --capture leaves a run for --record to pick up. A key is 64 hex characters, so the
 # literal name cannot collide with one.
 pending="$cache_dir/pending"
+
+# Where the retention sweep records when it last ran. Like 'pending', a name that no key can
+# collide with.
+cleanup_stamp="$cache_dir/last-cleanup"
+CLEANUP_INTERVAL=$((30 * 24 * 60 * 60))
+CLEANUP_KEEP=10
 
 # A 'git mutate' sweep dirties the tree on purpose while a mutation is applied. Two places
 # care: the dirty-tree refusal below says so instead of implying the repo is broken, and
@@ -105,6 +114,49 @@ if [ "$mode" = "capture" ]; then
     "$@" | tee -a -- "$pending"
     exit "${PIPESTATUS[0]}"
 fi
+
+# Nothing ever removed an entry, so a long-lived repo accumulated one file per distinct key
+# forever -- and the key is content-addressed, so every intermediate dirty state anyone
+# reported on left an entry of its own behind. Every $CLEANUP_INTERVAL, keep the
+# $CLEANUP_KEEP most recently written entries and drop the rest.
+#
+# Only 64-hex names are eligible, which is exactly the set of entries: 'pending', the stamp,
+# and a concurrent write's in-flight '.new.XXXXXX' are all named so they cannot match, and
+# all three must survive. Most recent means most recently *written*: a hit does not touch its
+# entry, so an old entry that is still being replayed can be pruned. That costs one gate run
+# to rebuild it, which is what the cache is for.
+#
+# A missing stamp starts the clock rather than sweeping: a cache directory with no stamp is
+# either brand new, with nothing to clean, or predates this code, and in neither case is
+# "clean now" better than "clean 30 days from now".
+#
+# The notice goes to stderr, unlike the cached-notice: it is housekeeping, not part of the
+# report, and stdout is a contract here -- a hit's first line is the cached-notice. Every step
+# is allowed to fail quietly; failing to tidy up is not a reason to withhold a report.
+prune_cache() {
+    local now last
+    [ -d "$cache_dir" ] || return 0
+    now=$(date +%s 2>/dev/null) || return 0
+    last=$(sed -n '1s/^epoch=\([0-9][0-9]*\).*/\1/p' "$cleanup_stamp" 2>/dev/null)
+    if [ -n "$last" ]; then
+        [ "$((now - last))" -lt "$CLEANUP_INTERVAL" ] && return 0
+        echo "report cleanup" >&2
+        find "$cache_dir" -maxdepth 1 -regextype posix-extended \
+             -type f -regex '.*/[0-9a-f]{64}' -printf '%T@ %p\n' 2>/dev/null |
+            sort -rn |
+            tail -n +$((CLEANUP_KEEP + 1)) |
+            cut -d' ' -f2- |
+            xargs -r rm -f --
+    fi
+    printf 'epoch=%s at=%s\n' "$now" "$(date -Is 2>/dev/null || date)" \
+        > "$cleanup_stamp" 2>/dev/null
+    return 0
+}
+
+# Every invocation that is not --capture, which must stay invisible, and before the
+# dirty-tree refusal below, so that a repo whose reports are all being refused still gets
+# tidied.
+prune_cache
 
 # Lists the repos that make up this key, in fixed order: declared dependencies (in
 # the order they appear in the dependency file), then this repo itself, last.

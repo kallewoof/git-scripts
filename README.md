@@ -28,6 +28,15 @@ its position relative to the content is the whole point of it. Every entry there
 prints the notice, then that body. Entries are written to a temp file in the cache directory and
 renamed, so a reader hitting the same key mid-write sees either no entry or a whole one.
 
+**Retention:** the key is content-addressed, so a busy repo leaves an entry behind for every distinct
+state anyone reported on, and nothing used to remove them. Every 30 days a run prints `report cleanup`
+on stderr -- stderr, not stdout, because it is housekeeping and not part of the report -- and keeps only
+the 10 most recently *written* entries. A hit does not touch its entry, so an entry that is old but still
+being replayed can be swept; the cost of that is one gate run to rebuild it. Only names that are 64 hex
+characters are eligible, which is exactly the set of entries: `pending`, the `last-cleanup` stamp, and an
+in-flight `.new.XXXXXX` cannot match and are left alone. A cache directory with no stamp starts the clock
+rather than sweeping immediately.
+
 **Dependency file:** a file named `.git-report-deps` at a repo's root, one relative repo path per line,
 blank lines and lines starting with `#` ignored. No file means no dependencies.
 
