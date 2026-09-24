@@ -1617,8 +1617,235 @@ new = '''    steps = [244, 331]'''
 EOF
     mutate "$repo" --cmd "python3 -m pytest -q" "$d/erroring.toml"
     assert_contains "a bare hint whose cases only errored is unmet, naming those cases" \
-        "cases-error-only: expected '$h' to fail; it failed only by error, which proves nothing about the behaviour -- errored in [2], and no parametrization failed by assertion."
+        "cases-error-only: expected '$h' to fail; it failed only by error, which proves nothing about the behaviour -- errored in [2], and nothing it names failed by assertion."
     assert_status "an error-only kill is still a finding (exit 2), unchanged by the expectation" 2
+}
+
+
+# --- test 24: a class, module or directory hint owns its tests; a red one is not "passed" --
+#
+# Two more ways a hint read "passed" when it had not. A hint naming a class, module or
+# directory selects many tests but equals none of their ids. And a hint naming a test that is
+# already red -- before any mutation, or on the clean tree as the fast tier runs it -- is
+# dropped from the rows, so its silence meant nothing. That one is neither met nor unmet: it is
+# reported apart, and counted apart, rather than inflating the unmet count.
+make_hint_scope_fixture() {
+    local repo="$1"
+    init_repo "$repo"
+    mkdir -p "$repo/tests" "$repo/tests_more" "$repo/tests_red"
+    : > "$repo/conftest.py"
+    cat > "$repo/mod.py" <<'EOF'
+STATE = {}
+
+
+def prime():
+    STATE["ready"] = True
+
+
+def walk():
+    steps = [244, 331, 721]
+    return steps
+
+
+def render(name):
+    return "hello " + name
+
+
+def lookup(key):
+    return {"a": 1}[key]
+EOF
+    cat > "$repo/tests/test_mod.py" <<'EOF'
+from mod import STATE, prime, render, walk
+
+
+def test_a_primes_the_state():
+    prime()
+    assert STATE["ready"] is True
+
+
+def test_b_needs_the_primed_state():
+    assert STATE.get("ready") is True
+
+
+class TestWalk:
+    def test_steps(self):
+        assert walk() == [244, 331, 721]
+
+
+class TestWalkbar:
+    def test_greets(self):
+        assert render("bo") == "hello bo"
+EOF
+    cat > "$repo/tests_red/test_red.py" <<'EOF'
+import pytest
+
+
+def test_known_broken():
+    assert 1 == 2
+
+
+@pytest.mark.parametrize("i", [0, 1])
+def test_half(i):
+    assert i == 0
+EOF
+    cat > "$repo/tests_more/test_more.py" <<'EOF'
+from mod import lookup
+
+
+def test_lookup():
+    assert lookup("a") == 1
+EOF
+    commit_all "$repo" "hint scope fixture"
+}
+
+test24() {
+    echo "test 24: class, module and directory hints own their tests; an already-red hint is not 'passed'"
+    need_pytest || return 0
+    local d="$WORK/t24" repo="$WORK/t24/repo" m="tests/test_mod.py" r="tests_red/test_red.py"
+    mkdir -p "$d"
+    make_hint_scope_fixture "$repo"
+    cat > "$d/mutations.toml" <<EOF
+[[mutation]]
+name = "class-hint"
+tests = ["$m::TestWalk"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [999, 331, 721]'''
+
+[[mutation]]
+name = "module-hint"
+tests = ["$m"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [998, 331, 721]'''
+
+[[mutation]]
+name = "class-prefix"
+tests = ["$m::TestWalk"]
+file = "mod.py"
+old = '''    return "hello " + name'''
+new = '''    return "hello"'''
+
+[[mutation]]
+name = "dir-hint"
+tests = ["tests"]
+file = "mod.py"
+old = '''    return "hello " + name'''
+new = '''    return "hi " + name'''
+
+[[mutation]]
+name = "dir-prefix"
+tests = ["tests"]
+file = "mod.py"
+old = '''    return {"a": 1}[key]'''
+new = '''    return {"a": 2}[key]'''
+
+[[mutation]]
+name = "baseline-red"
+tests = ["$r::test_known_broken"]
+file = "mod.py"
+old = '''    return "hello " + name'''
+new = '''    return "hey " + name'''
+
+[[mutation]]
+name = "baseline-red-case"
+tests = ["$r::test_half"]
+file = "mod.py"
+old = '''    return "hello " + name'''
+new = '''    return "yo " + name'''
+
+[[mutation]]
+name = "dir-with-red"
+tests = ["tests_red"]
+file = "mod.py"
+old = '''    return {"a": 1}[key]'''
+new = '''    return {"a": 3}[key]'''
+
+[[mutation]]
+name = "iso-red"
+tests = ["$m::TestWalk", "$m::test_b_needs_the_primed_state"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [997, 331, 721]'''
+EOF
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/mutations.toml"
+    assert_status "every mutation was killed by an assertion (exit 0)" 0
+    assert_missing "a class hint is met by a failing method of that class" "class-hint: expected"
+    assert_missing "a module hint is met by a failing test in that module" "module-hint: expected"
+    assert_missing "a directory hint is met by a failing test under it" "dir-hint: expected"
+    assert_contains "'TestWalk' does not claim 'TestWalkbar::...'" \
+        "class-prefix: expected '$m::TestWalk' to fail; it passed."
+    assert_contains "'tests' does not claim 'tests_more/...'" \
+        "dir-prefix: expected 'tests' to fail; it passed."
+    assert_contains "a hint red before any mutation is reported as not checkable, not as passed" \
+        "baseline-red: '$r::test_known_broken' could not be checked -- it already failed before any mutation."
+    assert_contains "a parametrized hint with a baseline-red case names that case" \
+        "baseline-red-case: '$r::test_half' could not be checked -- [1] already failed before any mutation; nothing else it names failed."
+    assert_contains "a hint red on the clean tree as the fast tier runs it is not checkable" \
+        "iso-red: '$m::test_b_needs_the_primed_state' could not be checked -- it already failed on the unmutated tree, run as the fast tier's subset."
+    assert_contains "the fast tier really did settle the iso-red mutation" \
+        "iso-red ... reddened"
+    assert_contains "a group hint with red members says what the rest of it did" \
+        "dir-with-red: 'tests_red' could not be checked -- test_red.py::test_half[1], test_red.py::test_known_broken already failed before any mutation; nothing else it names failed."
+    assert_missing "an unchecked hint is not listed as unmet" "baseline-red: expected"
+    assert_contains "unchecked hints get their own section" "== EXPECTATIONS NOT CHECKED"
+    assert_contains "and their own count, apart from the unmet ones" \
+        "2 expectation(s) not met, 4 not checkable."
+}
+
+
+# --- test 25: a Surefire hint owns the parametrized cases JUnit 5 reports --------------------
+#
+# JUnit 5 under Surefire reports a parametrized method as 'testAdd(int)[1]'. A hint naming
+# 'Mod::testAdd' owns those; 'Mod::testAd' does not.
+make_surefire_param_fixture() {
+    local repo="$1"
+    init_repo "$repo"
+    cat > "$repo/mod.py" <<'EOF'
+def add(a, b):
+    return a + b
+EOF
+    cat > "$repo/runner.sh" <<'EOF'
+#!/bin/bash
+d="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$d/target/surefire-reports"
+out="$d/target/surefire-reports/TEST-com.example.Mod.xml"
+if (cd "$d" && python3 -B -c "import mod; assert mod.add(2, 3) == 5"); then
+    printf '<testsuite name="com.example.Mod" tests="2" failures="0" errors="0" skipped="0"><testcase name="testAdd(int)[1]"/><testcase name="testAdd(int)[2]"/></testsuite>\n' > "$out"
+    exit 0
+fi
+printf '<testsuite name="com.example.Mod" tests="2" failures="1" errors="0" skipped="0"><testcase name="testAdd(int)[1]"><failure type="org.opentest4j.AssertionFailedError" message="expected 5"/></testcase><testcase name="testAdd(int)[2]"/></testsuite>\n' > "$out"
+exit 1
+EOF
+    chmod +x "$repo/runner.sh"
+    cat > "$repo/mutations.toml" <<'EOF'
+[[mutation]]
+name = "junit5-case"
+tests = ["Mod::testAdd"]
+file = "mod.py"
+old = '''    return a + b'''
+new = '''    return a - b'''
+
+[[mutation]]
+name = "junit5-prefix"
+tests = ["Mod::testAd"]
+file = "mod.py"
+old = '''    return a + b'''
+new = '''    return a * b'''
+EOF
+    commit_all "$repo" "surefire param fixture"
+}
+
+test25() {
+    echo "test 25: a Surefire hint owns the 'name(args)[n]' cases JUnit 5 reports"
+    local d="$WORK/t25" repo="$WORK/t25/repo"
+    mkdir -p "$d"
+    make_surefire_param_fixture "$repo"
+    mutate "$repo" --env mvn --cmd "$repo/runner.sh" "$repo/mutations.toml"
+    assert_status "both mutations were killed by an assertion (exit 0)" 0
+    assert_missing "'Mod::testAdd' is met by 'Mod::testAdd(int)[1]'" "junit5-case: expected"
+    assert_contains "'Mod::testAd' does not claim 'Mod::testAdd(int)[1]'" \
+        "junit5-prefix: expected 'Mod::testAd' to fail; it passed."
 }
 
 
@@ -1855,6 +2082,8 @@ test20
 test21
 test22
 test23
+test24
+test25
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1880,6 +2109,8 @@ echo "19. an expectation that did not come true is reported .......... test19"
 echo "22. a single-edit mutation may drop [[mutation.edit]] ....... test22"
 echo "21. a size-preserving mutation is measured, not a stale .pyc ... test21"
 echo "23. a bare hint for a parametrized test owns its cases ... test23"
+echo "24. class/module/dir hints own their tests; red hints unchecked  test24"
+echo "25. a Surefire hint owns JUnit 5's name(args)[n] cases ........ test25"
 echo "20. a green baseline that ran nothing refuses; stale reports uncounted  test20"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"

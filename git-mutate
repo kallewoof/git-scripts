@@ -116,10 +116,18 @@ behaviour does not would never surface. It never changes a verdict or the exit s
 behaviour is undefended" and "your guess about which test defends it was wrong" are different
 claims, and folding them together would make a clean sweep unreadable.
 
-A bare id for a parametrized test names every parametrization of it, and the expectation is
-met when ANY of them fails by assertion -- "this test defends the behaviour" -- whatever the
-others did. Only failures are visible, so "every case failed" could not be checked anyway;
-to expect one case in particular, name it: 'test_foo[case1]' matches only itself.
+A hint names everything its runner selects for it: a bare parametrized test every case of it,
+a class or module every test in it, a directory every test under it; for Surefire,
+'Cls::testFoo' owns JUnit 5's 'Cls::testFoo(int)[1]'. The expectation is met when ANY of those
+fails by assertion -- "this test defends the behaviour" -- whatever the others did. Only
+failures are visible, so "every case failed" could not be checked anyway; to expect one case
+in particular, name it: 'test_foo[case1]' matches only itself. The match stops at a boundary
+('[', '::', '/', '('), so 'test_foo' never claims 'test_foobar[...]'.
+
+A hint that was already red without the mutation -- before any mutation, or on the clean
+tree as the fast tier ran it -- is neither met nor unmet: its failure was excluded from the
+measurement, so it cannot show whether this mutation reddened it. It is listed apart, under
+EXPECTATIONS NOT CHECKED, and counted apart as "not checkable".
 
 SEVERAL EDITS AT ONCE. A two-part change -- add something here, drain it there -- stays one
 mutation, applied and reported as one: list [[mutation.edit]] tables instead of the three
@@ -233,6 +241,7 @@ class Result:
     status: str = ""
     note: str = ""
     rows: list = field(default_factory=list)      # [(kind, test_id, message)]
+    excluded: dict = field(default_factory=dict)  # test_id -> when it was red unmutated
     rows_all: list = field(default_factory=list)
     n_a: int = 0
     n_e: int = 0
@@ -660,6 +669,7 @@ class Sweep:
         self.fast_iso_ids = None
         self.hintwarn = []
         self.n_unmet = 0
+        self.n_unchecked = 0
 
     # -- lock, marker, snapshot, restore --------------------------------------------------
 
@@ -1453,6 +1463,9 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
 
         if fast_hit:
             res.rows = fast_rows
+            res.excluded = dict.fromkeys(sweep.fast_iso_ids,
+                                         "on the unmutated tree, run as the fast tier's subset")
+            res.excluded.update(dict.fromkeys(baseline_set, "before any mutation"))
             res.n_a = sum(1 for r in fast_rows if r[0] == "A")
             res.n_e = sum(1 for r in fast_rows if r[0] == "E")
             res.n_u = 0
@@ -1473,6 +1486,7 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
         res.rows_all = classify(log, env_name, assertion_pattern)
         res.rows = [r for r in res.rows_all if r[1] not in baseline_set] \
             if baseline_set else list(res.rows_all)
+        res.excluded = dict.fromkeys(baseline_set, "before any mutation")
         res.n_a = sum(1 for r in res.rows if r[0] == "A")
         res.n_e = sum(1 for r in res.rows if r[0] == "E")
         res.n_u = sum(1 for r in res.rows if r[0] == "U")
@@ -1573,12 +1587,34 @@ def section(sweep, title, *wanted):
                 print_rows(res, "E", "error")
 
 
-def hint_rows(tid, rows):
-    """The rows for the test a hint names. A bare id names every parametrization of it --
-    that is what pytest selects for it -- so 'test_foo' owns 'test_foo[case]'. The '[' is the
-    boundary: 'test_foo' must not own 'test_foobar[case]', and 'test_foo[a]' owns only itself.
+# What may follow a hint in an id it owns. pytest: '[' a parametrization, '::' a class's or
+# module's tests, '/' a directory's. Surefire: '(' a JUnit 5 method's parameter list, as in
+# 'testFoo(int)[1]'. JUnit 4's 'testFoo[0]' is already the '['.
+HINT_BOUNDARIES = ("[", "::", "/", "(")
+
+
+def hint_owns(tid, test_id):
+    """Whether a hint names this test id. A hint names everything its runner selects for it --
+    pytest runs every parametrization of 'test_foo' and every test of 'tests/x.py' -- so it owns
+    those ids too. The boundary is what keeps it honest: 'test_foo' must not own
+    'test_foobar[case]', and 'test_foo[a]' owns only itself.
     """
-    return [r for r in rows if r[1] == tid or r[1].startswith(tid + "[")]
+    if test_id == tid:
+        return True
+    if tid.endswith("/"):
+        return test_id.startswith(tid)
+    return any(test_id.startswith(tid + b) for b in HINT_BOUNDARIES)
+
+
+def hint_rows(tid, rows):
+    """The rows for the tests a hint names."""
+    return [r for r in rows if hint_owns(tid, r[1])]
+
+
+def owned_names(tid, ids):
+    """The ids a hint owns, relative to it: '[2]' for 'test_foo[2]', 'TestC::test_a' for
+    'tests/x.py::TestC::test_a'. An id equal to the hint is dropped -- there is nothing to add."""
+    return [i[len(tid):].lstrip(":/") for i in ids if i != tid]
 
 
 def expectations(sweep):
@@ -1589,7 +1625,7 @@ def expectations(sweep):
     Deliberately kept out of the exit status. "This behaviour is undefended" (2) and "your
     guess about which test defends it was wrong" are different claims.
     """
-    any_shown = False
+    unmet, unchecked = [], []
     for res in sweep.results:
         if not res.hints:
             continue
@@ -1602,23 +1638,54 @@ def expectations(sweep):
             if any(k == "A" for k, _, _ in mine):
                 continue
             errored = [i for k, i, _ in mine if k == "E"]
+            # A test red without the mutation was dropped from this result's rows, so its
+            # silence here means nothing: it might have failed by assertion. Saying "passed"
+            # would be false, and "not met" would be a guess.
+            red = sorted(i for i in res.excluded if hint_owns(tid, i))
+            if red:
+                why = {}
+                for i in red:
+                    why.setdefault(res.excluded[i], []).append(i)
+                parts = []
+                for when, ids in why.items():
+                    named = owned_names(tid, ids)
+                    parts.append("%s already failed %s"
+                                 % (", ".join(named) if named else "it", when))
+                line = ("  %s: '%s' could not be checked -- %s"
+                        % (res.name, tid, "; ".join(parts)))
+                # When the hint names more than the red tests, say what the rest did: that is
+                # what the caller needs to judge the expectation themselves.
+                if errored:
+                    line += "; the rest failed only by error"
+                elif red != [tid]:
+                    line += "; nothing else it names failed"
+                unchecked.append(line + ".")
+                continue
             if errored:
                 kind = "failed only by error, which proves nothing about the behaviour"
-                params = [i[len(tid):] for i in errored if i != tid]
-                if params:
-                    kind += " -- errored in %s, and no parametrization failed by assertion" \
-                        % ", ".join(params)
+                named = owned_names(tid, errored)
+                if named:
+                    kind += " -- errored in %s, and nothing it names failed by assertion" \
+                        % ", ".join(named)
             else:
                 kind = "passed"
-            if not any_shown:
-                emit()
-                emit("== EXPECTATIONS NOT MET -- a test you named did not fail ==")
-                any_shown = True
-            sweep.n_unmet += 1
-            emit("  %s: expected '%s' to fail; it %s." % (res.name, tid, kind))
-    if any_shown:
+            unmet.append("  %s: expected '%s' to fail; it %s." % (res.name, tid, kind))
+
+    sweep.n_unmet, sweep.n_unchecked = len(unmet), len(unchecked)
+    if unmet:
+        emit()
+        emit("== EXPECTATIONS NOT MET -- a test you named did not fail ==")
+        for line in unmet:
+            emit(line)
         emit("      Each mutation's own verdict above stands -- something else may well have")
         emit("      killed it. What is wrong here is the expectation, not the measurement.")
+    if unchecked:
+        emit()
+        emit("== EXPECTATIONS NOT CHECKED -- a test you named was red without the mutation ==")
+        for line in unchecked:
+            emit(line)
+        emit("      A test that is already red cannot show whether this mutation reddens it.")
+        emit("      Neither met nor unmet: fix that test, or name one that is green.")
 
 
 def report(sweep, env_name):
@@ -1651,6 +1718,8 @@ def report(sweep, env_name):
     n_killed = count("killed")
 
     unmet_note = ", %d expectation(s) not met" % sweep.n_unmet if sweep.n_unmet else ""
+    if sweep.n_unchecked:
+        unmet_note += ", %d not checkable" % sweep.n_unchecked
     emit("%s: %d killed by assertion, %d finding(s), %d not measured%s."
          % (SELF, n_killed, n_findings, n_unmeasured, unmet_note))
 
