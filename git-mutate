@@ -116,6 +116,11 @@ behaviour does not would never surface. It never changes a verdict or the exit s
 behaviour is undefended" and "your guess about which test defends it was wrong" are different
 claims, and folding them together would make a clean sweep unreadable.
 
+A bare id for a parametrized test names every parametrization of it, and the expectation is
+met when ANY of them fails by assertion -- "this test defends the behaviour" -- whatever the
+others did. Only failures are visible, so "every case failed" could not be checked anyway;
+to expect one case in particular, name it: 'test_foo[case1]' matches only itself.
+
 SEVERAL EDITS AT ONCE. A two-part change -- add something here, drain it there -- stays one
 mutation, applied and reported as one: list [[mutation.edit]] tables instead of the three
 keys, each table carrying its own 'file', 'old' and 'new'. One [[mutation]] may not use both
@@ -1568,6 +1573,14 @@ def section(sweep, title, *wanted):
                 print_rows(res, "E", "error")
 
 
+def hint_rows(tid, rows):
+    """The rows for the test a hint names. A bare id names every parametrization of it --
+    that is what pytest selects for it -- so 'test_foo' owns 'test_foo[case]'. The '[' is the
+    boundary: 'test_foo' must not own 'test_foobar[case]', and 'test_foo[a]' owns only itself.
+    """
+    return [r for r in rows if r[1] == tid or r[1].startswith(tid + "[")]
+
+
 def expectations(sweep):
     """An expectation the caller stated and the run did not bear out. NOT a finding about the
     code -- the mutation may well have been killed, by some other test -- but a finding about
@@ -1585,10 +1598,16 @@ def expectations(sweep):
         if res.status not in ("killed", "survived", "error-only"):
             continue
         for tid in res.hints:
-            if any(k == "A" and i == tid for k, i, _ in res.rows):
+            mine = hint_rows(tid, res.rows)
+            if any(k == "A" for k, _, _ in mine):
                 continue
-            if any(k == "E" and i == tid for k, i, _ in res.rows):
+            errored = [i for k, i, _ in mine if k == "E"]
+            if errored:
                 kind = "failed only by error, which proves nothing about the behaviour"
+                params = [i[len(tid):] for i in errored if i != tid]
+                if params:
+                    kind += " -- errored in %s, and no parametrization failed by assertion" \
+                        % ", ".join(params)
             else:
                 kind = "passed"
             if not any_shown:

@@ -413,6 +413,14 @@ reads `killed by assertion`, names a test that is not the one you named, and the
 "I thought `test_x` covered this, and actually `test_y` does" is invisible unless it is said. A hint
 that reddens only by error does not count as met either, and says so.
 
+A bare id for a parametrized test -- `tests/test_mod.py::test_score` where the suite runs
+`test_score[zero]`, `test_score[one]` -- names every parametrization of it. The expectation is met
+when **any** of them fails by assertion, whatever the others did: *this test defends the behaviour*.
+Only failures are visible to the sweep, so *every case failed* could not be checked anyway; to expect a
+particular case, name it -- `test_score[zero]` matches only itself. The match stops at the `[`, so
+`test_score` never claims `test_scorecard[...]`. When no parametrization failed by assertion but some
+errored, the line names the ones that errored.
+
 This never changes a verdict or an exit status. *This behaviour is undefended* and *your guess about
 which test defends it was wrong* are different claims; folding the second into the first would make a
 clean sweep unreadable in exactly the way a score does.

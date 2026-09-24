@@ -1510,6 +1510,118 @@ EOF
 }
 
 
+# --- test 23: a bare hint for a parametrized test owns its parametrizations -----------------
+#
+# pytest reports a parametrized test only under its '[param]' ids, so a hint naming the bare
+# function never compared equal to any row and was reported as having PASSED -- when it had
+# failed by assertion in every case. A false entry here is worse than none: it tells the caller
+# a test does not defend a behaviour when it does. The '[' is the boundary on both sides:
+# 'test_step' must not claim 'test_stepbar[...]', and 'test_step[0]' must not claim its siblings.
+make_param_fixture() {
+    local repo="$1"
+    init_repo "$repo"
+    mkdir -p "$repo/tests"
+    : > "$repo/conftest.py"
+    cat > "$repo/mod.py" <<'EOF'
+def walk():
+    steps = [244, 331, 721]
+    return steps
+
+
+def render(name):
+    return "hello " + name
+EOF
+    cat > "$repo/tests/test_mod.py" <<'EOF'
+import pytest
+
+from mod import render, walk
+
+
+@pytest.mark.parametrize("i", [0, 1, 2])
+def test_step(i):
+    assert walk()[i] == [244, 331, 721][i]
+
+
+@pytest.mark.parametrize("name", ["bo", "al"])
+def test_stepbar(name):
+    assert render(name) == "hello " + name
+EOF
+    commit_all "$repo" "param fixture"
+}
+
+test23() {
+    echo "test 23: a bare hint for a parametrized test is matched against its parametrizations"
+    need_pytest || return 0
+    local d="$WORK/t23" repo="$WORK/t23/repo" h="tests/test_mod.py::test_step"
+    mkdir -p "$d"
+    make_param_fixture "$repo"
+    cat > "$d/mutations.toml" <<EOF
+[[mutation]]
+name = "every-case-fails"
+tests = ["$h"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [0, 0, 0]'''
+
+[[mutation]]
+name = "one-case-fails"
+tests = ["$h", "$h[2]"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [244, 331, 0]'''
+
+[[mutation]]
+name = "assertion-and-error"
+tests = ["$h"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [0, 331]'''
+
+[[mutation]]
+name = "sibling-param"
+tests = ["$h[0]"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [244, 331, 1]'''
+
+[[mutation]]
+name = "only-the-prefix-fails"
+tests = ["$h"]
+file = "mod.py"
+old = '''    return "hello " + name'''
+new = '''    return "hello"'''
+EOF
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/mutations.toml"
+    assert_status "every mutation was killed by an assertion (exit 0)" 0
+    assert_missing "a bare hint that failed by assertion in every case is met" \
+        "every-case-fails: expected"
+    assert_missing "a bare hint is met when any case fails by assertion, the others passing" \
+        "one-case-fails: expected"
+    assert_missing "a bare hint is met by an assertion case even when another case errored" \
+        "assertion-and-error: expected"
+    assert_contains "a single-parameter hint matches only itself, not a failing sibling" \
+        "sibling-param: expected '$h[0]' to fail; it passed."
+    assert_contains "'test_step' does not claim 'test_stepbar[...]'; its own cases passed" \
+        "only-the-prefix-fails: expected '$h' to fail; it passed."
+    assert_contains "the count holds exactly the two hints that really did not fail" \
+        "2 expectation(s) not met"
+
+    # No parametrization failed by assertion, some errored: unmet, naming the errored cases.
+    cat > "$d/erroring.toml" <<EOF
+[[mutation]]
+name = "cases-error-only"
+tests = ["$h"]
+file = "mod.py"
+old = '''    steps = [244, 331, 721]'''
+new = '''    steps = [244, 331]'''
+EOF
+    mutate "$repo" --cmd "python3 -m pytest -q" "$d/erroring.toml"
+    assert_contains "a bare hint whose cases only errored is unmet, naming those cases" \
+        "cases-error-only: expected '$h' to fail; it failed only by error, which proves nothing about the behaviour -- errored in [2], and no parametrization failed by assertion."
+    assert_status "an error-only kill is still a finding (exit 2), unchanged by the expectation" 2
+}
+
+
 # --- test 21: a size-preserving mutation is measured against ITS OWN code ------------------
 #
 # CPython validates a cached .pyc against the source's (mtime, size). 'A = 1' -> 'A = 2'
@@ -1742,6 +1854,7 @@ test19
 test20
 test21
 test22
+test23
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1766,6 +1879,7 @@ echo "18. a caller's 'tests' hint steers the tier, never a verdict ...... test18
 echo "19. an expectation that did not come true is reported .......... test19"
 echo "22. a single-edit mutation may drop [[mutation.edit]] ....... test22"
 echo "21. a size-preserving mutation is measured, not a stale .pyc ... test21"
+echo "23. a bare hint for a parametrized test owns its cases ... test23"
 echo "20. a green baseline that ran nothing refuses; stale reports uncounted  test20"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
