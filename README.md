@@ -33,19 +33,31 @@ state anyone reported on, and nothing used to remove them. Every 30 days a run p
 on stderr -- stderr, not stdout, because it is housekeeping and not part of the report -- and keeps only
 the 10 most recently *written* entries. A hit does not touch its entry, so an entry that is old but still
 being replayed can be swept; the cost of that is one gate run to rebuild it. Only names that are 64 hex
-characters are eligible, which is exactly the set of entries: `pending`, the `last-cleanup` stamp, and an
-in-flight `.new.XXXXXX` cannot match and are left alone. A cache directory with no stamp starts the clock
-rather than sweeping immediately.
+characters are eligible, which is exactly the set of entries: the `last-cleanup` stamp, an in-flight
+`.new.XXXXXX`, and an older version's leftover `pending` cannot match and are left alone. A cache directory
+with no stamp starts the clock rather than sweeping immediately.
 
 **Dependency file:** a file named `.git-report-deps` at a repo's root, one relative repo path per line,
 blank lines and lines starting with `#` ignored. No file means no dependencies.
+
+**Worktrees share one cache.** Entries live in the repo's common git dir (`.git/info/git-report` of the
+main checkout), found through `git rev-parse --git-path`, so every linked worktree reads and writes the
+same directory. That is sound because the key (below) is path-free -- it hashes `HEAD`s and contents,
+never a location -- and it is the point: an attestation recorded by a commit in `repo@task` is exactly the
+entry `repo` looks up after `git merge --ff-only task`, so the merge does not re-run a gate that already
+passed on the same tree. `.git-report-deps` paths are relative to the *worktree's* root, so a sibling
+worktree `repo@task` resolves `../dep` to the same `dep` checkout the main one does; a worktree placed
+where a dependency path does not exist fails loudly. Needs git 2.31 or newer (`--path-format`).
 
 **The key:** for each repo in `[dependencies..., self]`, hash `git diff HEAD`, `git status --porcelain`, and
 the *contents* of its untracked files (`git ls-files --others --exclude-standard`, so an ignored file is
 still ignored) alongside its `HEAD`. A dirty repo is therefore keyed by its actual content, not by a boolean
 flag: two different uncommitted states never collide, and a clean repo always collapses to the same
 canonical hash. All of that, plus a hash of `git-report` itself, is hashed together into the final key. Both
-modes compute this identically.
+modes compute this identically -- including from inside a hook, where git exports `GIT_DIR` and
+`GIT_INDEX_FILE` (absolute, in a linked worktree) and those would override `git -C <dependency>`: the key's
+git commands run with the repository variables cleared, so a worktree's `--record` keys each dependency on
+the dependency's own `HEAD`, not on the committing repo's.
 
 The untracked contents are load-bearing rather than thorough. `git diff HEAD` covers tracked changes only
 and `status --porcelain` prints an untracked file's *name* but never a byte of it, so editing an untracked
@@ -56,7 +68,10 @@ untracked files included, is refused before the key is computed.
 **`--record`** writes an attestation (`gate passed at <hash>, recorded at commit time`) instead of running
 the gate -- meant to be called right after a commit succeeds, when the commit succeeding is already proof
 the gate passed. It refuses on a dirty own tree, same as the default mode: `pre-commit` validates only the
-staged state, so unstaged changes surviving the commit mean the tree isn't what was validated.
+staged state, so unstaged changes surviving the commit mean the tree isn't what was validated. If the entry
+cannot be written, it exits 1 naming the path -- an attestation reported as recorded that was never written
+would show as `Passed` under `pre-commit`, which hides a passing hook's stderr. A gate run that passed but
+could not be cached keeps the gate's exit status and says so on stderr.
 
 ## `--capture`: making a recorded entry carry the gate's numbers
 
@@ -77,11 +92,13 @@ existing entry, and change nothing else about the hook:
 ```
 
 `--capture` runs the command, passes its stdout through untouched, exits with the command's own status, and
-leaves a copy at `.git/info/git-report/pending`. `--record` folds that copy into the entry it writes, under
-the attestation line, so every cache hit afterwards carries the suite's numbers. Nothing else in the hook
-changes, and the same one line is the whole change in every repo. Also add `verbose: true` to that hook if
-it isn't there already, for the *un*cached path: `pre-commit` discards a passing hook's stdout, so without
-it a fresh `git report` prints `Passed` and throws the same number away.
+leaves a copy at `git-report-pending` in this checkout's own git dir (`.git/git-report-pending` in a main
+checkout). That copy is per worktree rather than in the shared cache, so two worktrees committing at once
+cannot fold each other's numbers into their attestations. `--record` folds that copy into the entry it
+writes, under the attestation line, so every cache hit afterwards carries the suite's numbers. Nothing else
+in the hook changes, and the same one line is the whole change in every repo. Also add `verbose: true` to
+that hook if it isn't there already, for the *un*cached path: `pre-commit` discards a passing hook's stdout,
+so without it a fresh `git report` prints `Passed` and throws the same number away.
 
 **A capture is stamped with the tree it ran against** (`git write-tree` at pre-commit time is exactly the
 tree the new commit will carry, since `pre-commit` stashes everything unstaged), and `--record` uses it only

@@ -371,7 +371,7 @@ test11() {
     init_repo "$repo"
     echo x > "$repo/f.txt"
     commit_all "$repo" init
-    pending="$repo/.git/info/git-report/pending"
+    pending="$repo/.git/git-report-pending"
 
     out=$(run_report "$repo" --capture -- bash -c 'echo "3196 passed"; echo noise >&2; exit 7' 2>/dev/null)
     status=$?
@@ -418,7 +418,7 @@ test12() {
             ok "the attestation and its HEAD survive alongside the output" ;;
         *) fail "the attestation and its HEAD survive alongside the output (got: $out)" ;;
     esac
-    if [ -f "$repo/.git/info/git-report/pending" ]; then
+    if [ -f "$repo/.git/git-report-pending" ]; then
         fail "--record consumes the copy it read"
     else
         ok "--record consumes the copy it read"
@@ -483,7 +483,7 @@ test14() {
     out=$(run_report "$repo" --capture -- bash -c 'echo mutated-run; exit 3'); status=$?
     assert_eq "the command still runs and keeps its status" "3" "$status"
     assert_eq "its output still passes through" "mutated-run" "$out"
-    if [ -f "$repo/.git/info/git-report/pending" ]; then
+    if [ -f "$repo/.git/git-report-pending" ]; then
         fail "a mutated run's output is not left for --record"
     else
         ok "a mutated run's output is not left for --record"
@@ -640,7 +640,9 @@ test17() {
         "$(cat "$cache/$(printf '%064d' 25 | tr '0-9' 'abcdef0123')" 2>/dev/null)"
 
     # A key is 64 hex characters; nothing else in the directory is, and none of it is a report.
-    assert_eq "the sweep leaves 'pending' alone" "tree=deadbeef" "$(cat "$cache/pending" 2>/dev/null)"
+    # 'pending' is no longer written here (it is per checkout now), but an older version's
+    # leftover is exactly such a name.
+    assert_eq "the sweep leaves a leftover non-key name alone" "tree=deadbeef" "$(cat "$cache/pending" 2>/dev/null)"
     assert_eq "the sweep leaves a concurrent write's temp file alone" "half-written" \
         "$(cat "$cache/.new.ABCDEF" 2>/dev/null)"
 
@@ -652,6 +654,189 @@ test17() {
     # The stamp is reset by the sweep, so the next run is inside the interval again.
     out=$(run_report "$repo" 2>&1 >/dev/null)
     assert_eq "the sweep does not repeat on the next run" "" "$out"
+}
+
+# Plain git hooks rather than pre-commit's, so that what the script sees is exactly what git
+# exports to a hook -- in a linked worktree that is an absolute GIT_DIR and GIT_INDEX_FILE.
+# The hooks directory is shared by every worktree, so installing in the main checkout wires
+# them all. post-commit's exit status is ignored by git, so --record's status and stderr are
+# logged where a test can read them: "Passed" with nothing written is the shape being pinned.
+install_raw_hooks() {
+    local repo="$1" captured="$2" log="$3"
+    cat > "$repo/.git/hooks/pre-commit" <<EOF
+#!/bin/bash
+exec "$SCRIPT" --capture -- echo "$captured"
+EOF
+    cat > "$repo/.git/hooks/post-commit" <<EOF
+#!/bin/bash
+"$SCRIPT" --record 2>> "$log"
+echo "record-exit=\$?" >> "$log"
+EOF
+    chmod +x "$repo/.git/hooks/pre-commit" "$repo/.git/hooks/post-commit"
+}
+
+# --- test 18: a commit in a linked worktree attests, and both checkouts replay it --
+
+test18() {
+    echo "test 18: a worktree commit's attestation replays in the worktree and, after a fast-forward, in main"
+    local d="$WORK/t18" main wt counter marker log head out
+    main="$d/main"; wt="$d/main@wt"; counter="$d/counter"; marker="$d/marker"; log="$d/record.log"
+    init_repo "$main"
+    make_fake_gate_config "$main" "$counter" "$marker"
+    echo x > "$main/f.txt"
+    commit_all "$main" init
+    install_raw_hooks "$main" "42 passed in the worktree" "$log"
+    git -C "$main" worktree add -q "$wt" -b wt
+
+    echo y >> "$wt/f.txt"
+    commit_all "$wt" "worktree commit" > /dev/null 2>&1
+    head=$(git -C "$wt" rev-parse HEAD)
+    assert_eq "--record exited 0 in the worktree" "record-exit=0" "$(tail -n 1 "$log")"
+    assert_eq "--record said nothing on stderr" "" "$(grep -v '^record-exit=' "$log")"
+    if [ -d "$main/.git/info/git-report" ]; then
+        ok "the entry went to the main checkout's cache directory, shared by every worktree"
+    else
+        fail "the entry went to the main checkout's cache directory, shared by every worktree"
+    fi
+
+    out=$(run_report "$wt" 2>&1)
+    assert_eq "the worktree's report re-ran no gate" "0" "$(counter_value "$counter")"
+    case "$(printf '%s\n' "$out" | head -n 1)" in
+        *"this report is cached"*"$head"*) ok "the worktree replays its own commit's attestation" ;;
+        *) fail "the worktree replays its own commit's attestation (got: $out)" ;;
+    esac
+    case "$out" in
+        *"42 passed in the worktree"*) ok "and it carries the output captured in the worktree" ;;
+        *) fail "and it carries the output captured in the worktree (got: $out)" ;;
+    esac
+
+    git -C "$main" merge -q --ff-only wt
+    out=$(run_report "$main" 2>&1)
+    assert_eq "main's report after the fast-forward re-ran no gate" "0" "$(counter_value "$counter")"
+    case "$(printf '%s\n' "$out" | head -n 1)" in
+        *"this report is cached"*"$head"*) ok "main replays the attestation the worktree recorded" ;;
+        *) fail "main replays the attestation the worktree recorded (got: $out)" ;;
+    esac
+    case "$out" in
+        *"42 passed in the worktree"*) ok "with the worktree's captured output" ;;
+        *) fail "with the worktree's captured output (got: $out)" ;;
+    esac
+}
+
+# --- test 19: the same, with a dependency, keyed on the dependency, not on self -----
+
+test19() {
+    echo "test 19: with a .git-report-deps, a worktree commit's attestation keys the dependency's HEAD"
+    local d="$WORK/t19" dep main wt counter marker log head out
+    dep="$d/dep"; main="$d/main"; wt="$d/main@wt"
+    counter="$d/counter"; marker="$d/marker"; log="$d/record.log"
+    init_repo "$dep"
+    echo x > "$dep/d.txt"
+    commit_all "$dep" "dep init"
+
+    init_repo "$main"
+    make_fake_gate_config "$main" "$counter" "$marker"
+    # Relative to the worktree root, so the sibling worktree resolves it to the same dep.
+    printf '../dep\n' > "$main/.git-report-deps"
+    echo x > "$main/f.txt"
+    commit_all "$main" init
+    install_raw_hooks "$main" "7 passed against dep" "$log"
+    git -C "$main" worktree add -q "$wt" -b wt
+
+    echo y >> "$wt/f.txt"
+    commit_all "$wt" "worktree commit" > /dev/null 2>&1
+    head=$(git -C "$wt" rev-parse HEAD)
+    assert_eq "--record exited 0 in the worktree" "record-exit=0" "$(tail -n 1 "$log")"
+
+    # A hook in a worktree inherits an absolute GIT_DIR, which overrides 'git -C <dep>': the
+    # dependency slot was keyed on this repo's own HEAD, and no later lookup computes that.
+    out=$(run_report "$wt" 2>&1)
+    assert_eq "the worktree's report re-ran no gate" "0" "$(counter_value "$counter")"
+    case "$(printf '%s\n' "$out" | head -n 1)" in
+        *"this report is cached"*"$head"*) ok "the worktree replays its own commit's attestation" ;;
+        *) fail "the worktree replays its own commit's attestation (got: $out)" ;;
+    esac
+
+    git -C "$main" merge -q --ff-only wt
+    out=$(run_report "$main" 2>&1)
+    assert_eq "main's report after the fast-forward re-ran no gate" "0" "$(counter_value "$counter")"
+    case "$out" in
+        *"7 passed against dep"*) ok "main replays it, captured output included" ;;
+        *) fail "main replays it, captured output included (got: $out)" ;;
+    esac
+
+    # And the dependency is still in the key: moving it busts the entry.
+    echo y >> "$dep/d.txt"
+    commit_all "$dep" "dep second"
+    run_report "$main" > /dev/null 2>&1
+    assert_eq "a dependency commit still busts the key" "1" "$(counter_value "$counter")"
+}
+
+# --- test 20: two worktrees' captures do not share a file --------------------------
+
+test20() {
+    echo "test 20: --capture in one worktree does not overwrite or join another's"
+    local d="$WORK/t20" main a b out
+    main="$d/main"; a="$d/main@a"; b="$d/main@b"
+    init_repo "$main"
+    echo x > "$main/f.txt"
+    commit_all "$main" init
+    # Same commit, so the same tree stamp: a shared file could not tell the two apart.
+    git -C "$main" worktree add -q "$a" -b a
+    git -C "$main" worktree add -q "$b" -b b
+
+    run_report "$a" --capture -- echo "output of A" > /dev/null
+    run_report "$b" --capture -- echo "output of B" > /dev/null
+    run_report "$a" --record 2> /dev/null
+
+    out=$(run_report "$a")
+    case "$out" in
+        *"output of A"*) ok "A's attestation carries A's capture" ;;
+        *) fail "A's attestation carries A's capture (got: $out)" ;;
+    esac
+    case "$out" in
+        *"output of B"*) fail "and nothing of B's" ;;
+        *) ok "and nothing of B's" ;;
+    esac
+    assert_eq "B's capture is still waiting for B's --record" "output of B" \
+        "$(tail -n +2 "$(git -C "$b" rev-parse --absolute-git-dir)/git-report-pending" 2>/dev/null)"
+}
+
+# --- test 21: an entry that cannot be written is said so, never passed off ---------
+
+test21() {
+    echo "test 21: an unwritable cache makes --record fail loudly, and a passing gate say it was not cached"
+    local d="$WORK/t21" repo counter marker cache err status
+    repo="$d/self"; counter="$d/counter"; marker="$d/marker"
+    init_repo "$repo"
+    make_fake_gate_config "$repo" "$counter" "$marker"
+    echo x > "$repo/f.txt"
+    commit_all "$repo" init
+    cache="$repo/.git/info/git-report"
+    if [ "$(id -u)" -eq 0 ]; then
+        ok "test 21 skipped: root can write through a read-only directory"
+        return
+    fi
+    mkdir -p "$cache"
+    chmod a-w "$cache"
+
+    err=$(run_report "$repo" --record 2>&1 >/dev/null); status=$?
+    if [ "$status" -ne 0 ]; then ok "--record exits non-zero"; else fail "--record exits non-zero (exit was 0)"; fi
+    case "$err" in
+        *"$cache/"[0-9a-f]*"nothing was recorded"*) ok "and names the entry it could not write" ;;
+        *) fail "and names the entry it could not write (got: $err)" ;;
+    esac
+
+    err=$(run_report "$repo" 2>&1 >/dev/null); status=$?
+    assert_eq "a passing gate keeps its own exit status" "0" "$status"
+    case "$err" in
+        *"could not be cached at '$cache/"*) ok "and says its report could not be cached" ;;
+        *) fail "and says its report could not be cached (got: $err)" ;;
+    esac
+
+    chmod u+w "$cache"
+    assert_eq "nothing was written" "0" \
+        "$(find "$cache" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9a-f]{64}' | wc -l)"
 }
 
 test1
@@ -671,6 +856,10 @@ test14
 test15
 test16
 test17
+test18
+test19
+test20
+test21
 
 echo
 echo "== behaviour -> test mapping =="
@@ -691,6 +880,10 @@ echo "14. no capture while a mutation sweep is in flight ........... test14"
 echo "15. the real wiring, end to end through pre-commit ........... test15"
 echo "16. untracked dependency content is keyed, not just its name . test16"
 echo "17. the cache is pruned every 30 days, 10 most recent kept ... test17"
+echo "18. a worktree commit replays in the worktree and in main .... test18"
+echo "19. ... and keys a dependency on the dependency, not on self .. test19"
+echo "20. two worktrees' captures do not share a file .............. test20"
+echo "21. an entry that cannot be written is said so ............... test21"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed"
 [ "$TESTS_FAILED" -eq 0 ]

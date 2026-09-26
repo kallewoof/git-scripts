@@ -62,14 +62,23 @@ self_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
     exit 1
 }
 
-cache_dir="$self_root/.git/info/git-report"
+# In a linked worktree '$self_root/.git' is a file ('gitdir: ...'), not a directory, so every
+# path here comes from git. This checkout's own git dir holds what belongs to one checkout; the
+# cache lives in the common dir, shared by every worktree of the repo. That is sound because an
+# entry is content-addressed and path-free (see compute_key), and it is the point: an attestation
+# recorded in a worktree is exactly the entry the main checkout looks up after fast-forwarding
+# onto that commit. In a main checkout both resolve to '$self_root/.git'.
+git_dir=$(git -C "$self_root" rev-parse --absolute-git-dir 2>/dev/null)
+cache_dir=$(git -C "$self_root" rev-parse --path-format=absolute --git-path info/git-report 2>/dev/null)
 
-# Where --capture leaves a run for --record to pick up. A key is 64 hex characters, so the
-# literal name cannot collide with one.
-pending="$cache_dir/pending"
+# Where --capture leaves a run for --record to pick up. Per checkout, not in the shared cache:
+# two worktrees committing at once would share one file, the later '>' truncating the earlier,
+# both teeing into it, and --record folding the other worktree's numbers into this commit. The
+# tree stamp cannot tell them apart when both are at the same tree.
+pending="$git_dir/git-report-pending"
 
-# Where the retention sweep records when it last ran. Like 'pending', a name that no key can
-# collide with.
+# Where the retention sweep records when it last ran. A key is 64 hex characters, so the literal
+# name cannot collide with one.
 cleanup_stamp="$cache_dir/last-cleanup"
 CLEANUP_INTERVAL=$((30 * 24 * 60 * 60))
 CLEANUP_KEEP=10
@@ -78,7 +87,7 @@ CLEANUP_KEEP=10
 # care: the dirty-tree refusal below says so instead of implying the repo is broken, and
 # --capture writes nothing while it exists, because a mutated run's output is not a report of
 # this tree.
-sweep_lock="$(git -C "$self_root" rev-parse --absolute-git-dir)/git-mutate.lock"
+sweep_lock="$git_dir/git-mutate.lock"
 
 # --capture is a wrapper around the gate's own test command, and its first duty is to be
 # invisible: it must never refuse, never fail a commit, and never alter what the command
@@ -105,9 +114,8 @@ sweep_lock="$(git -C "$self_root" rev-parse --absolute-git-dir)/git-mutate.lock"
 # it for a docs-only commit -- would inherit an earlier commit's numbers as if they were its
 # own.
 if [ "$mode" = "capture" ]; then
-    if [ -d "$sweep_lock" ] ||
+    if [ -z "$git_dir" ] || [ -d "$sweep_lock" ] ||
        ! tree=$(git -C "$self_root" write-tree 2>/dev/null) ||
-       ! mkdir -p "$cache_dir" 2>/dev/null ||
        ! printf 'tree=%s\n' "$tree" > "$pending" 2>/dev/null; then
         exec "$@"
     fi
@@ -115,16 +123,24 @@ if [ "$mode" = "capture" ]; then
     exit "${PIPESTATUS[0]}"
 fi
 
+# Past --capture, a path git could not give is a hard error: guessing one is how the cache used
+# to go missing in a worktree without a word. An absolute path is also the check that this git
+# understood --path-format (2.31+); an older one echoes the option back.
+if [[ "$git_dir" != /* || "$cache_dir" != /* ]]; then
+    echo "git-report: could not locate the git directory of '$self_root' (git 2.31 or newer is required)." >&2
+    exit 1
+fi
+
 # Nothing ever removed an entry, so a long-lived repo accumulated one file per distinct key
 # forever -- and the key is content-addressed, so every intermediate dirty state anyone
 # reported on left an entry of its own behind. Every $CLEANUP_INTERVAL, keep the
 # $CLEANUP_KEEP most recently written entries and drop the rest.
 #
-# Only 64-hex names are eligible, which is exactly the set of entries: 'pending', the stamp,
-# and a concurrent write's in-flight '.new.XXXXXX' are all named so they cannot match, and
-# all three must survive. Most recent means most recently *written*: a hit does not touch its
-# entry, so an old entry that is still being replayed can be pruned. That costs one gate run
-# to rebuild it, which is what the cache is for.
+# Only 64-hex names are eligible, which is exactly the set of entries: the stamp, a concurrent
+# write's in-flight '.new.XXXXXX', and an older version's leftover 'pending' are all named so
+# they cannot match, and must survive. Most recent means most recently *written*: a hit does
+# not touch its entry, so an old entry that is still being replayed can be pruned. That costs
+# one gate run to rebuild it, which is what the cache is for.
 #
 # A missing stamp starts the clock rather than sweeping: a cache directory with no stamp is
 # either brand new, with nothing to clean, or predates this code, and in neither case is
@@ -148,8 +164,8 @@ prune_cache() {
             cut -d' ' -f2- |
             xargs -r rm -f --
     fi
-    printf 'epoch=%s at=%s\n' "$now" "$(date -Is 2>/dev/null || date)" \
-        > "$cleanup_stamp" 2>/dev/null
+    { printf 'epoch=%s at=%s\n' "$now" "$(date -Is 2>/dev/null || date)" \
+        > "$cleanup_stamp"; } 2>/dev/null
     return 0
 }
 
@@ -180,6 +196,18 @@ list_repos() {
     printf '%s\n' "$root"
 }
 
+# A hook inherits git's repository variables, and in a linked worktree git exports GIT_DIR and
+# GIT_INDEX_FILE as absolute paths, which override '-C'. So from a worktree's hooks,
+# 'git -C <dependency> rev-parse HEAD' read the committing repo: --record keyed the dependency
+# slot on this repo's own HEAD, and no later lookup ever computed that key. A main checkout got it
+# right by accident -- there git exports only a relative GIT_INDEX_FILE, which '-C' re-roots.
+# Every git call in the key goes through this, this repo's own included: a later lookup runs
+# with none of these set, so the key must be computed as if none were.
+repo_git() {
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY \
+        git -C "$@"
+}
+
 # key = sha256( HEAD_1 diffhash_1 ... HEAD_n diffhash_n  sha256(this script) )
 # where diffhash_i = sha256( git diff HEAD ; git status --porcelain ; untracked contents )
 # for repo i. A dirty dependency is hashed by its actual content, not a boolean, so two
@@ -206,20 +234,20 @@ compute_key() {
 
     acc=""
     while IFS= read -r repo; do
-        head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || {
+        head=$(repo_git "$repo" rev-parse HEAD 2>/dev/null) || {
             echo "git-report: '$repo' has no commits (or is not a git repo)" >&2
             rm -f "$repos_file"
             return 1
         }
         diffhash=$( {
-            git -C "$repo" diff HEAD
-            git -C "$repo" status --porcelain
+            repo_git "$repo" diff HEAD
+            repo_git "$repo" status --porcelain
             # NUL-delimited so an exotic filename cannot split a field. Sorted as well, which
             # no test can pin -- git already emits these in order -- so that a change in its
             # traversal order could not silently move the hash. A file that vanishes between
             # the listing and the hashing is skipped rather than fatal: the worst that can do
             # is miss the cache.
-            git -C "$repo" ls-files --others --exclude-standard -z |
+            repo_git "$repo" ls-files --others --exclude-standard -z |
                 sort -z |
                 (cd "$repo" && xargs -0 -r sha256sum -- 2>/dev/null)
         } | sha256sum | cut -d' ' -f1)
@@ -305,9 +333,16 @@ if [ "$mode" = "record" ]; then
             printf "    rm '%s' && git report\n" "$entry"
         fi
     } | write_entry
+    written=$?
     # Consumed either way: a capture that did not match this tree will not match a later one
     # either, and leaving it would offer the next commit an older commit's numbers.
     rm -f "$pending"
+    # Loud, because the caller cannot tell otherwise: pre-commit hides a passing hook's stderr,
+    # so an --record that wrote nothing and exited 0 showed as 'Passed'.
+    if [ "$written" -ne 0 ]; then
+        echo "git-report: could not write the attestation to '$entry'; nothing was recorded." >&2
+        exit 1
+    fi
     exit 0
 fi
 
@@ -337,8 +372,10 @@ status=$?
 
 cat "$tmp"
 
-if [ "$status" -eq 0 ]; then
-    write_entry < "$tmp"
+# The gate's status stands either way; a report that could not be cached only says so, so that
+# the next run's re-run of the whole gate is not a mystery.
+if [ "$status" -eq 0 ] && ! write_entry < "$tmp"; then
+    echo "git-report: the gate passed, but its report could not be cached at '$entry'." >&2
 fi
 
 exit "$status"
