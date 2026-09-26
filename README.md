@@ -5,7 +5,8 @@ Some useful `git-`scripts.
 
 ```
 git report            # cache hit -> print it; miss -> run the gate (pre-commit), cache on success, print
-git report --record   # attest only: write the entry for the current key, run nothing
+git report --record   # attest only: write the entry for the current key, run nothing --
+                      # and only when --capture left a passing run for this commit's tree
 git report --capture [--] <cmd> [args...]
                       # run <cmd> transparently, leaving its output for --record to fold in
 ```
@@ -66,8 +67,13 @@ one read per untracked file in a dependency, and nothing for the repo being repo
 untracked files included, is refused before the key is computed.
 
 **`--record`** writes an attestation (`gate passed at <hash>, recorded at commit time`) instead of running
-the gate -- meant to be called right after a commit succeeds, when the commit succeeding is already proof
-the gate passed. It refuses on a dirty own tree, same as the default mode: `pre-commit` validates only the
+the gate -- meant to be called right after a commit succeeds. A commit succeeding is *not* by itself proof
+the gate passed: git runs `post-commit` for every commit a rebase, cherry-pick or `am` writes, and for
+`commit --no-verify`, none of which run `pre-commit`. Recording there once replayed a freshly rebased,
+never-tested `HEAD` as `gate passed` on its first line. So `--record` writes an entry only when a capture
+of a passing run is stamped with this commit's tree (next section); otherwise it records nothing, says so on
+stderr, and the next `git report` is a miss that runs the gate. It refuses on a dirty own tree, same as the
+default mode: `pre-commit` validates only the
 staged state, so unstaged changes surviving the commit mean the tree isn't what was validated. If the entry
 cannot be written, it exits 1 naming the path -- an attestation reported as recorded that was never written
 would show as `Passed` under `pre-commit`, which hides a passing hook's stderr. A gate run that passed but
@@ -91,8 +97,8 @@ existing entry, and change nothing else about the hook:
         entry: git report --capture -- pytest -m "not slow" --cov=src/terea --cov-fail-under=63
 ```
 
-`--capture` runs the command, passes its stdout through untouched, exits with the command's own status, and
-leaves a copy at `git-report-pending` in this checkout's own git dir (`.git/git-report-pending` in a main
+`--capture` runs the command, passes its stdout through untouched, exits with the command's own status, and,
+if the command passed, leaves a copy at `git-report-pending` in this checkout's own git dir (`.git/git-report-pending` in a main
 checkout). That copy is per worktree rather than in the shared cache, so two worktrees committing at once
 cannot fold each other's numbers into their attestations. `--record` folds that copy into the entry it
 writes, under the attestation line, so every cache hit afterwards carries the suite's numbers. Nothing else
@@ -105,21 +111,23 @@ tree the new commit will carry, since `pre-commit` stashes everything unstaged),
 if the stamp matches the commit it is attesting. This is load-bearing rather than belt-and-braces: a hook
 with `types_or: [python]` is *skipped* on a docs-only commit, so without the stamp such a commit would
 inherit an earlier commit's numbers as if they were its own. The copy is deleted once read, matched or not.
+A failed run leaves no copy at all -- otherwise an attempt whose tests failed would leave one stamped with
+exactly the tree a following `git commit --no-verify` of the same staged state carries -- and neither does
+`git report`'s own gate run, which is not a commit's gate.
 
-**When no capture matches, the entry says so** and names the one-line remedy, rather than leaving the
-reader to wonder whether the gate had nothing to say:
+**When no capture matches, nothing is recorded**, and `--record` says so on stderr (hidden by `pre-commit`
+for a passing hook, visible in a raw git hook):
 
 ```
-gate passed at c9ce6a68..., recorded at commit time
-
-this entry carries no gate output: no run was captured for this commit tree.
-Either this repo's test hook is not wired for capture (see README.md), or it
-was skipped because the commit touched no files it selects. For a report with
-numbers now:
-    rm '/path/to/.git/info/git-report/<key>' && git report
+git-report: no passing gate run was captured for the tree of c9ce6a68... (a rebase, cherry-pick, --no-verify commit, or a test hook not wired for capture); nothing recorded, so the next 'git report' runs the gate.
 ```
 
-That is also what an unwired repo gets: the honest sentence, never a number belonging to something else.
+`--record` cannot tell a rebase from a repo whose test hook is not wired for capture, or from a commit whose
+test hook was skipped (a `types_or` hook on a docs-only commit), and none of them is a pass. **So an unwired
+repo gets no post-commit caching**: the first `git report` after each commit runs the gate, and caches its
+result as any miss does. Wiring the test hook with `--capture` and `always_run: true` gives every gated
+commit an attestation; without `always_run`, a commit that skips the test hook is simply gated again by the
+next report.
 
 **`--capture` never refuses and never fails a commit.** Every step of setting the capture up may fail into
 a plain `exec "$@"`, which leaves nothing at all between the caller and the command. Two details are

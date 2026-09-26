@@ -9,7 +9,9 @@
 #                         (pre-commit), cache the result on success, and print it.
 #   git report --record   Write a cache entry attesting that the gate passed, without
 #                         running anything. Meant to be called from a pre-commit
-#                         post-commit stage, right after a commit succeeds.
+#                         post-commit stage, right after a commit succeeds. Records
+#                         nothing unless --capture left a passing run for this commit's
+#                         tree: post-commit also fires where the gate never ran.
 #   git report --capture [--] <cmd> [args...]
 #                         Run <cmd>, pass its output through untouched, exit with its status,
 #                         and leave a copy where --record can find it. Meant to prefix the
@@ -40,6 +42,7 @@ Usage:
   git report            Print a cached report; run the gate on a cache miss. A hit says it
                         is a hit, on the line above the content.
   git report --record   Attest that the gate passed for the current key; runs nothing.
+                        Records nothing without a passing --capture for this tree.
   git report --capture [--] <cmd> [args...]
                         Run <cmd> transparently and leave its output for --record.
 EOF
@@ -113,6 +116,10 @@ sweep_lock="$git_dir/git-mutate.lock"
 # attesting. Without it, a commit that skipped the pytest hook -- 'types_or: [python]' skips
 # it for a docs-only commit -- would inherit an earlier commit's numbers as if they were its
 # own.
+#
+# A run that failed leaves nothing. --record reads a capture as proof the gate passed for its
+# tree, and a failed attempt's copy would otherwise wait there, stamped with exactly the tree a
+# following 'git commit --no-verify' of the same staged state carries.
 if [ "$mode" = "capture" ]; then
     if [ -z "$git_dir" ] || [ -d "$sweep_lock" ] ||
        ! tree=$(git -C "$self_root" write-tree 2>/dev/null) ||
@@ -120,7 +127,9 @@ if [ "$mode" = "capture" ]; then
         exec "$@"
     fi
     "$@" | tee -a -- "$pending"
-    exit "${PIPESTATUS[0]}"
+    status=${PIPESTATUS[0]}
+    [ "$status" -eq 0 ] || rm -f -- "$pending" 2>/dev/null
+    exit "$status"
 fi
 
 # Past --capture, a path git could not give is a hard error: guessing one is how the cache used
@@ -313,29 +322,33 @@ write_entry() {
 # often -- clean tree at the recorded HEAD, straight into a cache hit -- so an entry with no
 # content in it hands them a colour where a number was needed.
 #
-# So it folds in whatever --capture left for this commit's tree, and keeps the attestation
-# line itself, which is the thing that stops a post-commit report from re-running the gate.
-# When no capture matches, it says that plainly rather than leaving the reader to wonder
-# whether the gate simply has nothing to say.
+# So it folds in what --capture left for this commit's tree, and keeps the attestation line
+# itself, which is the thing that stops a post-commit report from re-running the gate.
+#
+# And it records only then. post-commit also fires where pre-commit never ran -- every commit a
+# rebase, cherry-pick or 'am' writes, and 'commit --no-verify' -- and there the "gate passed"
+# line attested a tree no run had ever seen: a rebased HEAD replayed as passed on its first
+# line. A capture stamped with this tree is the one proof the gate ran for it, so without one
+# nothing is written and the next report misses and runs the gate. That includes a repo whose
+# test hook is not wired for capture, or was skipped for this commit: it cannot tell those
+# apart from a rebase, and a skip is not a pass either.
 if [ "$mode" = "record" ]; then
     self_head=$(git -C "$self_root" rev-parse HEAD)
+    if [ "$(sed -n '1s/^tree=//p' "$pending" 2>/dev/null)" != "$(git -C "$self_root" rev-parse "HEAD^{tree}")" ]; then
+        # A stale capture will not match a later commit either, and leaving it would offer
+        # one an older commit's numbers.
+        rm -f "$pending"
+        echo "git-report: no passing gate run was captured for the tree of $self_head (a rebase, cherry-pick, --no-verify commit, or a test hook not wired for capture); nothing recorded, so the next 'git report' runs the gate." >&2
+        exit 0
+    fi
     {
         printf 'gate passed at %s, recorded at commit time\n' "$self_head"
         echo
-        if [ "$(sed -n '1s/^tree=//p' "$pending" 2>/dev/null)" = "$(git -C "$self_root" rev-parse "HEAD^{tree}")" ]; then
-            printf -- "--- the gate's own output for this tree, captured at pre-commit time ---\n"
-            tail -n +2 "$pending"
-        else
-            printf 'this entry carries no gate output: no run was captured for this commit tree.\n'
-            printf "Either this repo's test hook is not wired for capture (see README.md), or it\n"
-            printf 'was skipped because the commit touched no files it selects. For a report with\n'
-            printf 'numbers now:\n'
-            printf "    rm '%s' && git report\n" "$entry"
-        fi
+        printf -- "--- the gate's own output for this tree, captured at pre-commit time ---\n"
+        tail -n +2 "$pending"
     } | write_entry
     written=$?
-    # Consumed either way: a capture that did not match this tree will not match a later one
-    # either, and leaving it would offer the next commit an older commit's numbers.
+    # Consumed either way, so it cannot attest anything else.
     rm -f "$pending"
     # Loud, because the caller cannot tell otherwise: pre-commit hides a passing hook's stderr,
     # so an --record that wrote nothing and exited 0 showed as 'Passed'.
@@ -369,6 +382,10 @@ tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 (cd "$self_root" && pre-commit run --all-files --hook-stage pre-commit) > "$tmp" 2>&1
 status=$?
+# A wired test hook just left a capture of this run. It is not a commit's gate -- a sibling hook
+# may have failed while the tests passed -- so it must not be there for a later '--no-verify'
+# commit or reword of this same tree to fold in as its own proof. This run caches itself below.
+rm -f "$pending"
 
 cat "$tmp"
 

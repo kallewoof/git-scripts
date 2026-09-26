@@ -222,6 +222,8 @@ test6() {
     commit_all "$repo" init
 
     local status_record
+    # What the gate's wired test hook leaves at pre-commit time: --record's proof that it ran.
+    run_report "$repo" --capture -- true > /dev/null
     run_report "$repo" --record > /dev/null; status_record=$?
     assert_eq "--record exits 0" "0" "$status_record"
     assert_eq "--record ran no gate" "0" "$(counter_value "$counter")"
@@ -373,9 +375,8 @@ test11() {
     commit_all "$repo" init
     pending="$repo/.git/git-report-pending"
 
-    out=$(run_report "$repo" --capture -- bash -c 'echo "3196 passed"; echo noise >&2; exit 7' 2>/dev/null)
+    out=$(run_report "$repo" --capture -- bash -c 'echo "3196 passed"; echo noise >&2; exit 0' 2>/dev/null)
     status=$?
-    assert_eq "--capture exits with the command's status, not its own" "7" "$status"
     assert_eq "--capture passes the command's stdout through" "3196 passed" "$out"
 
     if [ -f "$pending" ]; then ok "--capture left a copy for --record"; else fail "--capture left a copy for --record"; fi
@@ -386,6 +387,18 @@ test11() {
         *noise*) fail "stderr is left alone, not merged into the copy" ;;
         *) ok "stderr is left alone, not merged into the copy" ;;
     esac
+
+    # --record reads a copy as proof the gate passed for its tree, so a failed run leaves none --
+    # not even over the passing one above, which a failed run of the same tree supersedes.
+    out=$(run_report "$repo" --capture -- bash -c 'echo "3 failed"; exit 7' 2>/dev/null)
+    status=$?
+    assert_eq "--capture exits with the command's status, not its own" "7" "$status"
+    assert_eq "a failing command's stdout still passes through" "3 failed" "$out"
+    if [ -f "$pending" ]; then
+        fail "a failed run leaves no copy for --record ($(tr '\n' ' ' < "$pending"))"
+    else
+        ok "a failed run leaves no copy for --record"
+    fi
 }
 
 # --- test 12: a recorded entry carries the captured summary ------------------------
@@ -425,26 +438,33 @@ test12() {
     fi
 }
 
-# --- test 13: no matching capture is said plainly, not papered over ----------------
+# --- test 13: no capture for this tree records nothing, and says so -----------------
 
 test13() {
-    echo "test 13: with no capture for this tree, the recorded entry says so and names the remedy"
-    local d="$WORK/t13" never stale out
-    never="$d/never"; stale="$d/stale"
+    echo "test 13: with no capture for this tree, --record writes nothing, says why, and the next report runs the gate"
+    local d="$WORK/t13" never stale counter marker out err status
+    never="$d/never"; stale="$d/stale"; counter="$d/counter"; marker="$d/marker"
 
-    # (i) nothing was ever captured.
+    # (i) nothing was ever captured -- a test hook not wired for capture, or a commit that
+    # never went through pre-commit at all. Either way nothing proves the gate ran.
     init_repo "$never"
+    make_fake_gate_config "$never" "$counter" "$marker"
     echo x > "$never/f.txt"
     commit_all "$never" init
-    run_report "$never" --record
-    out=$(run_report "$never")
-    case "$out" in
-        *"carries no gate output"*) ok "an uncaptured commit says the entry carries no gate output" ;;
-        *) fail "an uncaptured commit says the entry carries no gate output (got: $out)" ;;
+    err=$(run_report "$never" --record 2>&1 >/dev/null); status=$?
+    assert_eq "--record still exits 0: a commit that bypassed the gate is not an error" "0" "$status"
+    case "$err" in
+        *"nothing recorded"*"runs the gate"*) ok "and says on stderr that nothing was recorded, and why" ;;
+        *) fail "and says on stderr that nothing was recorded, and why (got: $err)" ;;
     esac
-    case "$out" in
-        *"&& git report"*) ok "and names the one-line way to get one" ;;
-        *) fail "and names the one-line way to get one (got: $out)" ;;
+    assert_eq "no entry was written" "0" \
+        "$(find "$never/.git/info/git-report" -maxdepth 1 -type f -regextype posix-extended \
+            -regex '.*/[0-9a-f]{64}' 2>/dev/null | wc -l)"
+    out=$(run_report "$never")
+    assert_eq "the next report runs the gate" "1" "$(counter_value "$counter")"
+    case "$(printf '%s\n' "$out" | head -n 1)" in
+        *"cached"*|*"gate passed"*) fail "and its first line claims no pass it did not see (got: $out)" ;;
+        *) ok "and its first line claims no pass it did not see" ;;
     esac
 
     # (ii) a capture exists, but for a tree that is no longer the committed one -- exactly
@@ -455,16 +475,16 @@ test13() {
     run_report "$stale" --capture -- bash -c 'echo "999 passed"' > /dev/null
     echo y >> "$stale/f.txt"
     commit_all "$stale" second
-    run_report "$stale" --record
-    out=$(run_report "$stale")
-    case "$out" in
-        *"999 passed"*) fail "a capture from another tree is not passed off as this commit's" ;;
-        *) ok "a capture from another tree is not passed off as this commit's" ;;
+    err=$(run_report "$stale" --record 2>&1 >/dev/null)
+    case "$err" in
+        *"nothing recorded"*) ok "a capture from another tree does not attest this one" ;;
+        *) fail "a capture from another tree does not attest this one (got: $err)" ;;
     esac
-    case "$out" in
-        *"carries no gate output"*) ok "and the entry says it carries no gate output" ;;
-        *) fail "and the entry says it carries no gate output (got: $out)" ;;
-    esac
+    if [ -f "$stale/.git/git-report-pending" ]; then
+        fail "and the stale capture is consumed, so no later commit inherits it"
+    else
+        ok "and the stale capture is consumed, so no later commit inherits it"
+    fi
 }
 
 # --- test 14: no capture while a mutation sweep is in flight -----------------------
@@ -820,6 +840,8 @@ test21() {
     mkdir -p "$cache"
     chmod a-w "$cache"
 
+    # A matching capture, so that --record has a pass to attest and the write is attempted.
+    run_report "$repo" --capture -- true > /dev/null
     err=$(run_report "$repo" --record 2>&1 >/dev/null); status=$?
     if [ "$status" -ne 0 ]; then ok "--record exits non-zero"; else fail "--record exits non-zero (exit was 0)"; fi
     case "$err" in
@@ -837,6 +859,111 @@ test21() {
     chmod u+w "$cache"
     assert_eq "nothing was written" "0" \
         "$(find "$cache" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9a-f]{64}' | wc -l)"
+}
+
+# --- test 22: post-commit without a gate run attests nothing ----------------------
+
+test22() {
+    echo "test 22: a rebase, a --no-verify commit and a reword of a reported tree leave HEAD unattested"
+    local d="$WORK/t22" repo counter marker shim out
+    repo="$d/self"; counter="$d/counter"; marker="$d/marker"; shim="$d/shim.sh"
+    mkdir -p "$d"
+    cat > "$shim" <<'EOF'
+echo RAN >> "$1"
+[ -f "$2" ] && { echo "1 failed, 41 passed"; exit 1; }
+echo "42 passed"
+EOF
+    init_repo "$repo"
+    git -C "$repo" checkout -q -b master
+    # Wired as test 15 wires it, and as rp-stack does: a capturing, always_run test hook and a
+    # post-commit --record.
+    cat > "$repo/.pre-commit-config.yaml" <<EOF
+default_stages: [pre-commit]
+repos:
+  - repo: local
+    hooks:
+      - id: fake-pytest
+        name: fake pytest
+        entry: $SCRIPT --capture -- bash $shim $counter $marker
+        language: system
+        always_run: true
+        pass_filenames: false
+        verbose: true
+      - id: git-report-record
+        name: git report --record
+        entry: $SCRIPT --record
+        language: system
+        stages: [post-commit]
+        always_run: true
+        pass_filenames: false
+EOF
+    echo x > "$repo/f.txt"
+    commit_all "$repo" init
+    (cd "$repo" && pre-commit install --install-hooks > /dev/null 2>&1 &&
+        pre-commit install --hook-type post-commit > /dev/null 2>&1) || {
+        fail "test 22 could not install the hooks (skipping the rest)"
+        return
+    }
+    local gate
+    gated_commit() { (cd "$repo" && git add -A && git commit -q "$@") > "$d/commit.log" 2>&1; }
+
+    # (i) A gated topic commit records, and replays -- unchanged.
+    git -C "$repo" checkout -q -b topic
+    echo t > "$repo/t.txt"
+    gated_commit -m topic || fail "the gated topic commit succeeded ($(tail -n 5 "$d/commit.log" | tr '\n' ' '))"
+    out=$(run_report "$repo")
+    assert_eq "a gated commit's report re-runs nothing" "1" "$(counter_value "$counter")"
+    case "$out" in
+        *"this report is cached"*"gate passed at $(git -C "$repo" rev-parse HEAD)"*"42 passed"*)
+            ok "and replays its attestation with the captured numbers" ;;
+        *) fail "and replays its attestation with the captured numbers (got: $out)" ;;
+    esac
+
+    # (ii) master moves; the rebase rewrites topic. git runs post-commit for every commit a
+    # rebase writes, and pre-commit for none of them.
+    git -C "$repo" checkout -q master
+    echo m > "$repo/m.txt"
+    gated_commit -m "master moves"
+    git -C "$repo" checkout -q topic
+    gate=$(counter_value "$counter")
+    (cd "$repo" && git rebase -q master) > "$d/rebase.log" 2>&1 ||
+        fail "the rebase succeeded ($(tail -n 5 "$d/rebase.log" | tr '\n' ' '))"
+    assert_eq "the rebase itself ran no gate" "$gate" "$(counter_value "$counter")"
+    out=$(run_report "$repo")
+    assert_eq "the rebased HEAD's report runs the gate" "$((gate + 1))" "$(counter_value "$counter")"
+    case "$(printf '%s\n' "$out" | head -n 1)" in
+        *"cached"*|*"gate passed"*) fail "and its first line attests nothing it did not run (got: $out)" ;;
+        *) ok "and its first line attests nothing it did not run" ;;
+    esac
+
+    # (iii) An attempt whose tests fail, then the same staged state with --no-verify. The failed
+    # run's capture carries exactly that tree, and must not become its proof.
+    touch "$marker"
+    echo u >> "$repo/t.txt"
+    gated_commit -m "fails the gate" && fail "the failing commit was refused"
+    gated_commit --no-verify -m "bypasses the gate" ||
+        fail "the --no-verify commit succeeded ($(tail -n 5 "$d/commit.log" | tr '\n' ' '))"
+    rm -f "$marker"
+    gate=$(counter_value "$counter")
+    out=$(run_report "$repo")
+    assert_eq "a --no-verify commit's report runs the gate" "$((gate + 1))" "$(counter_value "$counter")"
+    case "$out" in
+        *"gate passed"*|*"1 failed"*) fail "and nothing attests it, least of all the failed run (got: $out)" ;;
+        *) ok "and nothing attests it, least of all the failed run" ;;
+    esac
+
+    # (iv) That report's own run went through the capturing hook, at this very tree. It is not a
+    # commit's gate, so a reword (same tree, no pre-commit) must not fold it in as proof.
+    if [ -f "$repo/.git/git-report-pending" ]; then
+        fail "a report's own gate run leaves no capture behind"
+    else
+        ok "a report's own gate run leaves no capture behind"
+    fi
+    gated_commit --amend --no-verify -m "reworded"
+    gate=$(counter_value "$counter")
+    run_report "$repo" > /dev/null
+    assert_eq "a reword of a reported tree is not attested by that report's run" \
+        "$((gate + 1))" "$(counter_value "$counter")"
 }
 
 test1
@@ -860,6 +987,7 @@ test18
 test19
 test20
 test21
+test22
 
 echo
 echo "== behaviour -> test mapping =="
@@ -875,7 +1003,7 @@ echo "9. a dirty tree from a git mutate sweep is named as such .... test9"
 echo "10. a hit says it is cached, above the content ............... test10"
 echo "11. --capture is transparent and stamps what it captures ..... test11"
 echo "12. a recorded entry carries the captured output ............. test12"
-echo "13. no capture for this tree is said plainly ................. test13"
+echo "13. no capture for this tree records nothing, and says so .... test13"
 echo "14. no capture while a mutation sweep is in flight ........... test14"
 echo "15. the real wiring, end to end through pre-commit ........... test15"
 echo "16. untracked dependency content is keyed, not just its name . test16"
@@ -884,6 +1012,7 @@ echo "18. a worktree commit replays in the worktree and in main .... test18"
 echo "19. ... and keys a dependency on the dependency, not on self .. test19"
 echo "20. two worktrees' captures do not share a file .............. test20"
 echo "21. an entry that cannot be written is said so ............... test21"
+echo "22. rebase / --no-verify / reword leave HEAD unattested ...... test22"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed"
 [ "$TESTS_FAILED" -eq 0 ]
