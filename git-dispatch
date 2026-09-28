@@ -14,11 +14,21 @@
 #                        codex -c model_reasoning_effort="high" 'Task: ...'   (with --agent codex)
 #     a session id   ->  claude --effort high --resume <id> 'Follow-up task: ...'
 #                        codex resume -c model_reasoning_effort="high" -C <cwd> <id> 'Follow-up task: ...'
-#                        the agent read from the 'Implementer' line (or --agent, if it names neither)
+#                        the program named by the 'Harness' line: claude-code or codex
+#     ... and a report ->  'Continue task: <path> - read it from the end.'
+#
+#   A session id with a '## Report' (or '## Report <n>') heading in the file, outside a fenced code
+#   block, is the same task continued: the worker already has it, and what is new is at the end.
+#   With no report it is a new task routed to an existing worker.
+#
+#   The session is resumed by the program that ran it, which only the 'Harness' line says. The
+#   'Implementer' line is a model name, and a model does not say which program ran it (Claude
+#   Opus from Claude Code, Cursor or agy alike), so it is never read.
 #
 #   --dry-run    Print each step -- the worktree command, the agent's exact argv and its cwd --
 #                and change nothing.
-#   --agent A    claude or codex. Required to resume a session whose Implementer names neither.
+#   --agent A    claude or codex. Resumes a session whose header has no Harness line; for a new
+#                session, picks the agent (default claude). Contradicting a Harness is refused.
 #   --effort L   The worker's reasoning effort, on a new session and a resume alike (default:
 #                high). The worker acts on its first message at once, so the level is always
 #                passed explicitly rather than left to whatever the agent's own setting is.
@@ -45,6 +55,9 @@ set -u
 
 SELF="git-dispatch"
 STATUSES=("Proposal" "Pending" "In Progress" "Finished" "Author Verified" "Blocked" "Returned" "Closed")
+FENCE_RE='^ {0,3}(`{3,}|~{3,})'
+FENCE_CLOSE_RE='^ {0,3}(`{3,}|~{3,})[[:space:]]*$'
+REPORT_RE='^## Report( [0-9]+)?[[:space:]]*$'
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 DEFAULT_EFFORT="high"
@@ -60,8 +73,8 @@ Usage:
                 Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
                 its worker in the project root.
   --dry-run     Print the worktree command, the agent's argv and its cwd; change nothing.
-  --agent A     claude or codex; overrides the default for a new session, and names the
-                agent to resume when the Implementer line names neither.
+  --agent A     claude or codex; picks a new session's agent (default claude), and names
+                the one to resume when the header has no Harness line.
   --effort L    The worker's reasoning effort (default: high). claude: low, medium, high,
                 xhigh, max; codex: the same, or ultra.
   --cwd DIR     Run the agent in DIR instead of the project root (older sessions).
@@ -214,14 +227,12 @@ case "$status" in
     *) die "$task: line 3: status is '$status'; only a Pending or Returned task is dispatched" ;;
 esac
 
-for key in "Implementer" "Implementer Session ID" "Checkout"; do
+for key in "Implementer Session ID" "Checkout"; do
     [ -n "${field[$key]+set}" ] ||
         die "$task: no '**$key: ...**' line in the header ($header_range)"
 done
-implementer=${field[Implementer]}
 session=${field[Implementer Session ID]}
 checkout=${field[Checkout]}
-l_impl=${field_line[Implementer]}
 l_session=${field_line[Implementer Session ID]}
 l_checkout=${field_line[Checkout]}
 
@@ -237,47 +248,45 @@ co_repo=${BASH_REMATCH[1]} slug=${BASH_REMATCH[2]}
 
 # --- the agent ------------------------------------------------------------------------------
 
-# Which agent an Implementer line names: a Claude model or a Codex one, as a whole word. Naming
-# both, or neither, is no answer.
-implementer_agent() {
-    local lc=${1,,} claude=0 codex=0
-    [[ "$lc" =~ (^|[^a-z0-9])claude([^a-z0-9]|$) ]] && claude=1
-    [[ "$lc" =~ (^|[^a-z0-9])codex([^a-z0-9]|$) ]] && codex=1
-    if [ "$claude" -eq 1 ] && [ "$codex" -eq 0 ]; then echo claude
-    elif [ "$codex" -eq 1 ] && [ "$claude" -eq 0 ]; then echo codex
+# The program that ran the session, from the Harness line. Only these two can be resumed from
+# here; anything else is named and refused rather than guessed at.
+harness="" harness_agent=""
+if [ -n "${field[Harness]+set}" ]; then
+    harness=${field[Harness]}
+    l_harness=${field_line[Harness]}
+    case "$harness" in
+        claude-code) harness_agent=claude ;;
+        codex) harness_agent=codex ;;
+        unassigned) harness="" ;;
+        "") die "$task: line $l_harness: empty Harness (write 'unassigned' for none)" ;;
+        *)
+            if [ "$session" = "unassigned" ]; then
+                die "$task: line $l_harness: Harness '$harness' is not a program git dispatch starts" \
+                    "(claude-code, codex); start it in $harness, or set Harness to unassigned"
+            fi
+            die "$task: line $l_harness: Harness '$harness' cannot be resumed from the command line;" \
+                "resume it in $harness, or dispatch a new session"
+            ;;
+    esac
+    if [ -n "$agent_opt" ] && [ -n "$harness_agent" ] && [ "$agent_opt" != "$harness_agent" ]; then
+        die "$task: line $l_harness: Harness is '$harness'; --agent $agent_opt contradicts it"
     fi
-}
-
-named=""
-[ "$implementer" = "unassigned" ] || named=$(implementer_agent "$implementer")
+fi
 
 if [ "$session" = "unassigned" ]; then
     resume=0
-    if [ -n "$agent_opt" ]; then
-        agent=$agent_opt
-    elif [ "$implementer" = "unassigned" ] || [ "$named" = "claude" ]; then
-        agent=claude
-    else
-        die "$task: line $l_impl: Implementer is '$implementer' but there is no session to resume;" \
-            "a new session would start claude -- say --agent claude or --agent codex"
-    fi
+    agent=${agent_opt:-${harness_agent:-claude}}
 else
     resume=1
     [ -n "$session" ] || die "$task: line $l_session: empty Implementer Session ID (write 'unassigned' for none)"
-    if [ -n "$agent_opt" ]; then
-        [ -z "$named" ] || [ "$named" = "$agent_opt" ] ||
-            die "$task: line $l_impl: Implementer '$implementer' is a $named worker; --agent $agent_opt cannot resume its session"
-        agent=$agent_opt
-    elif [ -n "$named" ]; then
-        agent=$named
-    else
-        die "$task: line $l_impl: Implementer '$implementer' names neither Claude nor Codex;" \
-            "say --agent claude or --agent codex to resume session $session"
-    fi
     # Anything but a UUID is not handed over: 'claude --resume <text>' opens a picker searching
     # for it, and a leading '-' would be read as an option.
     [[ "$session" =~ $UUID_RE ]] ||
         die "$task: line $l_session: Implementer Session ID '$session' is not a session UUID"
+    agent=${agent_opt:-$harness_agent}
+    [ -n "$agent" ] ||
+        die "$task: line $l_session: session $session, but no program to resume it with: add" \
+            "'**Harness: claude-code**' or '**Harness: codex**' to the header, or pass --agent claude|codex"
 fi
 command -v "$agent" > /dev/null 2>&1 || die "'$agent' is not on PATH"
 
@@ -304,11 +313,49 @@ case "$task_in_main" in
     *) task_ref=$task_in_main ;;
 esac
 
+# A worker's report means it already worked this task: a Blocked task CO answered and set back to
+# Pending, or a Returned one. It is a heading at column 0 after the header -- '## Report' or
+# '## Report <n>', exactly -- and not one inside a fenced code block, where a spec quotes the
+# headings it asks for. A fence closes on a run of its own character at least as long; one never
+# closed runs to the end of the file, as in Markdown, and that is said rather than passed over.
+report_line="" fence="" fence_line=""
+if [ "$resume" -eq 1 ]; then
+    lineno=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        line=${line%$'\r'}
+        [ "$lineno" -le "${last%%:*}" ] && continue
+        if [ -n "$fence" ]; then
+            if [[ "$line" =~ $FENCE_CLOSE_RE ]] && [ "${BASH_REMATCH[1]:0:1}" = "${fence:0:1}" ] &&
+                [ "${#BASH_REMATCH[1]}" -ge "${#fence}" ]; then
+                fence=""
+            fi
+            continue
+        fi
+        if [[ "$line" =~ $FENCE_RE ]]; then
+            fence=${BASH_REMATCH[1]} fence_line=$lineno
+            continue
+        fi
+        if [[ "$line" =~ $REPORT_RE ]]; then
+            report_line=$lineno
+            break
+        fi
+    done < "$task"
+    if [ -z "$report_line" ] && [ -n "$fence" ]; then
+        echo "$SELF: note: the code block opened at line $fence_line is never closed; nothing after it" \
+            "was read as a report" >&2
+    fi
+fi
+
 # Codex has no effort flag; its -c takes a TOML value, so the level goes in as a quoted string.
 codex_effort=(-c "model_reasoning_effort=\"$effort\"")
 
 if [ "$resume" -eq 1 ]; then
-    message="Follow-up task: $task_ref"
+    if [ -n "$report_line" ]; then
+        message="Continue task: $task_ref - read it from the end."
+    else
+        message="Follow-up task: $task_ref"
+    fi
     if [ "$agent" = "claude" ]; then
         argv=(claude --effort "$effort" --resume "$session" "$message")
     else
@@ -398,7 +445,14 @@ quote() {
     printf '%s\n' "$out"
 }
 
-echo "$SELF: task $task_abs ($status, $([ "$resume" -eq 1 ] && echo "resume $session" || echo "new session"))"
+if [ "$resume" -eq 0 ]; then
+    how="new session"
+elif [ -n "$report_line" ]; then
+    how="resume $session with $agent, continuing: a report at line $report_line"
+else
+    how="resume $session with $agent, a follow-up: no report"
+fi
+echo "$SELF: task $task_abs ($status, $how)"
 if [ "$create" -eq 1 ]; then
     echo "$SELF: worktree: $(quote "${add[@]}")    (from $base, via $base_from)"
 else

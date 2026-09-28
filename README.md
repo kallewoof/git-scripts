@@ -573,10 +573,12 @@ never read, because a task file that describes the format quotes a header of its
 
 ```
 **Status: Pending**                                  line 3; only Pending or Returned is dispatched
-**Implementer: Claude Opus 5.5**                     or "gpt-6-astra (Codex)", or "unassigned"
+**Harness: claude-code**                             or "codex", or "unassigned"; needed to resume
 **Implementer Session ID: 82ea4726-...**             or "unassigned"
 **Checkout: terea@failed-call**                      <repo>@<slug>
 ```
+
+`Implementer`, the model, is not read at all: see below. Any other header line is ignored.
 
 `Checkout: <repo>@<slug>` names the worktree. `<repo>` is the directory name of the repo's main checkout, and
 it has to be the repo the task file is in. The worktree is `<project root>/<repo>@<slug>` on
@@ -592,6 +594,21 @@ git dir (and, for a submodule, from its `core.worktree`).
 |               | `codex -c model_reasoning_effort="high" 'Task: ...'` (with `--agent codex`)             |
 | a UUID        | `claude --effort high --resume <id> 'Follow-up task: terea/context/TASK_<name>.md'`      |
 |               | `codex resume -c model_reasoning_effort="high" -C <project root> <id> 'Follow-up task: ...'` |
+| a UUID + a report | the same, with `'Continue task: terea/context/TASK_<name>.md - read it from the end.'` |
+
+**Three messages, for three situations.** With no session, it is a new task for a new worker (`Task:`).
+With a session and no report, it is a new task CO routed to an existing worker (`Follow-up task:`). With a
+session and a report already in the file, it is *the same task continued*, for example a `Blocked` task CO
+answered and set back to `Pending`, or a `Returned` one. That worker has the task in context already, and
+what is new is at the end (`Continue task: … - read it from the end.`).
+
+A report is a line that is exactly `## Report` or `## Report <n>` (trailing blanks allowed), at column 0,
+after the header, and **outside a fenced code block**. A spec quotes the headings it asks for, and it does
+so in a fence. A fence opens with three or more `` ` `` or `~`, indented up to three spaces. It closes on a
+run of the same character that is at least as long and has nothing after it. An unclosed fence runs to the
+end of the file, as in Markdown, and git dispatch says so on stderr instead of silently finding no report.
+`## Reporting`, `### Report`, ` ## Report` (indented) and `## Report 2b` are not reports. A `Returned` task
+with no report gets `Follow-up task:`: the report alone decides, and the status plays no part.
 
 **Effort is always passed, and defaults to `high`.** The worker acts on its message the moment it starts, so
 there is no chance to notice a session running at `max` or `low` before it has spent the task that way.
@@ -603,12 +620,19 @@ takes `low`, `medium`, `high`, `xhigh`, `max` (from `claude --help`). Codex take
 its config reference, which adds that "available levels depend on the model"). Anything else is refused,
 including a typo, a different case, and `ultra` for Claude.
 
-For a resume, the agent comes from the `Implementer` line: `Claude` or `Codex` as a whole word, exactly one
-of the two. If it names neither, the resume is refused unless `--agent` says which. If `--agent` contradicts
-it, the resume is refused, because that session belongs to the other agent. A new session starts `claude`
-unless `--agent` says otherwise. When the `Implementer` line is filled in and does not name Claude, it is
-refused rather than silently started as a Claude worker. A session ID has to be a UUID. Anything else would
-reach `claude --resume` as a picker search term, or as an option if it starts with `-`.
+**A session is resumed by the program that ran it, which only `Harness` says.** `claude-code` resumes with
+`claude --resume` and `codex` with `codex resume`, spelled exactly like that, with no aliases. A model name
+does not tell you the program: Claude Opus runs in Claude Code, Cursor and agy alike, and only the program
+that ran a session can resume it. So `Implementer` is never read, and `Implementer: Claude Opus 5.5` with
+`Harness: codex` resumes with `codex`. Any other Harness (`cursor`, `agy`, …) is refused by name: *"cannot be
+resumed from the command line; resume it in cursor, or dispatch a new session"*. A session with no Harness
+line, or with `Harness: unassigned`, is refused, and the refusal names both fixes: add the line, or pass
+`--agent`. A task written before `Harness` existed therefore needs `--agent` once. `--agent` contradicting a
+present Harness is refused.
+
+A new session (no session ID) starts the Harness's program if one is named, otherwise `claude`. `--agent`
+picks the program when there is no Harness, and must agree with one that is there. A session ID has to be a UUID. Anything else would reach `claude --resume` as a picker
+search term, or as an option if it starts with `-`.
 
 **The checkout.** If the worktree is absent, it runs `git worktree add <root>/<repo>@<slug> -b task/<slug>
 <default branch>`. The start point is the local branch as it stands: `git config dispatch.defaultBranch` if

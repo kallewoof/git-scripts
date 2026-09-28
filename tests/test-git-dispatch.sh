@@ -108,16 +108,18 @@ new_project() {
     mkdir -p "$MAIN/context"
 }
 
-# write_task <file> <status> <implementer> <session id> <checkout, or '-' for no line>
-# The body quotes a decoy header, as a real task file describing the format does.
+# write_task <file> <status> <implementer> <session id> <checkout, or '-'> [<harness, or '-'>]
+# '-' leaves the line out; the Harness line, when given, follows Implementer (line 6). The body
+# quotes a decoy header, as a real task file describing the format does.
 write_task() {
-    local file="$1" status="$2" impl="$3" sid="$4" co="$5"
+    local file="$1" status="$2" impl="$3" sid="$4" co="$5" harness="${6--}"
     {
         echo "# TASK: something"
         echo
         echo "**Status: $status**"
         echo "**Author: CO**"
         echo "**Implementer: $impl**"
+        [ "$harness" = "-" ] || echo "**Harness: $harness**"
         echo "**Implementer Session ID: $sid**"
         echo "**Implementation commit: unassigned**"
         [ "$co" = "-" ] || echo "**Checkout: $co**"
@@ -237,7 +239,7 @@ test2() {
     head=$(git -C "$wt" rev-parse HEAD)
     local state_before
     state_before=$(git -C "$wt" status --porcelain --untracked-files=all; cat "$wt/f.txt")
-    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@back"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@back" claude-code
     sum=$(sha1sum < "$task")
 
     run_dispatch "$task"
@@ -264,7 +266,7 @@ test3() {
     old_head=$(git -C "$old" rev-parse HEAD)
     echo more > "$MAIN/f.txt"
     commit_all "$MAIN" "master moved on"
-    write_task "$task" "Pending" "Claude Opus 5.5" "$ID1" "terea@second"
+    write_task "$task" "Pending" "Claude Opus 5.5" "$ID1" "terea@second" claude-code
 
     run_dispatch "$task"
     assert_eq "exits 0" "0" "$STATUS"
@@ -282,10 +284,10 @@ test3() {
 # --- test 4: codex --------------------------------------------------------------------------
 
 test4() {
-    begin test4 "a Codex implementer resumes through 'codex resume <id>'; --agent codex starts a new one"
+    begin test4 "Harness: codex resumes through 'codex resume <id>'; --agent codex or a Harness starts a new one"
     new_project t4
     local task="$MAIN/context/TASK_cx.md"
-    write_task "$task" "Returned" "gpt-6-astra (Codex)" "$ID2" "terea@cx"
+    write_task "$task" "Returned" "gpt-6-astra" "$ID2" "terea@cx" codex
     run_dispatch "$task"
     assert_eq "exits 0" "0" "$STATUS"
     assert_eq "codex resume -C <root> <id> with the follow-up message" \
@@ -301,33 +303,70 @@ test4() {
     assert_eq "... in the project root" "$ROOT" "$(agent_cwd)"
     rm -f "$LOG"
 
+    task="$MAIN/context/TASK_cx_harness.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@cx-harness" codex
+    run_dispatch "$task"
+    assert_eq "Harness: codex, no session: codex 'Task: ...'" \
+        "codex|-c|model_reasoning_effort=\"high\"|Task: terea/context/TASK_cx_harness.md" "$(agent_argv)"
+    rm -f "$LOG"
+
     task="$MAIN/context/TASK_cx_named.md"
     write_task "$task" "Pending" "gpt-6-astra (Codex)" "unassigned" "terea@cx-named"
-    refused "a new session for a Codex implementer without --agent" "line 5" "$task"
+    run_dispatch "$task"
+    assert_eq "a new session with no Harness is claude, whatever the Implementer says" \
+        "claude|--effort|high|Task: terea/context/TASK_cx_named.md" "$(agent_argv)"
+    rm -f "$LOG"
 }
 
-# --- test 5: an implementer naming neither --------------------------------------------------
+# --- test 5: the Harness line decides the program -------------------------------------------
 
 test5() {
-    begin test5 "an Implementer naming neither agent is refused unless --agent says which"
+    begin test5 "a session resumes with the program its Harness names; the model name is never read"
     new_project t5
     local task="$MAIN/context/TASK_who.md"
-    write_task "$task" "Returned" "Gemini 4 Ultra" "$ID1" "terea@who"
-    refused "unknown implementer" "line 5" "$task"
-    refused "unassigned implementer with a session id" "line 5" \
-        "$(write_task "$task" "Returned" "unassigned" "$ID1" "terea@who"; echo "$task")"
-    refused "an implementer naming both" "line 5" \
-        "$(write_task "$task" "Returned" "Claude-in-Codex" "$ID1" "terea@who"; echo "$task")"
-
-    write_task "$task" "Returned" "Gemini 4 Ultra" "$ID1" "terea@who"
-    run_dispatch --agent claude "$task"
-    assert_eq "--agent claude resumes it" \
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" codex
+    run_dispatch "$task"
+    assert_eq "Implementer 'Claude Opus 5.5' + Harness codex: codex" \
+        "codex|resume|-c|model_reasoning_effort=\"high\"|-C|$ROOT|$ID1|Follow-up task: terea/context/TASK_who.md" \
+        "$(agent_argv)"
+    rm -f "$LOG"
+    write_task "$task" "Returned" "gpt-6-astra (Codex)" "$ID1" "terea@who" claude-code
+    run_dispatch "$task"
+    assert_eq "Implementer naming Codex + Harness claude-code: claude" \
         "claude|--effort|high|--resume|$ID1|Follow-up task: terea/context/TASK_who.md" "$(agent_argv)"
     rm -f "$LOG"
 
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who"
+    refused "a session with no Harness line" "add '**Harness: claude-code**' or '**Harness: codex**'" "$task"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" unassigned
+    refused "a session with Harness unassigned" "no program to resume it with" "$task"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" cursor
+    refused "Harness cursor" "line 6: Harness 'cursor' cannot be resumed from the command line; resume it in cursor" "$task"
+    refused "Harness cursor, even with --agent" "Harness 'cursor' cannot be resumed" --agent claude "$task"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" claude
+    refused "an alias is not a Harness" "Harness 'claude' cannot be resumed" "$task"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" ""
+    refused "an empty Harness" "line 6: empty Harness" "$task"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@who" agy
+    refused "a new session whose Harness is agy" "Harness 'agy' is not a program git dispatch starts" "$task"
+
+    write_task "$task" "Returned" "Gemini 4 Ultra" "$ID1" "terea@who"
+    run_dispatch --agent claude "$task"
+    assert_eq "no Harness: --agent claude resumes it" \
+        "claude|--effort|high|--resume|$ID1|Follow-up task: terea/context/TASK_who.md" "$(agent_argv)"
+    rm -f "$LOG"
+    write_task "$task" "Returned" "Gemini 4 Ultra" "$ID1" "terea@who" unassigned
+    run_dispatch --agent codex "$task"
+    assert_eq "Harness unassigned: --agent codex resumes it" \
+        "codex|resume|-c|model_reasoning_effort=\"high\"|-C|$ROOT|$ID1|Follow-up task: terea/context/TASK_who.md" \
+        "$(agent_argv)"
+    rm -f "$LOG"
+
     local t2="$MAIN/context/TASK_mismatch.md"
-    write_task "$t2" "Returned" "Claude Opus 5.5" "$ID1" "terea@mismatch"
-    refused "--agent contradicting the implementer" "Claude Opus 5.5" --agent codex "$t2"
+    write_task "$t2" "Returned" "Claude Opus 5.5" "$ID1" "terea@mismatch" claude-code
+    refused "--agent contradicting the Harness" "Harness is 'claude-code'; --agent codex contradicts it" --agent codex "$t2"
+    write_task "$t2" "Pending" "unassigned" "unassigned" "terea@mismatch" codex
+    refused "... on a new session too" "Harness is 'codex'; --agent claude contradicts it" --agent claude "$t2"
 }
 
 # --- test 6: --cwd --------------------------------------------------------------------------
@@ -336,7 +375,7 @@ test6() {
     begin test6 "--cwd moves the agent's working directory, and nothing else"
     new_project t6
     local task="$MAIN/context/TASK_old.md"
-    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@old"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@old" claude-code
     run_dispatch --cwd "$MAIN" "$task"
     assert_eq "exits 0" "0" "$STATUS"
     assert_eq "the agent runs in DIR" "$MAIN" "$(agent_cwd)"
@@ -412,7 +451,7 @@ test10() {
     begin test10 "a branch without its worktree, or a worktree that is not the task's, is refused"
     new_project t10
     local task="$MAIN/context/TASK_br.md"
-    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@br"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@br" claude-code
     git -C "$MAIN" branch task/br master
     refused "task/br exists, terea@br does not" "branch task/br exists but its worktree $ROOT/terea@br does not" "$task"
 
@@ -462,7 +501,7 @@ test11() {
     rm -f "$LOG"
 
     local t2="$MAIN/context/TASK_dry2.md"
-    write_task "$t2" "Returned" "gpt-6-astra (Codex)" "$ID2" "terea@dry"
+    write_task "$t2" "Returned" "gpt-6-astra" "$ID2" "terea@dry" codex
     before=$(snapshot)
     run_dispatch --dry-run --cwd "$MAIN" "$t2"
     assert_eq "a dry resume changes nothing" "$before" "$(snapshot)"
@@ -667,14 +706,14 @@ test17() {
     rm -f "$LOG"
 
     local back="$MAIN/context/TASK_eff_back.md"
-    write_task "$back" "Returned" "Claude Opus 5.5" "$ID1" "terea@eff"
+    write_task "$back" "Returned" "Claude Opus 5.5" "$ID1" "terea@eff" claude-code
     run_dispatch --effort medium "$back"
     assert_eq "claude, resume: --effort medium" \
         "claude|--effort|medium|--resume|$ID1|Follow-up task: terea/context/TASK_eff_back.md" "$(agent_argv)"
     rm -f "$LOG"
 
     local cx="$MAIN/context/TASK_eff_cx.md"
-    write_task "$cx" "Returned" "gpt-6-astra (Codex)" "$ID2" "terea@eff"
+    write_task "$cx" "Returned" "gpt-6-astra" "$ID2" "terea@eff" codex
     run_dispatch --effort ultra "$cx"
     assert_eq "codex, resume: -c model_reasoning_effort=\"ultra\"" \
         "codex|resume|-c|model_reasoning_effort=\"ultra\"|-C|$ROOT|$ID2|Follow-up task: terea/context/TASK_eff_cx.md" \
@@ -695,6 +734,86 @@ test17() {
     refused "--effort without a value" "--effort needs a value" "$task" --effort
 }
 
+# --- test 18: a continued task -------------------------------------------------------------
+
+# The exec line a dry run prints, and the one expected for <argv...>. dry_exec runs in a command
+# substitution, so its run's OUT/ERR stay there; the run's files under $D do not.
+dry_exec() {
+    run_dispatch --dry-run "$@"
+    printf '%s\n' "$OUT" | sed -n 's/^git-dispatch: exec: //p'
+}
+quoted() {
+    local q
+    q=$(printf '%q ' "$@")
+    echo "${q% }"
+}
+
+test18() {
+    begin test18 "a session plus a worker's '## Report' says 'Continue task'; a heading in a fence does not"
+    new_project t18
+    local task="$MAIN/context/TASK_c.md" ref="terea/context/TASK_c.md"
+    local cont="Continue task: $ref - read it from the end." follow="Follow-up task: $ref"
+    local claude_resume=(claude --effort high --resume "$ID1")
+    local codex_resume=(codex resume -c 'model_reasoning_effort="high"' -C "$ROOT" "$ID2")
+
+    body() {  # body <harness> <session> <lines...>: a task, then the given lines after its body
+        local harness="$1" sid="$2"; shift 2
+        write_task "$task" "Pending" "Claude Opus 5.5" "$sid" "terea@c" "$harness"
+        printf '%s\n' "$@" >> "$task"
+    }
+
+    body claude-code "$ID1" "" "## Report" "" "Done, but blocked on X." "" "## Answer (CO)" "Do Y."
+    assert_eq "claude: '## Report' continues" "$(quoted "${claude_resume[@]}" "$cont")" "$(dry_exec "$task")"
+    assert_contains "... and the dry run says why" "continuing: a report at line" "$(cat "$D/out")"
+    body codex "$ID2" "" "## Report" "" "## Report 2" "" "more"
+    assert_eq "codex: '## Report' and '## Report 2' continue" "$(quoted "${codex_resume[@]}" "$cont")" "$(dry_exec "$task")"
+    body claude-code "$ID1" "" "## Report 2" "text"
+    assert_eq "'## Report 2' alone continues" "$(quoted "${claude_resume[@]}" "$cont")" "$(dry_exec "$task")"
+    body claude-code "$ID1" "" "## Report   " "text"
+    assert_eq "trailing blanks on the heading still count" "$(quoted "${claude_resume[@]}" "$cont")" "$(dry_exec "$task")"
+
+    body claude-code "$ID1" "" "## Why" "nothing reported yet"
+    assert_eq "claude: no report is a follow-up" "$(quoted "${claude_resume[@]}" "$follow")" "$(dry_exec "$task")"
+    assert_contains "... and the dry run says so" "a follow-up: no report" "$(cat "$D/out")"
+    body codex "$ID2" "" "## Why"
+    assert_eq "codex: no report is a follow-up" "$(quoted "${codex_resume[@]}" "$follow")" "$(dry_exec "$task")"
+    body unassigned unassigned "" "## Report" "an old report"
+    assert_eq "no session: 'Task:', report or not" "$(quoted claude --effort high "Task: $ref")" "$(dry_exec "$task")"
+
+    body claude-code "$ID1" "" "## Tests" '```' "## Report" '```'
+    assert_eq "'## Report' in a \`\`\` fence is quoted, not a report" \
+        "$(quoted "${claude_resume[@]}" "$follow")" "$(dry_exec "$task")"
+    body claude-code "$ID1" "" '~~~markdown' "## Report 2" '~~~'
+    assert_eq "... nor in a ~~~ fence with an info string" \
+        "$(quoted "${claude_resume[@]}" "$follow")" "$(dry_exec "$task")"
+    body claude-code "$ID1" "" '````' '```' "## Report" '```' '````'
+    assert_eq "... nor after a shorter run that does not close the fence" \
+        "$(quoted "${claude_resume[@]}" "$follow")" "$(dry_exec "$task")"
+    body claude-code "$ID1" "" '~~~' '```' "## Report" '~~~'
+    assert_eq "... nor after a run of the other character" \
+        "$(quoted "${claude_resume[@]}" "$follow")" "$(dry_exec "$task")"
+    body claude-code "$ID1" "" '  ```' "## Report" '   ```' "" "## Report"
+    assert_eq "an indented fence closes, and a report after it counts" \
+        "$(quoted "${claude_resume[@]}" "$cont")" "$(dry_exec "$task")"
+
+    body claude-code "$ID1" "" "## Reporting" "## Report format" "### Report" " ## Report" "## Report 2b" "**## Report**"
+    assert_eq "headings that only look like one are not a report" \
+        "$(quoted "${claude_resume[@]}" "$follow")" "$(dry_exec "$task")"
+
+    body claude-code "$ID1" "" '```' "## Report"
+    assert_eq "an unclosed fence runs to the end" "$(quoted "${claude_resume[@]}" "$follow")" "$(dry_exec "$task")"
+    assert_contains "... and says so" "never closed; nothing after it was read as a report" "$(cat "$D/err")"
+
+    body claude-code "$ID1" "" "## Report" "done"
+    local before
+    before=$(sha1sum < "$task")
+    run_dispatch "$task"
+    assert_eq "a real run execs the continuation" \
+        "claude|--effort|high|--resume|$ID1|$cont" "$(agent_argv)"
+    assert_eq "... and leaves the task file as it was" "$before" "$(sha1sum < "$task")"
+    rm -f "$LOG"
+}
+
 test1
 test2
 test3
@@ -712,14 +831,15 @@ test14
 test15
 test16
 test17
+test18
 
 echo
 echo "== behaviour -> test mapping =="
 echo "1. new task: worktree from the default branch, claude in the root ..... test1"
 echo "2. Returned task: worktree reused untouched, claude --resume ......... test2"
 echo "3. routed follow-up, new slug: new worktree, resume in the root ...... test3"
-echo "4. Codex: codex resume <id>; --agent codex for a new session ......... test4"
-echo "5. an implementer naming neither needs --agent ....................... test5"
+echo "4. Harness codex: codex resume <id>; codex for a new session ........ test4"
+echo "5. Harness decides the program; the model name is never read ........ test5"
 echo "6. --cwd moves only the agent's working directory .................... test6"
 echo "7. every non-dispatchable status is refused .......................... test7"
 echo "8. missing / malformed / duplicate Checkout is refused ............... test8"
@@ -732,6 +852,7 @@ echo "14. a submodule repo resolves to its own checkout .................... tes
 echo "15. bad session ids, bad options, GIT_DIR are refused ................ test15"
 echo "16. the agent is checked before any change ........................... test16"
 echo "17. --effort per agent; default high; unknown levels refused ......... test17"
+echo "18. a session plus a report continues; fenced headings do not ...... test18"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do
