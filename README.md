@@ -551,6 +551,98 @@ other's values, differently on each run and in both implementations. `test21` pi
 each edit must produce its own distinct assertion message -- because pinning the mechanism would only
 test the fix rather than the property.
 
+# git dispatch
+
+```
+git dispatch [--dry-run] [--agent claude|codex] [--cwd DIR] <task file>
+```
+
+Takes a task file that CO wrote, sets up that task's checkout, and execs its worker, which takes over the
+terminal. One task gets one worktree of one repo, placed beside the repo's main checkout in the **project
+root**: `rp-stack/terea@failed-call`, on branch `task/failed-call`. Several workers can then run at once,
+and CO merges their branches one at a time.
+
+```
+~/workspace/rp-stack/                 project root (a git repo itself, ignoring /*@*/)
+    terea/                            main checkout; the task file is terea/context/TASK_<name>.md
+    terea@failed-call/                the task's worktree, on task/failed-call
+```
+
+**What it reads from the task file**, only from the header (line 3 to the first blank line). The body is
+never read, because a task file that describes the format quotes a header of its own:
+
+```
+**Status: Pending**                                  line 3; only Pending or Returned is dispatched
+**Implementer: Claude Opus 5.5**                     or "gpt-6-astra (Codex)", or "unassigned"
+**Implementer Session ID: 82ea4726-...**             or "unassigned"
+**Checkout: terea@failed-call**                      <repo>@<slug>
+```
+
+`Checkout: <repo>@<slug>` names the worktree. `<repo>` is the directory name of the repo's main checkout, and
+it has to be the repo the task file is in. The worktree is `<project root>/<repo>@<slug>` on
+`task/<slug>`. The task file itself stays in the main checkout's `context/` and is only ever read. A path to
+it through any checkout resolves the same way, since the main checkout comes from the repository's common
+git dir (and, for a submodule, from its `core.worktree`).
+
+**What it runs**, in the project root:
+
+| Session ID    | Runs                                                                         |
+| :------------ | :--------------------------------------------------------------------------- |
+| `unassigned`  | `claude 'Task: terea/context/TASK_<name>.md'` (`--agent codex`: `codex '...'`)  |
+| a UUID        | `claude --resume <id> 'Follow-up task: terea/context/TASK_<name>.md'`         |
+|               | `codex resume -C <project root> <id> 'Follow-up task: ...'`                   |
+
+For a resume, the agent comes from the `Implementer` line: `Claude` or `Codex` as a whole word, exactly one
+of the two. If it names neither, the resume is refused unless `--agent` says which. If `--agent` contradicts
+it, the resume is refused, because that session belongs to the other agent. A new session starts `claude`
+unless `--agent` says otherwise. When the `Implementer` line is filled in and does not name Claude, it is
+refused rather than silently started as a Claude worker. A session ID has to be a UUID. Anything else would
+reach `claude --resume` as a picker search term, or as an option if it starts with `-`.
+
+**The checkout.** If the worktree is absent, it runs `git worktree add <root>/<repo>@<slug> -b task/<slug>
+<default branch>`. The start point is the local branch as it stands: `git config dispatch.defaultBranch` if
+set, else the branch `origin/HEAD` names, else whichever one of `main` and `master` exists. It is never
+`origin`'s copy and never the main checkout's current branch. A worktree that already exists on `task/<slug>`
+is reused exactly as it is: no rebase, no reset, no clean. It refuses, and names the cause, when:
+`task/<slug>` exists without its worktree, the branch is checked out somewhere else, the path holds
+something that is not the task's worktree, the worktree is on another branch, or it is registered but
+missing on disk.
+
+**Every check runs before the first change.** Status, header, Checkout, repo, session ID, agent on `PATH`,
+checkout state and default branch are all settled before `git worktree add`. Every refusal exits 1 and names
+the task file line or the path that was wrong (a usage error exits 2). `--dry-run` prints the same steps (the
+worktree command, the exact argv as `printf %q` would quote it, and the cwd) and changes nothing. A set
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` is refused: it would point every git command,
+the agent's included, at a repository the task file did not name.
+
+## Why every worker starts in the project root
+
+A session can be resumed only from where it can be found. Before Claude Code v2.1.223, `claude --resume
+<id>` looked only in the current directory's project and its git worktrees. When a Codex session's saved
+directory differs from the current one, Codex asks which to use. A follow-up task routed to the same worker
+usually builds in a *different* worktree, a new slug, and the old worktree is removed at merge. A worker
+started inside its worktree would have no directory to be resumed from. The project root never changes,
+so every worker is started there and resumed there. Its worktree is a subdirectory of where it started,
+and its task file is where CO wrote it.
+
+`codex resume` also gets `-C <project root>`, so that this tool, not a saved setting, picks the directory.
+Codex's documentation says `-C` takes precedence over `tui.resume_cwd`, the setting that answers its
+"which directory?" prompt. It does not say outright that `-C` also skips the prompt.
+
+**`--cwd DIR`** starts or resumes the agent in `DIR` instead. It is meant for workers started before this
+tool existed, e.g. inside `rp-stack/terea`. The worktree and the agent choice are unchanged. The message
+names the task file *from `DIR`* (`Follow-up task: context/TASK_<name>.md` from inside `terea`), or
+absolutely when the file is not under `DIR`: a path relative to a directory the agent is not in would point
+nowhere.
+
+What starting in the project root means for the agent. The project root is a git repo itself, so an agent
+that roots itself at the nearest repo roots itself where it already is. Claude Code loads the `CLAUDE.md`
+files above and in the project root at launch. A repo's own `CLAUDE.md` loads only when the agent reads a
+file under that repo. Claude's auto memory is keyed by git repository, so every worker started in the
+project root shares the project root's memory. Codex treats the nearest `.git` above the cwd as the project
+root and reads `AGENTS.md` from there down to the cwd, which here means the project root's only. Both agents
+see the super-project's git status at startup, not the worktree's.
+
 # Other resources
 
 * https://github.com/fanquake/core-review

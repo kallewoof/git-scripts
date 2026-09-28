@@ -1,0 +1,383 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Karl-Johan Alm
+# Distributed under the MIT software license, see the accompanying
+# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+
+# Usage:
+#   git dispatch [--dry-run] [--agent claude|codex] [--cwd DIR] <task file>
+#
+#   Read a task file (<project root>/<repo>/context/TASK_<name>.md), set up its checkout
+#   (<project root>/<repo>@<slug> on task/<slug>, from its 'Checkout: <repo>@<slug>' line), and
+#   exec the worker in the project root:
+#     no session id  ->  claude 'Task: <repo>/context/TASK_<name>.md'   (--agent picks codex)
+#     a session id   ->  claude --resume <id> 'Follow-up task: ...'
+#                        codex resume -C <cwd> <id> 'Follow-up task: ...'
+#                        the agent read from the 'Implementer' line (or --agent, if it names neither)
+#
+#   --dry-run    Print each step -- the worktree command, the agent's exact argv and its cwd --
+#                and change nothing.
+#   --agent A    claude or codex. Required to resume a session whose Implementer names neither.
+#   --cwd DIR    Start or resume the agent in DIR instead of the project root, for sessions
+#                started elsewhere before this tool existed. The message then names the task
+#                file relative to DIR.
+#
+# Every agent starts in the project root, because a session is found for resuming from where it
+# was started (Claude Code before v2.1.223; Codex asks when the directories differ), and the
+# project root is the one directory that outlives every task's worktree. See README.md.
+#
+# The task file is read, never written. Only a status of Pending or Returned is dispatched. An
+# existing worktree is reused exactly as it is; a task/<slug> branch without its worktree is
+# refused. Everything is checked before the first change, and every refusal exits 1 naming its
+# cause.
+#
+# The branch a new worktree starts from: git config dispatch.defaultBranch if set, else the
+# branch origin/HEAD names, else whichever one of 'main' and 'master' exists -- always the local
+# branch as it stands, never origin's copy of it.
+
+set -u
+
+SELF="git-dispatch"
+STATUSES=("Proposal" "Pending" "In Progress" "Finished" "Author Verified" "Blocked" "Returned" "Closed")
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  git dispatch [--dry-run] [--agent claude|codex] [--cwd DIR] <task file>
+                Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
+                its worker in the project root.
+  --dry-run     Print the worktree command, the agent's argv and its cwd; change nothing.
+  --agent A     claude or codex; overrides the default for a new session, and names the
+                agent to resume when the Implementer line names neither.
+  --cwd DIR     Run the agent in DIR instead of the project root (older sessions).
+EOF
+}
+
+die() {
+    echo "$SELF: $*" >&2
+    exit 1
+}
+
+usage_error() {
+    echo "$SELF: $*" >&2
+    usage
+    exit 2
+}
+
+dry_run=0 agent_opt="" cwd_opt="" task="" seen_agent=0 seen_cwd=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run) dry_run=1 ;;
+        --agent|--cwd)
+            [ "$#" -ge 2 ] || usage_error "$1 needs a value"
+            if [ "$1" = "--agent" ]; then
+                [ "$seen_agent" -eq 0 ] || usage_error "--agent given twice"
+                seen_agent=1; agent_opt=$2
+            else
+                [ "$seen_cwd" -eq 0 ] || usage_error "--cwd given twice"
+                seen_cwd=1; cwd_opt=$2
+            fi
+            shift
+            ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) usage_error "unknown option '$1'" ;;
+        *)
+            [ -z "$task" ] || usage_error "one task file, not several ('$task', '$1')"
+            task=$1
+            ;;
+    esac
+    shift
+done
+if [ "$#" -gt 0 ]; then
+    [ -z "$task" ] && [ "$#" -eq 1 ] || usage_error "one task file, not several"
+    task=$1
+fi
+[ -n "$task" ] || usage_error "no task file given"
+case "$agent_opt" in
+    ""|claude|codex) ;;
+    *) usage_error "--agent must be 'claude' or 'codex', not '$agent_opt'" ;;
+esac
+if [ "$seen_cwd" -eq 1 ] && [ -z "$cwd_opt" ]; then
+    usage_error "--cwd needs a directory"
+fi
+
+# These make every git command below, and every one the agent runs, act on a repository the task
+# file did not name. The repository comes from the task file, so a set one is refused rather than
+# quietly overridden.
+for var in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE; do
+    [ -z "${!var+set}" ] || die "$var is set ('${!var}'); the repository comes from the task file -- unset it"
+done
+
+# --- the task file --------------------------------------------------------------------------
+
+[ -f "$task" ] || die "no such task file: $task"
+[ -r "$task" ] || die "cannot read the task file: $task"
+task_base=$(basename -- "$task")
+case "$task_base" in
+    TASK_?*.md) ;;
+    *) die "$task: a task file is named TASK_<name>.md" ;;
+esac
+task_dir=$(cd -- "$(dirname -- "$task")" && pwd -P) || die "cannot enter the task file's directory"
+task_abs="$task_dir/$task_base"
+
+# The main checkout is the working tree of the repository's common git dir -- the same answer from
+# any of its worktrees. That is '<checkout>/.git' for a plain repo, but a submodule's common dir is
+# <super>/.git/modules/<name>, whose checkout only its core.worktree names (and which git 2.34's
+# 'worktree list' reports as the git dir itself).
+common=$(git -C "$task_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+    die "$task: not inside a git repository"
+[ "$(git --git-dir="$common" config --bool core.bare)" != "true" ] ||
+    die "$task: the repository ($common) is bare; a task needs a main checkout"
+if core_wt=$(git --git-dir="$common" config core.worktree); then
+    main=$(cd -- "$common" && cd -- "$core_wt" && pwd -P) ||
+        die "$task: cannot enter the main checkout ($common has core.worktree '$core_wt')"
+elif [ "$(basename -- "$common")" = ".git" ]; then
+    main=$(dirname -- "$common")
+else
+    die "$task: cannot tell the main checkout of $common (not '<checkout>/.git', no core.worktree)"
+fi
+listing=$(git -C "$main" worktree list --porcelain) || die "cannot list the worktrees of $main"
+repo=$(basename -- "$main")
+root=$(dirname -- "$main")
+
+# CO writes the task into the main checkout's context/, and the message names it there. A copy
+# elsewhere -- a worktree's own context/, say -- is a different file the worker would never see.
+[ "$main/context/$task_base" -ef "$task_abs" ] ||
+    die "$task: not the task file in the main checkout ($main/context/$task_base)"
+
+# The header is line 3 up to the first blank line. Only it is read: the body may quote the header
+# format itself (this tool's own task file does), and a 'Checkout:' found there is not the task's.
+header=()
+lineno=0
+while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    line=${line%$'\r'}
+    [ "$lineno" -lt 3 ] && continue
+    [ -z "${line//[[:space:]]/}" ] && break
+    header+=("$lineno:$line")
+done < "$task"
+[ "${#header[@]}" -gt 0 ] || die "$task: no header at line 3 (expected '**Status: ...**')"
+last=${header[${#header[@]}-1]}
+header_range="lines 3-${last%%:*}"
+
+declare -A field field_line
+for entry in "${header[@]}"; do
+    n=${entry%%:*}
+    line=${entry#*:}
+    line=${line%"${line##*[![:space:]]}"}
+    if [[ "$line" =~ ^\*\*([^*:]+):\ *(.*[^[:space:]])\ *\*\*$ ]]; then
+        key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    elif [[ "$line" =~ ^\*\*([^*:]+):\ *\*\*$ ]]; then
+        key=${BASH_REMATCH[1]} value=""
+    else
+        continue
+    fi
+    [ -z "${field[$key]+set}" ] ||
+        die "$task: line $n: a second '$key:' line (the first is line ${field_line[$key]})"
+    field[$key]=$value
+    field_line[$key]=$n
+done
+
+status_line=${header[0]#*:}
+[ "${field_line[Status]:-}" = 3 ] ||
+    die "$task: line 3 is not the status (expected '**Status: <status>**', got '$status_line')"
+status=${field[Status]}
+known=0
+for s in "${STATUSES[@]}"; do [ "$s" = "$status" ] && known=1; done
+[ "$known" -eq 1 ] || die "$task: line 3: unknown status '$status'"
+case "$status" in
+    Pending|Returned) ;;
+    *) die "$task: line 3: status is '$status'; only a Pending or Returned task is dispatched" ;;
+esac
+
+for key in "Implementer" "Implementer Session ID" "Checkout"; do
+    [ -n "${field[$key]+set}" ] ||
+        die "$task: no '**$key: ...**' line in the header ($header_range)"
+done
+implementer=${field[Implementer]}
+session=${field[Implementer Session ID]}
+checkout=${field[Checkout]}
+l_impl=${field_line[Implementer]}
+l_session=${field_line[Implementer Session ID]}
+l_checkout=${field_line[Checkout]}
+
+[[ "$checkout" =~ ^([^@]+)@([^@]+)$ ]] ||
+    die "$task: line $l_checkout: malformed Checkout '$checkout' (expected '<repo>@<slug>')"
+co_repo=${BASH_REMATCH[1]} slug=${BASH_REMATCH[2]}
+[[ "$co_repo" =~ $NAME_RE ]] ||
+    die "$task: line $l_checkout: malformed Checkout '$checkout': '$co_repo' is not a repository directory name"
+[[ "$slug" =~ $NAME_RE ]] && git check-ref-format "refs/heads/task/$slug" ||
+    die "$task: line $l_checkout: malformed Checkout '$checkout': 'task/$slug' is not a valid branch name"
+[ "$co_repo" = "$repo" ] ||
+    die "$task: line $l_checkout: Checkout names repo '$co_repo', but the task file is in '$repo' ($main)"
+
+# --- the agent ------------------------------------------------------------------------------
+
+# Which agent an Implementer line names: a Claude model or a Codex one, as a whole word. Naming
+# both, or neither, is no answer.
+implementer_agent() {
+    local lc=${1,,} claude=0 codex=0
+    [[ "$lc" =~ (^|[^a-z0-9])claude([^a-z0-9]|$) ]] && claude=1
+    [[ "$lc" =~ (^|[^a-z0-9])codex([^a-z0-9]|$) ]] && codex=1
+    if [ "$claude" -eq 1 ] && [ "$codex" -eq 0 ]; then echo claude
+    elif [ "$codex" -eq 1 ] && [ "$claude" -eq 0 ]; then echo codex
+    fi
+}
+
+named=""
+[ "$implementer" = "unassigned" ] || named=$(implementer_agent "$implementer")
+
+if [ "$session" = "unassigned" ]; then
+    resume=0
+    if [ -n "$agent_opt" ]; then
+        agent=$agent_opt
+    elif [ "$implementer" = "unassigned" ] || [ "$named" = "claude" ]; then
+        agent=claude
+    else
+        die "$task: line $l_impl: Implementer is '$implementer' but there is no session to resume;" \
+            "a new session would start claude -- say --agent claude or --agent codex"
+    fi
+else
+    resume=1
+    [ -n "$session" ] || die "$task: line $l_session: empty Implementer Session ID (write 'unassigned' for none)"
+    if [ -n "$agent_opt" ]; then
+        [ -z "$named" ] || [ "$named" = "$agent_opt" ] ||
+            die "$task: line $l_impl: Implementer '$implementer' is a $named worker; --agent $agent_opt cannot resume its session"
+        agent=$agent_opt
+    elif [ -n "$named" ]; then
+        agent=$named
+    else
+        die "$task: line $l_impl: Implementer '$implementer' names neither Claude nor Codex;" \
+            "say --agent claude or --agent codex to resume session $session"
+    fi
+    # Anything but a UUID is not handed over: 'claude --resume <text>' opens a picker searching
+    # for it, and a leading '-' would be read as an option.
+    [[ "$session" =~ $UUID_RE ]] ||
+        die "$task: line $l_session: Implementer Session ID '$session' is not a session UUID"
+fi
+command -v "$agent" > /dev/null 2>&1 || die "'$agent' is not on PATH"
+
+if [ -n "$cwd_opt" ]; then
+    [ -d "$cwd_opt" ] || die "--cwd: no such directory: $cwd_opt"
+    agent_cwd=$(cd -- "$cwd_opt" && pwd -P) || die "--cwd: cannot enter $cwd_opt"
+else
+    agent_cwd=$root
+fi
+
+# The task file as the agent will see it from where it starts: relative when it is below that
+# directory (<repo>/context/TASK_<name>.md from the project root), absolute otherwise.
+task_in_main="$main/context/$task_base"
+case "$task_in_main" in
+    "$agent_cwd"/*) task_ref=${task_in_main#"$agent_cwd"/} ;;
+    *) task_ref=$task_in_main ;;
+esac
+
+if [ "$resume" -eq 1 ]; then
+    message="Follow-up task: $task_ref"
+    if [ "$agent" = "claude" ]; then
+        argv=(claude --resume "$session" "$message")
+    else
+        # Codex asks which directory to use when a session's saved one differs from the current
+        # one. -C names the directory chosen here, and outranks a saved tui.resume_cwd answer.
+        argv=(codex resume -C "$agent_cwd" "$session" "$message")
+    fi
+else
+    message="Task: $task_ref"
+    argv=("$agent" "$message")
+fi
+
+# --- the checkout ---------------------------------------------------------------------------
+
+wt="$root/$repo@$slug"
+branch="task/$slug"
+
+# The worktree git knows at $wt, and where $branch is checked out, from the same listing.
+wt_known=0 wt_branch="" wt_prunable=0 branch_at=""
+cur_path="" cur_branch="" cur_prunable=0
+while IFS= read -r line; do
+    case "$line" in
+        "worktree "*) cur_path=${line#worktree } ;;
+        "branch "*) cur_branch=${line#branch } ;;
+        prunable|"prunable "*) cur_prunable=1 ;;
+        "")
+            if [ "$cur_path" = "$wt" ]; then
+                wt_known=1 wt_branch=$cur_branch wt_prunable=$cur_prunable
+            fi
+            [ "$cur_branch" = "refs/heads/$branch" ] && branch_at=$cur_path
+            cur_path="" cur_branch="" cur_prunable=0
+            ;;
+    esac
+done < <(printf '%s\n\n' "$listing")
+
+branch_exists=0
+git -C "$main" show-ref --verify --quiet "refs/heads/$branch" && branch_exists=1
+
+if [ "$wt_known" -eq 1 ]; then
+    [ "$wt_prunable" -eq 0 ] && [ -d "$wt" ] ||
+        die "worktree $wt is registered but missing on disk; restore it or 'git worktree prune' it"
+    if [ "$wt_branch" != "refs/heads/$branch" ]; then
+        on=${wt_branch#refs/heads/}
+        die "worktree $wt is on ${on:-a detached HEAD}, not $branch"
+    fi
+    create=0
+else
+    [ ! -e "$wt" ] && [ ! -L "$wt" ] ||
+        die "$wt exists but is not a worktree of $main"
+    [ -z "$branch_at" ] ||
+        die "branch $branch is checked out at $branch_at, not at $wt"
+    [ "$branch_exists" -eq 0 ] ||
+        die "branch $branch exists but its worktree $wt does not; refusing to guess what it holds"
+    create=1
+
+    if base=$(git -C "$main" config --get dispatch.defaultBranch); then
+        base_from="git config dispatch.defaultBranch"
+    elif origin_head=$(git -C "$main" symbolic-ref --quiet --short refs/remotes/origin/HEAD); then
+        base=${origin_head#origin/}
+        base_from="origin/HEAD"
+    else
+        candidates=()
+        for b in main master; do
+            git -C "$main" show-ref --verify --quiet "refs/heads/$b" && candidates+=("$b")
+        done
+        [ "${#candidates[@]}" -eq 1 ] ||
+            die "cannot tell $repo's default branch: no origin/HEAD, and" \
+                "${candidates[*]:-neither main nor master exists}${candidates[*]:+ both exist};" \
+                "set it with 'git -C $main config dispatch.defaultBranch <branch>'"
+        base=${candidates[0]}
+        base_from="the only one of main/master"
+    fi
+    git -C "$main" show-ref --verify --quiet "refs/heads/$base" ||
+        die "the default branch '$base' (from $base_from) has no local branch in $main"
+    add=(git -C "$main" worktree add "$wt" -b "$branch" "$base")
+fi
+
+# --- act ------------------------------------------------------------------------------------
+
+quote() {
+    local out="" a
+    for a in "$@"; do out+="${out:+ }$(printf '%q' "$a")"; done
+    printf '%s\n' "$out"
+}
+
+echo "$SELF: task $task_abs ($status, $([ "$resume" -eq 1 ] && echo "resume $session" || echo "new session"))"
+if [ "$create" -eq 1 ]; then
+    echo "$SELF: worktree: $(quote "${add[@]}")    (from $base, via $base_from)"
+else
+    echo "$SELF: worktree: reuse $wt ($branch) as it is"
+fi
+echo "$SELF: cwd: $agent_cwd"
+echo "$SELF: exec: $(quote "${argv[@]}")"
+
+if [ "$dry_run" -eq 1 ]; then
+    echo "$SELF: dry run -- nothing changed"
+    exit 0
+fi
+
+if [ "$create" -eq 1 ]; then
+    "${add[@]}" || die "git worktree add failed; the agent was not started"
+fi
+cd -- "$agent_cwd" || die "cannot enter $agent_cwd"
+exec "${argv[@]}"
