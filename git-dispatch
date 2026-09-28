@@ -5,19 +5,25 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 # Usage:
-#   git dispatch [--dry-run] [--agent claude|codex] [--cwd DIR] <task file>
+#   git dispatch [--dry-run] [--agent claude|codex] [--effort LEVEL] [--cwd DIR] <task file>
 #
 #   Read a task file (<project root>/<repo>/context/TASK_<name>.md), set up its checkout
 #   (<project root>/<repo>@<slug> on task/<slug>, from its 'Checkout: <repo>@<slug>' line), and
 #   exec the worker in the project root:
-#     no session id  ->  claude 'Task: <repo>/context/TASK_<name>.md'   (--agent picks codex)
-#     a session id   ->  claude --resume <id> 'Follow-up task: ...'
-#                        codex resume -C <cwd> <id> 'Follow-up task: ...'
+#     no session id  ->  claude --effort high 'Task: <repo>/context/TASK_<name>.md'
+#                        codex -c model_reasoning_effort="high" 'Task: ...'   (with --agent codex)
+#     a session id   ->  claude --effort high --resume <id> 'Follow-up task: ...'
+#                        codex resume -c model_reasoning_effort="high" -C <cwd> <id> 'Follow-up task: ...'
 #                        the agent read from the 'Implementer' line (or --agent, if it names neither)
 #
 #   --dry-run    Print each step -- the worktree command, the agent's exact argv and its cwd --
 #                and change nothing.
 #   --agent A    claude or codex. Required to resume a session whose Implementer names neither.
+#   --effort L   The worker's reasoning effort, on a new session and a resume alike (default:
+#                high). The worker acts on its first message at once, so the level is always
+#                passed explicitly rather than left to whatever the agent's own setting is.
+#                claude takes low, medium, high, xhigh or max; codex takes those or ultra
+#                (whether the model offers a level is the model's business).
 #   --cwd DIR    Start or resume the agent in DIR instead of the project root, for sessions
 #                started elsewhere before this tool existed. The message then names the task
 #                file relative to DIR.
@@ -41,16 +47,23 @@ SELF="git-dispatch"
 STATUSES=("Proposal" "Pending" "In Progress" "Finished" "Author Verified" "Blocked" "Returned" "Closed")
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+DEFAULT_EFFORT="high"
+# From 'claude --help' ("--effort <level> ... (low, medium, high, xhigh, max)"), and Codex's config
+# reference for model_reasoning_effort ("such as low, medium, high, xhigh, max, or ultra").
+CLAUDE_EFFORTS=(low medium high xhigh max)
+CODEX_EFFORTS=(low medium high xhigh max ultra)
 
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  git dispatch [--dry-run] [--agent claude|codex] [--cwd DIR] <task file>
+  git dispatch [--dry-run] [--agent claude|codex] [--effort LEVEL] [--cwd DIR] <task file>
                 Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
                 its worker in the project root.
   --dry-run     Print the worktree command, the agent's argv and its cwd; change nothing.
   --agent A     claude or codex; overrides the default for a new session, and names the
                 agent to resume when the Implementer line names neither.
+  --effort L    The worker's reasoning effort (default: high). claude: low, medium, high,
+                xhigh, max; codex: the same, or ultra.
   --cwd DIR     Run the agent in DIR instead of the project root (older sessions).
 EOF
 }
@@ -67,18 +80,26 @@ usage_error() {
 }
 
 dry_run=0 agent_opt="" cwd_opt="" task="" seen_agent=0 seen_cwd=0
+effort=$DEFAULT_EFFORT seen_effort=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) dry_run=1 ;;
-        --agent|--cwd)
+        --agent|--cwd|--effort)
             [ "$#" -ge 2 ] || usage_error "$1 needs a value"
-            if [ "$1" = "--agent" ]; then
-                [ "$seen_agent" -eq 0 ] || usage_error "--agent given twice"
-                seen_agent=1; agent_opt=$2
-            else
-                [ "$seen_cwd" -eq 0 ] || usage_error "--cwd given twice"
-                seen_cwd=1; cwd_opt=$2
-            fi
+            case "$1" in
+                --agent)
+                    [ "$seen_agent" -eq 0 ] || usage_error "--agent given twice"
+                    seen_agent=1; agent_opt=$2
+                    ;;
+                --cwd)
+                    [ "$seen_cwd" -eq 0 ] || usage_error "--cwd given twice"
+                    seen_cwd=1; cwd_opt=$2
+                    ;;
+                --effort)
+                    [ "$seen_effort" -eq 0 ] || usage_error "--effort given twice"
+                    seen_effort=1; effort=$2
+                    ;;
+            esac
             shift
             ;;
         -h|--help) usage; exit 0 ;;
@@ -260,6 +281,14 @@ else
 fi
 command -v "$agent" > /dev/null 2>&1 || die "'$agent' is not on PATH"
 
+# Checked against the agent that will run, not against a union: 'claude --effort ultra' is not a
+# level claude has, and a typo must not reach either agent to be rejected -- or quietly ignored.
+if [ "$agent" = "claude" ]; then efforts=("${CLAUDE_EFFORTS[@]}"); else efforts=("${CODEX_EFFORTS[@]}"); fi
+known=0
+for e in "${efforts[@]}"; do [ "$e" = "$effort" ] && known=1; done
+[ "$known" -eq 1 ] ||
+    die "--effort '$effort' is not a level $agent takes (${efforts[*]})"
+
 if [ -n "$cwd_opt" ]; then
     [ -d "$cwd_opt" ] || die "--cwd: no such directory: $cwd_opt"
     agent_cwd=$(cd -- "$cwd_opt" && pwd -P) || die "--cwd: cannot enter $cwd_opt"
@@ -275,18 +304,25 @@ case "$task_in_main" in
     *) task_ref=$task_in_main ;;
 esac
 
+# Codex has no effort flag; its -c takes a TOML value, so the level goes in as a quoted string.
+codex_effort=(-c "model_reasoning_effort=\"$effort\"")
+
 if [ "$resume" -eq 1 ]; then
     message="Follow-up task: $task_ref"
     if [ "$agent" = "claude" ]; then
-        argv=(claude --resume "$session" "$message")
+        argv=(claude --effort "$effort" --resume "$session" "$message")
     else
         # Codex asks which directory to use when a session's saved one differs from the current
         # one. -C names the directory chosen here, and outranks a saved tui.resume_cwd answer.
-        argv=(codex resume -C "$agent_cwd" "$session" "$message")
+        argv=(codex resume "${codex_effort[@]}" -C "$agent_cwd" "$session" "$message")
     fi
 else
     message="Task: $task_ref"
-    argv=("$agent" "$message")
+    if [ "$agent" = "claude" ]; then
+        argv=(claude --effort "$effort" "$message")
+    else
+        argv=(codex "${codex_effort[@]}" "$message")
+    fi
 fi
 
 # --- the checkout ---------------------------------------------------------------------------

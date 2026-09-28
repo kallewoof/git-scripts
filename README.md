@@ -554,7 +554,7 @@ test the fix rather than the property.
 # git dispatch
 
 ```
-git dispatch [--dry-run] [--agent claude|codex] [--cwd DIR] <task file>
+git dispatch [--dry-run] [--agent claude|codex] [--effort LEVEL] [--cwd DIR] <task file>
 ```
 
 Takes a task file that CO wrote, sets up that task's checkout, and execs its worker, which takes over the
@@ -586,11 +586,22 @@ git dir (and, for a submodule, from its `core.worktree`).
 
 **What it runs**, in the project root:
 
-| Session ID    | Runs                                                                         |
-| :------------ | :--------------------------------------------------------------------------- |
-| `unassigned`  | `claude 'Task: terea/context/TASK_<name>.md'` (`--agent codex`: `codex '...'`)  |
-| a UUID        | `claude --resume <id> 'Follow-up task: terea/context/TASK_<name>.md'`         |
-|               | `codex resume -C <project root> <id> 'Follow-up task: ...'`                   |
+| Session ID    | Runs                                                                                     |
+| :------------ | :--------------------------------------------------------------------------------------- |
+| `unassigned`  | `claude --effort high 'Task: terea/context/TASK_<name>.md'`                              |
+|               | `codex -c model_reasoning_effort="high" 'Task: ...'` (with `--agent codex`)             |
+| a UUID        | `claude --effort high --resume <id> 'Follow-up task: terea/context/TASK_<name>.md'`      |
+|               | `codex resume -c model_reasoning_effort="high" -C <project root> <id> 'Follow-up task: ...'` |
+
+**Effort is always passed, and defaults to `high`.** The worker acts on its message the moment it starts, so
+there is no chance to notice a session running at `max` or `low` before it has spent the task that way.
+Leaving the level to the agent's own settings would make it whatever was last configured.
+`--effort LEVEL` picks another level, for a new session and a resume alike, and it is translated per
+agent: Claude's `--effort <level>`, or Codex's `-c model_reasoning_effort="<level>"` (Codex has no flag; the
+value is a TOML string). The level is checked against the agent that will run, before any change. Claude
+takes `low`, `medium`, `high`, `xhigh`, `max` (from `claude --help`). Codex takes those or `ultra` (from
+its config reference, which adds that "available levels depend on the model"). Anything else is refused,
+including a typo, a different case, and `ultra` for Claude.
 
 For a resume, the agent comes from the `Implementer` line: `Claude` or `Codex` as a whole word, exactly one
 of the two. If it names neither, the resume is refused unless `--agent` says which. If `--agent` contradicts

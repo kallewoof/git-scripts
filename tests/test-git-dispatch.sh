@@ -217,7 +217,7 @@ test1() {
         "$(git -C "$ROOT/terea@new-thing" rev-parse HEAD 2>&1)"
     assert_eq "claude starts in the project root" "$ROOT" "$(agent_cwd)"
     assert_eq "claude gets 'Task: <repo>/context/TASK_<name>.md'" \
-        "claude|Task: terea/context/TASK_new_thing.md" "$(agent_argv)"
+        "claude|--effort|high|Task: terea/context/TASK_new_thing.md" "$(agent_argv)"
     assert_eq "the task file is untouched" "$sum" "$(sha1sum < "$task")"
     assert_eq "the main checkout is untouched" "$main_before" \
         "$(git -C "$MAIN" rev-parse HEAD; git -C "$MAIN" symbolic-ref HEAD; git -C "$MAIN" status --porcelain --ignored)"
@@ -248,7 +248,7 @@ test2() {
     assert_eq "one worktree besides main, still" "2" "$(git -C "$MAIN" worktree list | wc -l | tr -d ' ')"
     assert_eq "claude resumes in the project root" "$ROOT" "$(agent_cwd)"
     assert_eq "claude --resume <id> with the follow-up message" \
-        "claude|--resume|$ID1|Follow-up task: terea/context/TASK_back.md" "$(agent_argv)"
+        "claude|--effort|high|--resume|$ID1|Follow-up task: terea/context/TASK_back.md" "$(agent_argv)"
     assert_eq "the task file is untouched" "$sum" "$(sha1sum < "$task")"
 }
 
@@ -276,7 +276,7 @@ test3() {
         "$(git -C "$old" rev-parse HEAD) $(git -C "$old" symbolic-ref HEAD)"
     assert_eq "the resume is still in the project root" "$ROOT" "$(agent_cwd)"
     assert_eq "claude --resume <id>, follow-up message" \
-        "claude|--resume|$ID1|Follow-up task: terea/context/TASK_second.md" "$(agent_argv)"
+        "claude|--effort|high|--resume|$ID1|Follow-up task: terea/context/TASK_second.md" "$(agent_argv)"
 }
 
 # --- test 4: codex --------------------------------------------------------------------------
@@ -289,7 +289,7 @@ test4() {
     run_dispatch "$task"
     assert_eq "exits 0" "0" "$STATUS"
     assert_eq "codex resume -C <root> <id> with the follow-up message" \
-        "codex|resume|-C|$ROOT|$ID2|Follow-up task: terea/context/TASK_cx.md" "$(agent_argv)"
+        "codex|resume|-c|model_reasoning_effort=\"high\"|-C|$ROOT|$ID2|Follow-up task: terea/context/TASK_cx.md" "$(agent_argv)"
     assert_eq "codex resumes in the project root" "$ROOT" "$(agent_cwd)"
     rm -f "$LOG"
 
@@ -297,7 +297,7 @@ test4() {
     write_task "$task" "Pending" "unassigned" "unassigned" "terea@cx-new"
     run_dispatch --agent codex "$task"
     assert_eq "--agent codex, no session: codex 'Task: ...'" \
-        "codex|Task: terea/context/TASK_cx_new.md" "$(agent_argv)"
+        "codex|-c|model_reasoning_effort=\"high\"|Task: terea/context/TASK_cx_new.md" "$(agent_argv)"
     assert_eq "... in the project root" "$ROOT" "$(agent_cwd)"
     rm -f "$LOG"
 
@@ -322,7 +322,7 @@ test5() {
     write_task "$task" "Returned" "Gemini 4 Ultra" "$ID1" "terea@who"
     run_dispatch --agent claude "$task"
     assert_eq "--agent claude resumes it" \
-        "claude|--resume|$ID1|Follow-up task: terea/context/TASK_who.md" "$(agent_argv)"
+        "claude|--effort|high|--resume|$ID1|Follow-up task: terea/context/TASK_who.md" "$(agent_argv)"
     rm -f "$LOG"
 
     local t2="$MAIN/context/TASK_mismatch.md"
@@ -343,14 +343,14 @@ test6() {
     assert_eq "the worktree is still <root>/<repo>@<slug>" "refs/heads/task/old" \
         "$(git -C "$ROOT/terea@old" symbolic-ref HEAD 2>&1)"
     assert_eq "the message names the task file from DIR" \
-        "claude|--resume|$ID1|Follow-up task: context/TASK_old.md" "$(agent_argv)"
+        "claude|--effort|high|--resume|$ID1|Follow-up task: context/TASK_old.md" "$(agent_argv)"
     rm -f "$LOG"
 
     mkdir -p "$D/elsewhere"
     run_dispatch --cwd "$D/elsewhere" "$task"
     assert_eq "outside the task file's tree: runs there" "$D/elsewhere" "$(agent_cwd)"
     assert_eq "... and names the task file absolutely" \
-        "claude|--resume|$ID1|Follow-up task: $MAIN/context/TASK_old.md" "$(agent_argv)"
+        "claude|--effort|high|--resume|$ID1|Follow-up task: $MAIN/context/TASK_old.md" "$(agent_argv)"
     rm -f "$LOG"
 
     refused "--cwd naming no directory" "no such directory" --cwd "$D/nope" "$task"
@@ -468,7 +468,7 @@ test11() {
     assert_eq "a dry resume changes nothing" "$before" "$(snapshot)"
     assert_contains "... prints the reuse" "worktree: reuse $ROOT/terea@dry (task/dry) as it is" "$OUT"
     assert_contains "... and the exact argv" \
-        "exec: $(printf '%q ' codex resume -C "$MAIN" "$ID2" "Follow-up task: context/TASK_dry2.md" | sed 's/ $//')" "$OUT"
+        "exec: $(printf '%q ' codex resume -c 'model_reasoning_effort="high"' -C "$MAIN" "$ID2" "Follow-up task: context/TASK_dry2.md" | sed 's/ $//')" "$OUT"
     assert_contains "... and the cwd" "cwd: $MAIN" "$OUT"
 }
 
@@ -547,14 +547,14 @@ test13() {
     run_dispatch "$old/context/TASK_via.md"
     assert_eq "given through a worktree: dispatched" "0" "$STATUS"
     assert_eq "... the message names it in the main checkout" \
-        "claude|Task: terea/context/TASK_via.md" "$(agent_argv)"
+        "claude|--effort|high|Task: terea/context/TASK_via.md" "$(agent_argv)"
     assert_eq "... and the worktree is the task's own" "refs/heads/task/via" \
         "$(git -C "$ROOT/terea@via" symbolic-ref HEAD 2>&1)"
     rm -f "$LOG"
 
     (cd "$D" && PATH="$SAFE_PATH" AGENT_LOG="$LOG" "$SCRIPT" proj/terea/context/TASK_via.md > /dev/null 2>&1)
     assert_eq "a relative path works (the worktree now exists, so it is reused)" \
-        "claude|Task: terea/context/TASK_via.md" "$(agent_argv)"
+        "claude|--effort|high|Task: terea/context/TASK_via.md" "$(agent_argv)"
     rm -f "$LOG"
 
     local other="$ROOT/terea@copy"
@@ -598,7 +598,7 @@ test14() {
     assert_eq "the worktree is <root>/terea@sub" "refs/heads/task/sub" \
         "$(git -C "$ROOT/terea@sub" symbolic-ref HEAD 2>&1)"
     assert_eq "claude starts in the project root" "$ROOT" "$(agent_cwd)"
-    assert_eq "with the message naming terea/context" "claude|Task: terea/context/TASK_sub.md" "$(agent_argv)"
+    assert_eq "with the message naming terea/context" "claude|--effort|high|Task: terea/context/TASK_sub.md" "$(agent_argv)"
 }
 
 # --- test 15: bad input ---------------------------------------------------------------------
@@ -650,6 +650,51 @@ test16() {
     assert_eq "no worktree was made" "$before" "$(snapshot)"
 }
 
+# --- test 17: --effort ---------------------------------------------------------------------
+
+test17() {
+    begin test17 "--effort reaches either agent in its own spelling; a level the agent lacks is refused"
+    new_project t17
+    local task="$MAIN/context/TASK_eff.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@eff"
+    run_dispatch --effort xhigh "$task"
+    assert_eq "claude, new session: --effort xhigh" \
+        "claude|--effort|xhigh|Task: terea/context/TASK_eff.md" "$(agent_argv)"
+    rm -f "$LOG"
+    run_dispatch --effort max "$task"
+    assert_eq "max only when asked for" \
+        "claude|--effort|max|Task: terea/context/TASK_eff.md" "$(agent_argv)"
+    rm -f "$LOG"
+
+    local back="$MAIN/context/TASK_eff_back.md"
+    write_task "$back" "Returned" "Claude Opus 5.5" "$ID1" "terea@eff"
+    run_dispatch --effort medium "$back"
+    assert_eq "claude, resume: --effort medium" \
+        "claude|--effort|medium|--resume|$ID1|Follow-up task: terea/context/TASK_eff_back.md" "$(agent_argv)"
+    rm -f "$LOG"
+
+    local cx="$MAIN/context/TASK_eff_cx.md"
+    write_task "$cx" "Returned" "gpt-6-astra (Codex)" "$ID2" "terea@eff"
+    run_dispatch --effort ultra "$cx"
+    assert_eq "codex, resume: -c model_reasoning_effort=\"ultra\"" \
+        "codex|resume|-c|model_reasoning_effort=\"ultra\"|-C|$ROOT|$ID2|Follow-up task: terea/context/TASK_eff_cx.md" \
+        "$(agent_argv)"
+    rm -f "$LOG"
+    run_dispatch --agent codex --effort low "$task"
+    assert_eq "codex, new session: -c model_reasoning_effort=\"low\"" \
+        "codex|-c|model_reasoning_effort=\"low\"|Task: terea/context/TASK_eff.md" "$(agent_argv)"
+    rm -f "$LOG"
+
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@eff-new"
+    refused "ultra for claude" "--effort 'ultra' is not a level claude takes" --effort ultra "$task"
+    refused "a typo" "--effort 'hihg' is not a level claude takes" --effort hihg "$task"
+    refused "the wrong case" "--effort 'High' is not a level claude takes" --effort High "$task"
+    refused "a TOML-breaking level for codex" "is not a level codex takes" --agent codex --effort 'high" x' "$task"
+    refused "an empty level" "--effort '' is not a level" --effort "" "$task"
+    refused "--effort twice" "--effort given twice" --effort high --effort max "$task"
+    refused "--effort without a value" "--effort needs a value" "$task" --effort
+}
+
 test1
 test2
 test3
@@ -666,6 +711,7 @@ test13
 test14
 test15
 test16
+test17
 
 echo
 echo "== behaviour -> test mapping =="
@@ -685,6 +731,7 @@ echo "13. the task file is the main checkout's, reached any way ............ tes
 echo "14. a submodule repo resolves to its own checkout .................... test14"
 echo "15. bad session ids, bad options, GIT_DIR are refused ................ test15"
 echo "16. the agent is checked before any change ........................... test16"
+echo "17. --effort per agent; default high; unknown levels refused ......... test17"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do
