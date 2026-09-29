@@ -554,7 +554,7 @@ test the fix rather than the property.
 # git dispatch
 
 ```
-git dispatch [--dry-run] [--agent claude|codex] [--effort LEVEL] [--cwd DIR] <task file>
+git dispatch [--dry-run] [--agent claude|codex|omp] [--effort LEVEL] [--cwd DIR] <task file>
 ```
 
 Takes a task file that CO wrote, sets up that task's checkout, and execs its worker, which takes over the
@@ -573,7 +573,7 @@ never read, because a task file that describes the format quotes a header of its
 
 ```
 **Status: Pending**                                  line 3; only Pending or Returned is dispatched
-**Harness: claude-code**                             or "codex", or "unassigned"; needed to resume
+**Harness: claude-code**                             or "codex", "omp", or "unassigned"; omp cannot resume
 **Implementer Session ID: 82ea4726-...**             or "unassigned"
 **Checkout: terea@failed-call**                      <repo>@<slug>
 ```
@@ -592,6 +592,7 @@ git dir (and, for a submodule, from its `core.worktree`).
 | :------------ | :--------------------------------------------------------------------------------------- |
 | `unassigned`  | `claude --effort high 'Task: terea/context/TASK_<name>.md'`                              |
 |               | `codex -c model_reasoning_effort="high" 'Task: ...'` (with `--agent codex`)             |
+|               | `omp 'Task: ...'` (with `--agent omp` or `Harness: omp`; no effort, no resume)          |
 | a UUID        | `claude --effort high --resume <id> 'Follow-up task: terea/context/TASK_<name>.md'`      |
 |               | `codex resume -c model_reasoning_effort="high" -C <project root> <id> 'Follow-up task: ...'` |
 | a UUID + a report | the same, with `'Continue task: terea/context/TASK_<name>.md - read it from the end.'` |
@@ -618,7 +619,8 @@ agent: Claude's `--effort <level>`, or Codex's `-c model_reasoning_effort="<leve
 value is a TOML string). The level is checked against the agent that will run, before any change. Claude
 takes `low`, `medium`, `high`, `xhigh`, `max` (from `claude --help`). Codex takes those or `ultra` (from
 its config reference, which adds that "available levels depend on the model"). Anything else is refused,
-including a typo, a different case, and `ultra` for Claude.
+including a typo, a different case, and `ultra` for Claude. omp takes no effort level at all: nothing is
+passed to it, and an explicit `--effort` with omp is refused rather than silently dropped.
 
 **A session is resumed by the program that ran it, which only `Harness` says.** `claude-code` resumes with
 `claude --resume` and `codex` with `codex resume`, spelled exactly like that, with no aliases. A model name
@@ -628,7 +630,9 @@ that ran a session can resume it. So `Implementer` is never read, and `Implement
 resumed from the command line; resume it in cursor, or dispatch a new session"*. A session with no Harness
 line, or with `Harness: unassigned`, is refused, and the refusal names both fixes: add the line, or pass
 `--agent`. A task written before `Harness` existed therefore needs `--agent` once. `--agent` contradicting a
-present Harness is refused.
+present Harness is refused. omp starts a session (`omp 'Task: …'`) but git dispatch cannot resume one, so a
+session ID with `Harness: omp` is refused: resume it in omp itself, or set the ID to `unassigned` to start
+a new omp session.
 
 A new session (no session ID) starts the Harness's program if one is named, otherwise `claude`. `--agent`
 picks the program when there is no Harness, and must agree with one that is there. A session ID has to be a UUID. Anything else would reach `claude --resume` as a picker

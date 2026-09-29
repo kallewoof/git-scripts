@@ -5,13 +5,14 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 # Usage:
-#   git dispatch [--dry-run] [--agent claude|codex] [--effort LEVEL] [--cwd DIR] <task file>
+#   git dispatch [--dry-run] [--agent claude|codex|omp] [--effort LEVEL] [--cwd DIR] <task file>
 #
 #   Read a task file (<project root>/<repo>/context/TASK_<name>.md), set up its checkout
 #   (<project root>/<repo>@<slug> on task/<slug>, from its 'Checkout: <repo>@<slug>' line), and
 #   exec the worker in the project root:
 #     no session id  ->  claude --effort high 'Task: <repo>/context/TASK_<name>.md'
 #                        codex -c model_reasoning_effort="high" 'Task: ...'   (with --agent codex)
+#                        omp 'Task: ...'   (with --agent omp; no effort level, no resume)
 #     a session id   ->  claude --effort high --resume <id> 'Follow-up task: ...'
 #                        codex resume -c model_reasoning_effort="high" -C <cwd> <id> 'Follow-up task: ...'
 #                        the program named by the 'Harness' line: claude-code or codex
@@ -27,13 +28,15 @@
 #
 #   --dry-run    Print each step -- the worktree command, the agent's exact argv and its cwd --
 #                and change nothing.
-#   --agent A    claude or codex. Resumes a session whose header has no Harness line; for a new
-#                session, picks the agent (default claude). Contradicting a Harness is refused.
+#   --agent A    claude, codex or omp. Resumes a session whose header has no Harness line (omp
+#                cannot resume); for a new session, picks the agent (default claude).
+#                Contradicting a Harness is refused.
 #   --effort L   The worker's reasoning effort, on a new session and a resume alike (default:
 #                high). The worker acts on its first message at once, so the level is always
 #                passed explicitly rather than left to whatever the agent's own setting is.
 #                claude takes low, medium, high, xhigh or max; codex takes those or ultra
-#                (whether the model offers a level is the model's business).
+#                (whether the model offers a level is the model's business). omp takes none,
+#                so --effort with omp is refused rather than dropped.
 #   --cwd DIR    Start or resume the agent in DIR instead of the project root, for sessions
 #                started elsewhere before this tool existed. The message then names the task
 #                file relative to DIR.
@@ -69,14 +72,15 @@ CODEX_EFFORTS=(low medium high xhigh max ultra)
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  git dispatch [--dry-run] [--agent claude|codex] [--effort LEVEL] [--cwd DIR] <task file>
+  git dispatch [--dry-run] [--agent claude|codex|omp] [--effort LEVEL] [--cwd DIR] <task file>
                 Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
                 its worker in the project root.
   --dry-run     Print the worktree command, the agent's argv and its cwd; change nothing.
-  --agent A     claude or codex; picks a new session's agent (default claude), and names
-                the one to resume when the header has no Harness line.
+  --agent A     claude, codex or omp; picks a new session's agent (default claude), and names
+                the one to resume when the header has no Harness line (omp cannot resume).
   --effort L    The worker's reasoning effort (default: high). claude: low, medium, high,
-                xhigh, max; codex: the same, or ultra.
+                xhigh, max; codex: the same, or ultra. omp takes none; --effort with omp
+                is refused.
   --cwd DIR     Run the agent in DIR instead of the project root (older sessions).
 EOF
 }
@@ -131,8 +135,8 @@ if [ "$#" -gt 0 ]; then
 fi
 [ -n "$task" ] || usage_error "no task file given"
 case "$agent_opt" in
-    ""|claude|codex) ;;
-    *) usage_error "--agent must be 'claude' or 'codex', not '$agent_opt'" ;;
+    ""|claude|codex|omp) ;;
+    *) usage_error "--agent must be 'claude', 'codex' or 'omp', not '$agent_opt'" ;;
 esac
 if [ "$seen_cwd" -eq 1 ] && [ -z "$cwd_opt" ]; then
     usage_error "--cwd needs a directory"
@@ -248,8 +252,9 @@ co_repo=${BASH_REMATCH[1]} slug=${BASH_REMATCH[2]}
 
 # --- the agent ------------------------------------------------------------------------------
 
-# The program that ran the session, from the Harness line. Only these two can be resumed from
-# here; anything else is named and refused rather than guessed at.
+# The program that ran the session, from the Harness line. Only claude-code and codex can be
+# resumed from here (omp starts a session but cannot resume one); anything else is named and
+# refused rather than guessed at.
 harness="" harness_agent=""
 if [ -n "${field[Harness]+set}" ]; then
     harness=${field[Harness]}
@@ -257,12 +262,13 @@ if [ -n "${field[Harness]+set}" ]; then
     case "$harness" in
         claude-code) harness_agent=claude ;;
         codex) harness_agent=codex ;;
+        omp) harness_agent=omp ;;
         unassigned) harness="" ;;
         "") die "$task: line $l_harness: empty Harness (write 'unassigned' for none)" ;;
         *)
             if [ "$session" = "unassigned" ]; then
                 die "$task: line $l_harness: Harness '$harness' is not a program git dispatch starts" \
-                    "(claude-code, codex); start it in $harness, or set Harness to unassigned"
+                    "(claude-code, codex, omp); start it in $harness, or set Harness to unassigned"
             fi
             die "$task: line $l_harness: Harness '$harness' cannot be resumed from the command line;" \
                 "resume it in $harness, or dispatch a new session"
@@ -287,16 +293,26 @@ else
     [ -n "$agent" ] ||
         die "$task: line $l_session: session $session, but no program to resume it with: add" \
             "'**Harness: claude-code**' or '**Harness: codex**' to the header, or pass --agent claude|codex"
+    if [ "$agent" = "omp" ]; then
+        die "$task: line $l_session: git dispatch cannot resume an omp session; resume it in omp" \
+            "itself, or set Implementer Session ID to unassigned to start a new omp session"
+    fi
 fi
 command -v "$agent" > /dev/null 2>&1 || die "'$agent' is not on PATH"
 
 # Checked against the agent that will run, not against a union: 'claude --effort ultra' is not a
-# level claude has, and a typo must not reach either agent to be rejected -- or quietly ignored.
-if [ "$agent" = "claude" ]; then efforts=("${CLAUDE_EFFORTS[@]}"); else efforts=("${CODEX_EFFORTS[@]}"); fi
-known=0
-for e in "${efforts[@]}"; do [ "$e" = "$effort" ] && known=1; done
-[ "$known" -eq 1 ] ||
-    die "--effort '$effort' is not a level $agent takes (${efforts[*]})"
+# level claude has, and a typo must not reach any agent to be rejected -- or quietly ignored.
+# omp takes no level at all: nothing is passed, so only an explicit --effort is refused.
+if [ "$agent" = "omp" ]; then
+    [ "$seen_effort" -eq 0 ] ||
+        die "--effort '$effort' is not a level omp takes (omp takes none)"
+else
+    if [ "$agent" = "claude" ]; then efforts=("${CLAUDE_EFFORTS[@]}"); else efforts=("${CODEX_EFFORTS[@]}"); fi
+    known=0
+    for e in "${efforts[@]}"; do [ "$e" = "$effort" ] && known=1; done
+    [ "$known" -eq 1 ] ||
+        die "--effort '$effort' is not a level $agent takes (${efforts[*]})"
+fi
 
 if [ -n "$cwd_opt" ]; then
     [ -d "$cwd_opt" ] || die "--cwd: no such directory: $cwd_opt"
@@ -367,6 +383,8 @@ else
     message="Task: $task_ref"
     if [ "$agent" = "claude" ]; then
         argv=(claude --effort "$effort" "$message")
+    elif [ "$agent" = "omp" ]; then
+        argv=(omp "$message")
     else
         argv=(codex "${codex_effort[@]}" "$message")
     fi

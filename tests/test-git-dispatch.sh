@@ -5,10 +5,10 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 #
 # Test suite for git-dispatch. Builds throwaway project roots under a temp dir -- a super-project
-# holding a repo's main checkout, and sibling worktrees -- and puts fake 'claude' and 'codex' first
-# on a PATH that holds no real one: each fake records its cwd and argv to a file and exits. No test
-# starts a real agent, and nothing outside the temp dir is touched. Each test names the behaviour
-# it pins -- see the final summary for the full mapping.
+# holding a repo's main checkout, and sibling worktrees -- and puts fake 'claude', 'codex' and
+# 'omp' first on a PATH that holds no real one: each fake records its cwd and argv to a file and
+# exits. No test starts a real agent, and nothing outside the temp dir is touched. Each test names
+# the behaviour it pins -- see the final summary for the full mapping.
 #
 # A failing test also prints a pytest-shaped line at the end ('FAILED <id> - AssertionError: ...',
 # or 'ERROR <id> - ...' when git-dispatch itself died of a bash error), so that 'git mutate' can
@@ -67,7 +67,7 @@ begin() {
 
 FAKEBIN="$WORK/bin"
 mkdir -p "$FAKEBIN"
-for agent in claude codex; do
+for agent in claude codex omp; do
     cat > "$FAKEBIN/$agent" <<'EOF'
 #!/bin/bash
 {
@@ -652,7 +652,7 @@ test15() {
     refused "a session id that is a search term" "is not a session UUID" "$task"
 
     write_task "$task" "Pending" "unassigned" "unassigned" "terea@in"
-    refused "--agent bogus" "--agent must be 'claude' or 'codex'" --agent bogus "$task"
+    refused "--agent bogus" "--agent must be 'claude', 'codex' or 'omp'" --agent bogus "$task"
     refused "--agent twice" "--agent given twice" --agent claude --agent codex "$task"
     refused "--cwd twice" "--cwd given twice" --cwd "$ROOT" --cwd "$MAIN" "$task"
     refused "two task files" "one task file" "$task" "$task"
@@ -814,6 +814,40 @@ test18() {
     rm -f "$LOG"
 }
 
+# --- test 19: omp ---------------------------------------------------------------------------
+
+test19() {
+    begin test19 "omp: 'omp <message>' starts a session; it cannot resume and takes no --effort"
+    new_project t19
+    local task="$MAIN/context/TASK_pi.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@pi"
+    run_dispatch --agent omp "$task"
+    assert_eq "exits 0" "0" "$STATUS"
+    assert_eq "--agent omp, no session: omp 'Task: ...'" \
+        "omp|Task: terea/context/TASK_pi.md" "$(agent_argv)"
+    assert_eq "omp starts in the project root" "$ROOT" "$(agent_cwd)"
+    assert_eq "the worktree is <root>/terea@pi" "refs/heads/task/pi" \
+        "$(git -C "$ROOT/terea@pi" symbolic-ref HEAD 2>&1)"
+    rm -f "$LOG"
+
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@pi-harness" omp
+    run_dispatch "$task"
+    assert_eq "Harness: omp, no session: omp 'Task: ...'" \
+        "omp|Task: terea/context/TASK_pi.md" "$(agent_argv)"
+    rm -f "$LOG"
+
+    write_task "$task" "Returned" "GLM 5.3" "$ID1" "terea@pi-resume" omp
+    refused "Harness omp with a session id" "git dispatch cannot resume an omp session" "$task"
+    refused "... even with --agent omp" "git dispatch cannot resume an omp session" --agent omp "$task"
+
+    write_task "$task" "Returned" "GLM 5.3" "$ID2" "terea@pi-noharness"
+    refused "--agent omp on a Harness-less session" "git dispatch cannot resume an omp session" --agent omp "$task"
+
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@pi-effort"
+    refused "--effort with omp" "--effort 'high' is not a level omp takes" --agent omp --effort high "$task"
+    refused "... any level" "--effort 'low' is not a level omp takes" --agent omp --effort low "$task"
+}
+
 test1
 test2
 test3
@@ -832,27 +866,29 @@ test15
 test16
 test17
 test18
+test19
 
 echo
 echo "== behaviour -> test mapping =="
 echo "1. new task: worktree from the default branch, claude in the root ..... test1"
-echo "2. Returned task: worktree reused untouched, claude --resume ......... test2"
-echo "3. routed follow-up, new slug: new worktree, resume in the root ...... test3"
-echo "4. Harness codex: codex resume <id>; codex for a new session ........ test4"
-echo "5. Harness decides the program; the model name is never read ........ test5"
-echo "6. --cwd moves only the agent's working directory .................... test6"
-echo "7. every non-dispatchable status is refused .......................... test7"
-echo "8. missing / malformed / duplicate Checkout is refused ............... test8"
-echo "9. a Checkout naming another repo is refused ......................... test9"
-echo "10. branch without worktree, or a foreign worktree, is refused ....... test10"
-echo "11. --dry-run changes nothing, prints the exact argv and cwd ......... test11"
-echo "12. the default branch, as it stands locally ......................... test12"
-echo "13. the task file is the main checkout's, reached any way ............ test13"
-echo "14. a submodule repo resolves to its own checkout .................... test14"
-echo "15. bad session ids, bad options, GIT_DIR are refused ................ test15"
-echo "16. the agent is checked before any change ........................... test16"
-echo "17. --effort per agent; default high; unknown levels refused ......... test17"
-echo "18. a session plus a report continues; fenced headings do not ...... test18"
+echo "2. Returned task: worktree reused untouched, claude --resume .......... test2"
+echo "3. routed follow-up, new slug: new worktree, resume in the root ....... test3"
+echo "4. Harness codex: codex resume <id>; codex for a new session .......... test4"
+echo "5. Harness decides the program; the model name is never read .......... test5"
+echo "6. --cwd moves only the agent's working directory ..................... test6"
+echo "7. every non-dispatchable status is refused ........................... test7"
+echo "8. missing / malformed / duplicate Checkout is refused ................ test8"
+echo "9. a Checkout naming another repo is refused .......................... test9"
+echo "10. branch without worktree, or a foreign worktree, is refused ........ test10"
+echo "11. --dry-run changes nothing, prints the exact argv and cwd .......... test11"
+echo "12. the default branch, as it stands locally .......................... test12"
+echo "13. the task file is the main checkout's, reached any way ............. test13"
+echo "14. a submodule repo resolves to its own checkout ..................... test14"
+echo "15. bad session ids, bad options, GIT_DIR are refused ................. test15"
+echo "16. the agent is checked before any change ............................ test16"
+echo "17. --effort per agent; default high; unknown levels refused .......... test17"
+echo "18. a session plus a report continues; fenced headings do not ......... test18"
+echo "19. omp: 'omp <message>' starts a session; no resume, no effort ....... test19"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do
