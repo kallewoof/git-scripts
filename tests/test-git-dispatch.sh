@@ -5,9 +5,10 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 #
 # Test suite for git-dispatch. Builds throwaway project roots under a temp dir -- a super-project
-# holding a repo's main checkout, and sibling worktrees -- and puts fake 'claude', 'codex' and
-# 'omp' first on a PATH that holds no real one: each fake records its cwd and argv to a file and
-# exits. No test starts a real agent, and nothing outside the temp dir is touched. Each test names
+# holding a repo's main checkout, and sibling worktrees -- and puts fake 'claude', 'codex',
+# 'omp' and 'agent' (cursor's program) first on a PATH that holds no real one. Each fake records
+# its cwd and argv to a file and exits. No test starts a real agent, and nothing outside the temp
+# dir is touched. Each test names
 # the behaviour it pins -- see the final summary for the full mapping.
 #
 # A failing test also prints a pytest-shaped line at the end ('FAILED <id> - AssertionError: ...',
@@ -67,7 +68,7 @@ begin() {
 
 FAKEBIN="$WORK/bin"
 mkdir -p "$FAKEBIN"
-for agent in claude codex omp; do
+for agent in claude codex omp agent; do
     cat > "$FAKEBIN/$agent" <<'EOF'
 #!/bin/bash
 {
@@ -337,12 +338,12 @@ test5() {
     rm -f "$LOG"
 
     write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who"
-    refused "a session with no Harness line" "add '**Harness: claude-code**' or '**Harness: codex**'" "$task"
+    refused "a session with no Harness line" "add '**Harness: claude-code**', '**Harness: codex**' or '**Harness: cursor**'" "$task"
     write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" unassigned
     refused "a session with Harness unassigned" "no program to resume it with" "$task"
-    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" cursor
-    refused "Harness cursor" "line 6: Harness 'cursor' cannot be resumed from the command line; resume it in cursor" "$task"
-    refused "Harness cursor, even with --agent" "Harness 'cursor' cannot be resumed" --agent claude "$task"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" agy
+    refused "Harness agy" "line 6: Harness 'agy' cannot be resumed from the command line; resume it in agy" "$task"
+    refused "Harness agy, even with --agent" "Harness 'agy' cannot be resumed" --agent claude "$task"
     write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" claude
     refused "an alias is not a Harness" "Harness 'claude' cannot be resumed" "$task"
     write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" ""
@@ -367,6 +368,8 @@ test5() {
     refused "--agent contradicting the Harness" "Harness is 'claude-code'; --agent codex contradicts it" --agent codex "$t2"
     write_task "$t2" "Pending" "unassigned" "unassigned" "terea@mismatch" codex
     refused "... on a new session too" "Harness is 'codex'; --agent claude contradicts it" --agent claude "$t2"
+    write_task "$t2" "Returned" "Claude Opus 5.5" "$ID1" "terea@mismatch" cursor
+    refused "... and cursor against another agent" "Harness is 'cursor'; --agent claude contradicts it" --agent claude "$t2"
 }
 
 # --- test 6: --cwd --------------------------------------------------------------------------
@@ -652,7 +655,7 @@ test15() {
     refused "a session id that is a search term" "is not a session UUID" "$task"
 
     write_task "$task" "Pending" "unassigned" "unassigned" "terea@in"
-    refused "--agent bogus" "--agent must be 'claude', 'codex' or 'omp'" --agent bogus "$task"
+    refused "--agent bogus" "--agent must be 'claude', 'codex', 'omp' or 'cursor'" --agent bogus "$task"
     refused "--agent twice" "--agent given twice" --agent claude --agent codex "$task"
     refused "--cwd twice" "--cwd given twice" --cwd "$ROOT" --cwd "$MAIN" "$task"
     refused "two task files" "one task file" "$task" "$task"
@@ -848,6 +851,68 @@ test19() {
     refused "... any level" "--effort 'low' is not a level omp takes" --agent omp --effort low "$task"
 }
 
+# --- test 20: cursor ------------------------------------------------------------------------
+
+test20() {
+    begin test20 "cursor: 'agent <message>' starts a session; 'agent --resume <id>' continues one; no effort"
+    new_project t20
+    local task="$MAIN/context/TASK_cu.md"
+    write_task "$task" "Pending" "Claude Opus 5.5" "unassigned" "terea@cu"
+    run_dispatch --agent cursor "$task"
+    assert_eq "exits 0" "0" "$STATUS"
+    assert_eq "--agent cursor, no session: agent 'Task: ...'" \
+        "agent|Task: terea/context/TASK_cu.md" "$(agent_argv)"
+    assert_eq "agent starts in the project root" "$ROOT" "$(agent_cwd)"
+    assert_eq "the worktree is <root>/terea@cu" "refs/heads/task/cu" \
+        "$(git -C "$ROOT/terea@cu" symbolic-ref HEAD 2>&1)"
+    rm -f "$LOG"
+
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@cu-harness" cursor
+    run_dispatch "$task"
+    assert_eq "Harness: cursor, no session: agent 'Task: ...'" \
+        "agent|Task: terea/context/TASK_cu.md" "$(agent_argv)"
+    rm -f "$LOG"
+
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@cu-resume" cursor
+    run_dispatch "$task"
+    assert_eq "Harness: cursor resumes through agent --resume <id>" \
+        "agent|--resume|$ID1|Follow-up task: terea/context/TASK_cu.md" "$(agent_argv)"
+    assert_eq "the resume is in the project root" "$ROOT" "$(agent_cwd)"
+    rm -f "$LOG"
+
+    write_task "$task" "Returned" "Composer" "$ID2" "terea@cu-noharness"
+    run_dispatch --agent cursor "$task"
+    assert_eq "--agent cursor, no Harness: agent --resume <id>" \
+        "agent|--resume|$ID2|Follow-up task: terea/context/TASK_cu.md" "$(agent_argv)"
+    rm -f "$LOG"
+
+    write_task "$task" "Pending" "Claude Opus 5.5" "$ID1" "terea@cu-cont" cursor
+    printf '\n## Report\n\nDone.\n' >> "$task"
+    run_dispatch "$task"
+    assert_eq "a report continues" \
+        "agent|--resume|$ID1|Continue task: terea/context/TASK_cu.md - read it from the end." "$(agent_argv)"
+    rm -f "$LOG"
+
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@cu-effort"
+    refused "--effort with cursor" "--effort 'high' is not a level cursor takes" --agent cursor --effort high "$task"
+    refused "... any level" "--effort 'low' is not a level cursor takes" --agent cursor --effort low "$task"
+
+    local before
+    before=$(snapshot)
+    mkdir -p "$D/noagent"
+    cp "$FAKEBIN/claude" "$D/noagent/claude"
+    if PATH="$D/noagent:/usr/bin:/bin" command -v agent > /dev/null 2>&1; then
+        fail "no agent may be on the test PATH"
+        return
+    fi
+    (cd "$D" && PATH="$D/noagent:/usr/bin:/bin" AGENT_LOG="$LOG" "$SCRIPT" --agent cursor "$task") \
+        > /dev/null 2> "$D/err"
+    local status=$?
+    if [ "$status" -ne 0 ]; then ok "missing agent: exits non-zero"; else fail "missing agent: exits non-zero"; fi
+    assert_contains "missing agent: names the program" "'agent' is not on PATH" "$(cat "$D/err")"
+    assert_eq "missing agent: no worktree was made" "$before" "$(snapshot)"
+}
+
 test1
 test2
 test3
@@ -867,6 +932,7 @@ test16
 test17
 test18
 test19
+test20
 
 echo
 echo "== behaviour -> test mapping =="
@@ -889,6 +955,7 @@ echo "16. the agent is checked before any change ............................ te
 echo "17. --effort per agent; default high; unknown levels refused .......... test17"
 echo "18. a session plus a report continues; fenced headings do not ......... test18"
 echo "19. omp: 'omp <message>' starts a session; no resume, no effort ....... test19"
+echo "20. cursor: 'agent <message>'; 'agent --resume <id>'; no effort ....... test20"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do

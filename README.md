@@ -554,7 +554,7 @@ test the fix rather than the property.
 # git dispatch
 
 ```
-git dispatch [--dry-run] [--agent claude|codex|omp] [--effort LEVEL] [--cwd DIR] <task file>
+git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file>
 ```
 
 Takes a task file that CO wrote, sets up that task's checkout, and execs its worker, which takes over the
@@ -573,7 +573,7 @@ never read, because a task file that describes the format quotes a header of its
 
 ```
 **Status: Pending**                                  line 3; only Pending or Returned is dispatched
-**Harness: claude-code**                             or "codex", "omp", or "unassigned"; omp cannot resume
+**Harness: claude-code**                             or "codex", "omp", "cursor", or "unassigned"; omp cannot resume
 **Implementer Session ID: 82ea4726-...**             or "unassigned"
 **Checkout: terea@failed-call**                      <repo>@<slug>
 ```
@@ -593,8 +593,10 @@ git dir (and, for a submodule, from its `core.worktree`).
 | `unassigned`  | `claude --effort high 'Task: terea/context/TASK_<name>.md'`                              |
 |               | `codex -c model_reasoning_effort="high" 'Task: ...'` (with `--agent codex`)             |
 |               | `omp 'Task: ...'` (with `--agent omp` or `Harness: omp`; no effort, no resume)          |
+|               | `agent 'Task: ...'` (with `--agent cursor` or `Harness: cursor`; no effort)             |
 | a UUID        | `claude --effort high --resume <id> 'Follow-up task: terea/context/TASK_<name>.md'`      |
 |               | `codex resume -c model_reasoning_effort="high" -C <project root> <id> 'Follow-up task: ...'` |
+|               | `agent --resume <id> 'Follow-up task: ...'` (cursor; its program is `agent`)            |
 | a UUID + a report | the same, with `'Continue task: terea/context/TASK_<name>.md - read it from the end.'` |
 
 **Three messages, for three situations.** With no session, it is a new task for a new worker (`Task:`).
@@ -619,20 +621,23 @@ agent: Claude's `--effort <level>`, or Codex's `-c model_reasoning_effort="<leve
 value is a TOML string). The level is checked against the agent that will run, before any change. Claude
 takes `low`, `medium`, `high`, `xhigh`, `max` (from `claude --help`). Codex takes those or `ultra` (from
 its config reference, which adds that "available levels depend on the model"). Anything else is refused,
-including a typo, a different case, and `ultra` for Claude. omp takes no effort level at all: nothing is
-passed to it, and an explicit `--effort` with omp is refused rather than silently dropped.
+including a typo, a different case, and `ultra` for Claude. omp and cursor take no effort level at all:
+nothing is passed to either, and an explicit `--effort` with one of them is refused rather than silently
+dropped. Cursor's CLI has no effort flag; effort is a parameter of a model name, and the model is not
+chosen here.
 
 **A session is resumed by the program that ran it, which only `Harness` says.** `claude-code` resumes with
-`claude --resume` and `codex` with `codex resume`, spelled exactly like that, with no aliases. A model name
-does not tell you the program: Claude Opus runs in Claude Code, Cursor and agy alike, and only the program
-that ran a session can resume it. So `Implementer` is never read, and `Implementer: Claude Opus 5.5` with
-`Harness: codex` resumes with `codex`. Any other Harness (`cursor`, `agy`, …) is refused by name: *"cannot be
-resumed from the command line; resume it in cursor, or dispatch a new session"*. A session with no Harness
-line, or with `Harness: unassigned`, is refused, and the refusal names both fixes: add the line, or pass
-`--agent`. A task written before `Harness` existed therefore needs `--agent` once. `--agent` contradicting a
-present Harness is refused. omp starts a session (`omp 'Task: …'`) but git dispatch cannot resume one, so a
-session ID with `Harness: omp` is refused: resume it in omp itself, or set the ID to `unassigned` to start
-a new omp session.
+`claude --resume`, `codex` with `codex resume`, and `cursor` with `agent --resume`, spelled exactly like
+that, with no aliases. Cursor's command-line program is `agent`, so `--agent cursor` and `Harness: cursor`
+both exec `agent`. A model name does not tell you the program: Claude Opus runs in Claude Code, Cursor and
+agy alike, and only the program that ran a session can resume it. So `Implementer` is never read, and
+`Implementer: Claude Opus 5.5` with `Harness: codex` resumes with `codex`. Any other Harness (`agy`, …) is
+refused by name: *"cannot be resumed from the command line; resume it in agy, or dispatch a new session"*.
+A session with no Harness line, or with `Harness: unassigned`, is refused, and the refusal names both fixes:
+add the line, or pass `--agent`. A task written before `Harness` existed therefore needs `--agent` once.
+`--agent` contradicting a present Harness is refused. omp starts a session (`omp 'Task: …'`) but git
+dispatch cannot resume one, so a session ID with `Harness: omp` is refused: resume it in omp itself, or set
+the ID to `unassigned` to start a new omp session.
 
 A new session (no session ID) starts the Harness's program if one is named, otherwise `claude`. `--agent`
 picks the program when there is no Harness, and must agree with one that is there. A session ID has to be a UUID. Anything else would reach `claude --resume` as a picker
@@ -679,8 +684,9 @@ that roots itself at the nearest repo roots itself where it already is. Claude C
 files above and in the project root at launch. A repo's own `CLAUDE.md` loads only when the agent reads a
 file under that repo. Claude's auto memory is keyed by git repository, so every worker started in the
 project root shares the project root's memory. Codex treats the nearest `.git` above the cwd as the project
-root and reads `AGENTS.md` from there down to the cwd, which here means the project root's only. Both agents
-see the super-project's git status at startup, not the worktree's.
+root and reads `AGENTS.md` from there down to the cwd, which here means the project root's only. Cursor's
+`agent` uses the current directory as its workspace and reads `AGENTS.md` and `CLAUDE.md` at that project
+root. Each of them sees the super-project's git status at startup, not the worktree's.
 
 # Other resources
 
