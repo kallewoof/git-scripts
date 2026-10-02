@@ -913,6 +913,147 @@ test20() {
     assert_eq "missing agent: no worktree was made" "$before" "$(snapshot)"
 }
 
+# --- test 21: dispatch.root, unset and set --------------------------------------------------
+
+test21() {
+    begin test21 "dispatch.root unset: the root is dirname(main); set: worktree, cwd, absolute task path"
+    new_project t21
+    local task="$MAIN/context/TASK_plain.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@plain"
+    run_dispatch --dry-run "$task"
+    assert_eq "unset: dry-run exits 0" "0" "$STATUS"
+    assert_contains "unset: dry-run says the root is dirname(main), from the default" \
+        "root: $(dirname -- "$MAIN")    (default: the main checkout's parent)" "$OUT"
+    run_dispatch "$task"
+    assert_eq "unset: the worktree is dirname(main)/<repo>@<slug>" "refs/heads/task/plain" \
+        "$(git -C "$(dirname -- "$MAIN")/terea@plain" symbolic-ref HEAD 2>&1)"
+    assert_eq "unset: the agent starts in dirname(main)" "$(dirname -- "$MAIN")" "$(agent_cwd)"
+    rm -f "$LOG"
+
+    local phys="$D/phys"
+    mkdir -p "$phys"
+    ln -s "$phys" "$D/via-link"
+    git -C "$MAIN" config dispatch.root "$D/via-link"
+    # Comments and blank lines are not relative paths, so the key may still be set.
+    printf '# none\n\n' > "$MAIN/.git-report-deps"
+    task="$MAIN/context/TASK_set.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@set"
+    local before
+    before=$(snapshot)
+    run_dispatch --dry-run "$task"
+    assert_eq "set: dry-run exits 0" "0" "$STATUS"
+    assert_eq "set: dry-run changes nothing" "$before" "$(snapshot)"
+    assert_contains "set: dry-run names the physical root and dispatch.root" \
+        "root: $phys    (git config dispatch.root)" "$OUT"
+    assert_contains "set: dry-run's worktree command uses that root" \
+        "worktree add $phys/terea@set" "$OUT"
+    assert_contains "set: dry-run cwd is the root" "cwd: $phys" "$OUT"
+    run_dispatch "$task"
+    assert_eq "set: exits 0" "0" "$STATUS"
+    assert_contains "set: the worktree is registered at the physical root" \
+        "worktree $phys/terea@set" "$(git -C "$MAIN" worktree list --porcelain)"
+    assert_eq "set: the agent cwd is the root" "$phys" "$(agent_cwd)"
+    assert_eq "set: the task path is absolute" \
+        "claude|--effort|high|Task: $MAIN/context/TASK_set.md" "$(agent_argv)"
+}
+
+# --- test 22: dispatch.root refusals --------------------------------------------------------
+
+test22() {
+    begin test22 "a missing, nested, or dependency-breaking dispatch.root is refused before any change"
+    new_project t22
+    local task="$MAIN/context/TASK_no.md" missing="$D/no-such-root"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@no"
+    git -C "$MAIN" config dispatch.root "$missing"
+    refused "a dispatch.root that does not exist" "dispatch.root '$missing' does not exist" "$task"
+    assert_contains "missing root: says to create it or unset it" \
+        "create that directory, or unset it with 'git -C $MAIN config --unset dispatch.root'" "$ERR"
+    if [ ! -e "$missing" ]; then
+        ok "missing root: the directory was not created"
+    else
+        fail "missing root: the directory was not created"
+    fi
+
+    git -C "$MAIN" config dispatch.root "$MAIN/context"
+    refused "a dispatch.root inside the main checkout" "is inside the main checkout" "$task"
+    assert_contains "inside root: says to set one outside the checkout" "outside the checkout" "$ERR"
+
+    git -C "$MAIN" config dispatch.root "$MAIN"
+    refused "a dispatch.root that is the main checkout" "is the main checkout" "$task"
+    assert_contains "the checkout itself: says to set one outside the checkout" \
+        "outside the checkout" "$ERR"
+
+    # The config value is not a string prefix of the checkout; only the physical path is inside it.
+    ln -s "$MAIN/context" "$D/looks-outside"
+    git -C "$MAIN" config dispatch.root "$D/looks-outside"
+    refused "a dispatch.root whose physical path is inside the main checkout" \
+        "is inside the main checkout" "$task"
+
+    local ext="$D/ext"
+    mkdir -p "$ext"
+    git -C "$MAIN" config dispatch.root "$ext"
+    printf '# note\n\n../dep\n' > "$MAIN/.git-report-deps"
+    refused "a relative .git-report-deps while dispatch.root is set" "relative path ('../dep')" "$task"
+    assert_contains "relative dep: says to remove it or unset dispatch.root" \
+        "unset dispatch.root with 'git -C $MAIN config --unset dispatch.root'" "$ERR"
+    if [ ! -e "$ext/terea@no" ]; then
+        ok "relative dep: no worktree was created"
+    else
+        fail "relative dep: no worktree was created"
+    fi
+}
+
+# --- test 23: Returned, under dispatch.root -------------------------------------------------
+
+test23() {
+    begin test23 "a Returned task reuses its worktree under dispatch.root and resumes there"
+    new_project t23
+    local phys="$D/phys"
+    local wt="$phys/terea@back" task="$MAIN/context/TASK_back.md" head state_before
+    mkdir -p "$phys"
+    git -C "$MAIN" worktree add -q "$wt" -b task/back master
+    echo work > "$wt/g.txt"
+    commit_all "$wt" "worker's commit"
+    echo dirty >> "$wt/f.txt"
+    head=$(git -C "$wt" rev-parse HEAD)
+    state_before=$(git -C "$wt" status --porcelain --untracked-files=all; cat "$wt/f.txt")
+    git -C "$MAIN" config dispatch.root "$phys"
+    write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@back" claude-code
+
+    run_dispatch "$task"
+    assert_eq "exits 0" "0" "$STATUS"
+    assert_eq "the worktree's HEAD is where the worker left it" "$head" "$(git -C "$wt" rev-parse HEAD)"
+    assert_eq "its uncommitted work is untouched" "$state_before" \
+        "$(git -C "$wt" status --porcelain --untracked-files=all; cat "$wt/f.txt")"
+    assert_eq "still one worktree besides main" "2" "$(git -C "$MAIN" worktree list | wc -l | tr -d ' ')"
+    if [ ! -e "$ROOT/terea@back" ]; then
+        ok "nothing was created beside the main checkout"
+    else
+        fail "nothing was created beside the main checkout"
+    fi
+    assert_eq "the resume cwd is the configured root" "$phys" "$(agent_cwd)"
+    assert_eq "claude --resume names the task absolutely" \
+        "claude|--effort|high|--resume|$ID1|Follow-up task: $MAIN/context/TASK_back.md" "$(agent_argv)"
+}
+
+# --- test 24: --cwd still wins --------------------------------------------------------------
+
+test24() {
+    begin test24 "--cwd overrides dispatch.root as the agent's cwd; the worktree stays under the root"
+    new_project t24
+    local phys="$D/phys" alt="$D/alt" task="$MAIN/context/TASK_cwd.md"
+    mkdir -p "$phys" "$alt"
+    git -C "$MAIN" config dispatch.root "$phys"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@cwd"
+    run_dispatch --cwd "$alt" "$task"
+    assert_eq "exits 0" "0" "$STATUS"
+    assert_eq "the agent cwd is --cwd" "$(cd -- "$alt" && pwd -P)" "$(agent_cwd)"
+    assert_eq "the worktree is under dispatch.root" "refs/heads/task/cwd" \
+        "$(git -C "$phys/terea@cwd" symbolic-ref HEAD 2>&1)"
+    assert_eq "the task path is absolute from --cwd" \
+        "claude|--effort|high|Task: $MAIN/context/TASK_cwd.md" "$(agent_argv)"
+}
+
 test1
 test2
 test3
@@ -933,6 +1074,10 @@ test17
 test18
 test19
 test20
+test21
+test22
+test23
+test24
 
 echo
 echo "== behaviour -> test mapping =="
@@ -956,6 +1101,10 @@ echo "17. --effort per agent; default high; unknown levels refused .......... te
 echo "18. a session plus a report continues; fenced headings do not ......... test18"
 echo "19. omp: 'omp <message>' starts a session; no resume, no effort ....... test19"
 echo "20. cursor: 'agent <message>'; 'agent --resume <id>'; no effort ....... test20"
+echo "21. dispatch.root unset is dirname(main); set moves the worktree ..... test21"
+echo "22. a missing, nested, or dependency-breaking root is refused ......... test22"
+echo "23. a Returned task reuses the worktree under dispatch.root ........... test23"
+echo "24. --cwd overrides dispatch.root for the agent's cwd ................. test24"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do

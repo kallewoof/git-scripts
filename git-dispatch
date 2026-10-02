@@ -29,7 +29,8 @@
 #   'Implementer' line is a model name, and a model does not say which program ran it (Claude
 #   Opus from Claude Code, Cursor or agy alike), so it is never read.
 #
-#   --dry-run    Print each step -- the worktree command, the agent's exact argv and its cwd --
+#   --dry-run    Print each step -- the project root and where it came from (dispatch.root
+#                or the default), the worktree command, the agent's exact argv and its cwd --
 #                and change nothing.
 #   --agent A    claude, codex, omp or cursor. Resumes a session whose header has no Harness line
 #                (omp cannot resume); for a new session, picks the agent (default claude).
@@ -47,6 +48,12 @@
 # Every agent starts in the project root, because a session is found for resuming from where it
 # was started (Claude Code before v2.1.223; Codex asks when the directories differ), and the
 # project root is the one directory that outlives every task's worktree. See README.md.
+#
+# The project root is the directory of the main checkout, unless `git config dispatch.root`
+# names another one. That directory must already exist, and it must not be the main checkout
+# or inside it. It is also refused when .git-report-deps lists a relative path: those resolve
+# from a sibling of the main checkout, so a worktree placed elsewhere would break git report.
+# Unset, the root is that parent directory, as before. --cwd still overrides the agent's cwd.
 #
 # The task file is read, never written. Only a status of Pending or Returned is dispatched. An
 # existing worktree is reused exactly as it is; a task/<slug> branch without its worktree is
@@ -77,8 +84,9 @@ usage() {
 Usage:
   git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file>
                 Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
-                its worker in the project root.
-  --dry-run     Print the worktree command, the agent's argv and its cwd; change nothing.
+                its worker in the project root (the main checkout's parent, or dispatch.root).
+  --dry-run     Print the root and where it came from, the worktree command, the agent's
+                argv and its cwd; change nothing.
   --agent A     claude, codex, omp or cursor; picks a new session's agent (default claude), and
                 names the one to resume when the header has no Harness line (omp cannot resume).
                 cursor runs the 'agent' program.
@@ -183,7 +191,67 @@ else
 fi
 listing=$(git -C "$main" worktree list --porcelain) || die "cannot list the worktrees of $main"
 repo=$(basename -- "$main")
+# Unset, the root is the main checkout's parent and every path below is the one it has
+# always been. Set, both the worktree and the agent's cwd (unless --cwd overrides the cwd)
+# use this directory instead: a checkout that lives among unrelated repos would otherwise
+# share their parent. Resolved once, here, so a Returned task's reuse and a resume look
+# at the same place a new worktree is created.
 root=$(dirname -- "$main")
+root_from="default: the main checkout's parent"
+if root_cfg=$(git -C "$main" config --get dispatch.root); then
+    root_cfg=${root_cfg%$'\r'}
+    if [ -z "$root_cfg" ]; then
+        die "dispatch.root is empty; set it to a directory ('git -C $main config dispatch.root <dir>')" \
+            "or unset it ('git -C $main config --unset dispatch.root')"
+    fi
+    # A relative value is resolved from the main checkout, the repository the config
+    # belongs to, not from whatever directory the command was run in. Absolute or
+    # relative, the root is then the physical path.
+    if [ "${root_cfg#/}" = "$root_cfg" ]; then
+        root_candidate=$main/$root_cfg
+    else
+        root_candidate=$root_cfg
+    fi
+    if [ ! -d "$root_candidate" ]; then
+        if [ -e "$root_candidate" ] && [ ! -L "$root_candidate" ]; then
+            die "dispatch.root '$root_cfg' is not a directory; point it at a directory" \
+                "('git -C $main config dispatch.root <dir>'), or unset it" \
+                "('git -C $main config --unset dispatch.root')"
+        fi
+        die "dispatch.root '$root_cfg' does not exist; create that directory, or unset it with" \
+            "'git -C $main config --unset dispatch.root'"
+    fi
+    root=$(cd -- "$root_candidate" && pwd -P) ||
+        die "dispatch.root '$root_cfg' cannot be entered"
+    main_phys=$(cd -- "$main" && pwd -P) || die "cannot enter the main checkout ($main)"
+    if [ "$root" = "$main_phys" ]; then
+        die "dispatch.root '$root' is the main checkout; a worktree nested in its own repo pollutes it." \
+            "Set it to a directory outside the checkout ('git -C $main config dispatch.root <dir>')"
+    elif [[ "$root" == "$main_phys"/* ]]; then
+        die "dispatch.root '$root' is inside the main checkout ($main_phys); a worktree nested in its" \
+            "own repo pollutes it. Set it to a directory outside the checkout" \
+            "('git -C $main config dispatch.root <dir>')"
+    fi
+    # .git-report-deps entries are paths relative to the worktree (git-report joins each one
+    # onto it). Beside the main checkout, ../dep is the sibling the main checkout sees; under
+    # any other root it is not. Blank lines and comments, which git-report ignores, are not
+    # entries. Checked here, before any worktree is added.
+    deps_file=$main/.git-report-deps
+    if [ -f "$deps_file" ]; then
+        while IFS= read -r deps_line || [ -n "$deps_line" ]; do
+            deps_line=${deps_line%$'\r'}
+            deps_trim=${deps_line#"${deps_line%%[![:space:]]*}"}
+            deps_trim=${deps_trim%"${deps_trim##*[![:space:]]}"}
+            [ -n "$deps_trim" ] || continue
+            [ "${deps_trim:0:1}" = "#" ] && continue
+            die "dispatch.root is set ($root) but $deps_file lists a relative path ('$deps_trim');" \
+                "it resolves only from a sibling of the main checkout, so git report would break" \
+                "in the worktree. Remove that path, or unset dispatch.root with" \
+                "'git -C $main config --unset dispatch.root'"
+        done < "$deps_file"
+    fi
+    root_from="git config dispatch.root"
+fi
 
 # CO writes the task into the main checkout's context/, and the message names it there. A copy
 # elsewhere -- a worktree's own context/, say -- is a different file the worker would never see.
@@ -335,7 +403,9 @@ else
 fi
 
 # The task file as the agent will see it from where it starts: relative when it is below that
-# directory (<repo>/context/TASK_<name>.md from the project root), absolute otherwise.
+# directory (<repo>/context/TASK_<name>.md from the project root), absolute otherwise. A
+# dispatch.root that is not a parent of the main checkout, or a --cwd that is not, names the
+# file absolutely; the task file itself stays in the main checkout's context/.
 task_in_main="$main/context/$task_base"
 case "$task_in_main" in
     "$agent_cwd"/*) task_ref=${task_in_main#"$agent_cwd"/} ;;
@@ -488,6 +558,9 @@ else
     how="resume $session with $agent, a follow-up: no report"
 fi
 echo "$SELF: task $task_abs ($status, $how)"
+if [ "$dry_run" -eq 1 ]; then
+    echo "$SELF: root: $root    ($root_from)"
+fi
 if [ "$create" -eq 1 ]; then
     echo "$SELF: worktree: $(quote "${add[@]}")    (from $base, via $base_from)"
 else

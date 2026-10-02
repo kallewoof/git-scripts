@@ -568,6 +568,9 @@ and CO merges their branches one at a time.
     terea@failed-call/                the task's worktree, on task/failed-call
 ```
 
+The project root is the directory that contains the main checkout. A repo that does not sit in a
+dedicated project directory can name another one with `dispatch.root` (below).
+
 **What it reads from the task file**, only from the header (line 3 to the first blank line). The body is
 never read, because a task file that describes the format quotes a header of its own:
 
@@ -653,9 +656,10 @@ something that is not the task's worktree, the worktree is on another branch, or
 missing on disk.
 
 **Every check runs before the first change.** Status, header, Checkout, repo, session ID, agent on `PATH`,
-checkout state and default branch are all settled before `git worktree add`. Every refusal exits 1 and names
-the task file line or the path that was wrong (a usage error exits 2). `--dry-run` prints the same steps (the
-worktree command, the exact argv as `printf %q` would quote it, and the cwd) and changes nothing. A set
+`dispatch.root`, checkout state and default branch are all settled before `git worktree add`. Every refusal
+exits 1 and names the task file line or the path that was wrong (a usage error exits 2). `--dry-run` prints
+the same steps (the project root and whether it came from `dispatch.root` or the default, the worktree
+command, the exact argv as `printf %q` would quote it, and the cwd) and changes nothing. A set
 `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` is refused: it would point every git command,
 the agent's included, at a repository the task file did not name.
 
@@ -687,6 +691,35 @@ project root shares the project root's memory. Codex treats the nearest `.git` a
 root and reads `AGENTS.md` from there down to the cwd, which here means the project root's only. Cursor's
 `agent` uses the current directory as its workspace and reads `AGENTS.md` and `CLAUDE.md` at that project
 root. Each of them sees the super-project's git status at startup, not the worktree's.
+
+## `dispatch.root`
+
+Set this when the repo does not sit in a dedicated project directory. The default root is the parent
+of the main checkout, so a checkout at `~/workspace/intor` would put worktrees in `~/workspace` and
+start every worker there, next to unrelated repos. Naming a root keeps the worktrees and the workers
+in a directory of their own:
+
+```
+git -C <repo> config dispatch.root <dir>
+```
+
+`<dir>` must already exist; git dispatch does not create it. A relative `<dir>` is resolved from the
+main checkout, and the root actually used is the physical path. The worktree is then
+`<root>/<repo>@<slug>` on `task/<slug>`, and the worker starts in `<root>`. The task file stays in the
+main checkout's `context/`. When that path is not under the worker's cwd, the message names it
+absolutely. `--cwd` still chooses the cwd. With the key unset, the root is still the main checkout's
+parent: the worktree path, the worker's cwd and the message are unchanged.
+
+The root needs its own instructions file, because a worker starts there and reads that directory's
+instructions rather than the repo's. For Claude, a `CLAUDE.md` in `<dir>` should tell the worker to
+`cd` into its checkout and read the instructions there.
+
+It is refused, before anything is created, when `<dir>` does not exist, when `<dir>` is the main
+checkout or inside it (a worktree nested in its own repo pollutes the checkout), or when
+`.git-report-deps` lists a relative path. Those paths resolve from a sibling of the main checkout, so
+`git report` would break in a worktree placed somewhere else. A blank line or a comment in that file
+is not such a path. `--dry-run` prints the root it would use and whether that came from
+`dispatch.root` or the default.
 
 # Other resources
 
