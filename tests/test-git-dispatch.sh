@@ -25,6 +25,7 @@ WORK=$(cd "$WORK" && pwd -P)
 
 TESTS_RUN=0
 TESTS_FAILED=0
+SNAP_EXTRA=()
 CURRENT=""
 declare -A T_FAIL T_ERR
 ORDER=()
@@ -98,6 +99,7 @@ new_project() {
     ROOT="$D/proj"
     MAIN="$ROOT/terea"
     LOG="$D/agent.log"
+    SNAP_EXTRA=()
     mkdir -p "$ROOT"
     init_repo "$ROOT"
     printf '/*@*/\n' > "$ROOT/.gitignore"
@@ -177,6 +179,14 @@ snapshot() {
     git -C "$ROOT" status --porcelain --ignored --untracked-files=all
     (cd "$ROOT" && find . -name .git -prune -o -print | LC_ALL=C sort)
     (cd "$ROOT" && find . -name 'TASK_*' -type f -exec sha1sum {} + | LC_ALL=C sort)
+    # Directories outside the project root a test also watches (a dispatch.root, the main
+    # checkout's context/): each entry's type and link target, and every task file's bytes.
+    local x
+    for x in ${SNAP_EXTRA[@]+"${SNAP_EXTRA[@]}"}; do
+        echo "== extra $x"
+        (cd "$x" && find . -name .git -prune -o -printf '%y %p -> %l\n' | LC_ALL=C sort)
+        (cd "$x" && find . -name .git -prune -o -name 'TASK_*' -type f -exec sha1sum {} + | LC_ALL=C sort)
+    done
     [ -e "$LOG" ] && echo "AN AGENT RAN: $(agent_argv)"
     true
 }
@@ -1054,6 +1064,269 @@ test24() {
         "claude|--effort|high|Task: $MAIN/context/TASK_cwd.md" "$(agent_argv)"
 }
 
+# --- dispatch.moveTask ----------------------------------------------------------------------
+
+# A project whose dispatch.root is $D/phys (PHYS), with dispatch.moveTask true. Snapshots also
+# watch PHYS and the main checkout's context/, where the task file and its link live.
+move_project() {
+    new_project "$1"
+    PHYS="$D/phys"
+    mkdir -p "$PHYS"
+    git -C "$MAIN" config dispatch.root "$PHYS"
+    git -C "$MAIN" config dispatch.moveTask true
+    SNAP_EXTRA=("$PHYS" "$MAIN/context")
+}
+
+# What a path holds: 'link <target>', 'file <sha1>', 'other' or 'absent'.
+file_state() {
+    if [ -L "$1" ]; then
+        echo "link $(readlink -- "$1")"
+    elif [ -f "$1" ]; then
+        echo "file $(sha1sum < "$1")"
+    elif [ -e "$1" ]; then
+        echo "other"
+    else
+        echo "absent"
+    fi
+}
+
+# --- test 25: dispatch.moveTask unset -------------------------------------------------------
+
+test25() {
+    begin test25 "dispatch.moveTask unset, false, or without dispatch.root: the task file stays, the message is today's"
+    new_project t25
+    local phys="$D/phys" task="$MAIN/context/TASK_stay.md" sum
+    mkdir -p "$phys"
+    git -C "$MAIN" config dispatch.root "$phys"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@stay"
+    sum=$(sha1sum < "$task")
+    run_dispatch "$task"
+    assert_eq "unset: exits 0" "0" "$STATUS"
+    assert_eq "unset: the task file stays, a regular file, untouched" "file $sum" "$(file_state "$task")"
+    assert_eq "unset: nothing in the checkout's context/" "absent" \
+        "$(file_state "$phys/terea@stay/context/TASK_stay.md")"
+    assert_eq "unset: the message names the main checkout's file" \
+        "claude|--effort|high|Task: $MAIN/context/TASK_stay.md" "$(agent_argv)"
+    assert_eq "unset: no move, link or task file line" "" \
+        "$(grep -E '^git-dispatch: (move|link|task file):' <<< "$OUT")"
+    rm -f "$LOG"
+
+    git -C "$MAIN" config dispatch.moveTask false
+    task="$MAIN/context/TASK_off.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@off"
+    sum=$(sha1sum < "$task")
+    run_dispatch "$task"
+    assert_eq "false: the task file stays" "file $sum" "$(file_state "$task")"
+    assert_eq "false: the message names the main checkout's file" \
+        "claude|--effort|high|Task: $MAIN/context/TASK_off.md" "$(agent_argv)"
+    rm -f "$LOG"
+
+    git -C "$MAIN" config --unset dispatch.root
+    git -C "$MAIN" config dispatch.moveTask true
+    task="$MAIN/context/TASK_noroot.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@noroot"
+    sum=$(sha1sum < "$task")
+    run_dispatch "$task"
+    assert_eq "true, no dispatch.root: the task file stays" "file $sum" "$(file_state "$task")"
+    assert_eq "true, no dispatch.root: nothing in the checkout's context/" "absent" \
+        "$(file_state "$ROOT/terea@noroot/context/TASK_noroot.md")"
+    assert_eq "true, no dispatch.root: today's message" \
+        "claude|--effort|high|Task: terea/context/TASK_noroot.md" "$(agent_argv)"
+}
+
+# --- test 26: the first dispatch moves and links --------------------------------------------
+
+test26() {
+    begin test26 "dispatch.moveTask: the first dispatch moves the task into its checkout and links it back"
+    move_project t26
+    local task="$MAIN/context/TASK_mv.md" wt="$PHYS/terea@mv"
+    local dest="$PHYS/terea@mv/context/TASK_mv.md" rel="../../../phys/terea@mv/context/TASK_mv.md"
+    local sum before
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@mv"
+    sum=$(sha1sum < "$task")
+
+    before=$(snapshot)
+    run_dispatch --dry-run "$task"
+    assert_eq "dry run: exits 0" "0" "$STATUS"
+    assert_eq "dry run: nothing moved" "$before" "$(snapshot)"
+    assert_contains "dry run: prints the move" "move: $task -> $dest" "$OUT"
+    assert_contains "dry run: prints the link" "link: $task -> $rel" "$OUT"
+    assert_eq "dry run: the exec names the moved file" \
+        "$(quoted claude --effort high "Task: terea@mv/context/TASK_mv.md")" "$(dry_exec "$task")"
+
+    run_dispatch "$task"
+    assert_eq "exits 0" "0" "$STATUS"
+    assert_eq "the checkout holds the task file, byte-identical" "file $sum" "$(file_state "$dest")"
+    assert_eq "the main checkout's path is a relative link to it" "link $rel" "$(file_state "$task")"
+    if [ "$task" -ef "$dest" ]; then
+        ok "the link resolves to the checkout's file"
+    else
+        fail "the link resolves to the checkout's file"
+    fi
+    assert_eq "the worker starts in the root" "$PHYS" "$(agent_cwd)"
+    assert_eq "the message names the moved file from the root" \
+        "claude|--effort|high|Task: terea@mv/context/TASK_mv.md" "$(agent_argv)"
+    assert_eq "the moved file is ignored in the worktree" "" \
+        "$(git -C "$wt" status --porcelain --untracked-files=all)"
+    assert_eq "no temporary link is left" "TASK_mv.md" "$(ls -A "$MAIN/context")"
+    rm -f "$LOG"
+
+    # A task routed to the same checkout, which already exists: reused, and the file moves into it.
+    local task2="$MAIN/context/TASK_two.md"
+    write_task "$task2" "Pending" "unassigned" "unassigned" "terea@mv"
+    sum=$(sha1sum < "$task2")
+    run_dispatch "$task2"
+    assert_eq "an existing checkout: exits 0" "0" "$STATUS"
+    assert_eq "an existing checkout: the file moved into it" "file $sum" \
+        "$(file_state "$wt/context/TASK_two.md")"
+    assert_eq "an existing checkout: linked back" "link ../../../phys/terea@mv/context/TASK_two.md" \
+        "$(file_state "$task2")"
+    assert_eq "an existing checkout: the message names the moved file" \
+        "claude|--effort|high|Task: terea@mv/context/TASK_two.md" "$(agent_argv)"
+}
+
+# --- test 27: re-dispatching through the link -----------------------------------------------
+
+test27() {
+    begin test27 "dispatch.moveTask: a Returned task is read through its link; nothing moves"
+    move_project t27
+    local task="$MAIN/context/TASK_ret.md" wt="$PHYS/terea@ret"
+    local dest="$PHYS/terea@ret/context/TASK_ret.md" link_before dest_before
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@ret"
+    run_dispatch "$task"
+    rm -f "$LOG"
+    # The worker reported and CO returned the task, both writing the one file, in the checkout.
+    write_task "$dest" "Returned" "Claude Opus 5.5" "$ID1" "terea@ret" claude-code
+    printf '\n## Report\n\nDone.\n' >> "$dest"
+    link_before=$(file_state "$task")
+    dest_before=$(file_state "$dest")
+
+    run_dispatch "$task"
+    assert_eq "accepted: exits 0" "0" "$STATUS"
+    assert_eq "the link is unchanged" "$link_before" "$(file_state "$task")"
+    assert_eq "the checkout's file is unchanged" "$dest_before" "$(file_state "$dest")"
+    assert_eq "nothing else in either context/" "TASK_ret.md|TASK_ret.md" \
+        "$(ls -A "$MAIN/context")|$(ls -A "$wt/context")"
+    assert_contains "says it reads through the link" "task file: $MAIN/context/TASK_ret.md links to $dest" "$OUT"
+    assert_eq "resumes in the root" "$PHYS" "$(agent_cwd)"
+    assert_eq "the message continues the moved file" \
+        "claude|--effort|high|--resume|$ID1|Continue task: terea@ret/context/TASK_ret.md - read it from the end." \
+        "$(agent_argv)"
+    rm -f "$LOG"
+
+    assert_eq "--cwd in the checkout: the file is named from there" \
+        "$(quoted claude --effort high --resume "$ID1" "Continue task: context/TASK_ret.md - read it from the end.")" \
+        "$(dry_exec --cwd "$wt" "$task")"
+    assert_eq "--cwd outside the root: the file is named absolutely" \
+        "$(quoted claude --effort high --resume "$ID1" "Continue task: $dest - read it from the end.")" \
+        "$(dry_exec --cwd "$MAIN" "$task")"
+}
+
+# --- test 28: dispatch.moveTask refusals ----------------------------------------------------
+
+test28() {
+    begin test28 "dispatch.moveTask: a taken destination, a split file, a bad link, the checkout's copy are refused"
+    move_project t28
+    local task wt dest
+
+    task="$MAIN/context/TASK_d.md" wt="$PHYS/terea@d"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@d"
+    git -C "$MAIN" worktree add -q "$wt" -b task/d master
+    mkdir -p "$wt/context/TASK_d.md"
+    refused "a destination that already exists" "$wt/context/TASK_d.md: that path already exists" "$task"
+
+    task="$MAIN/context/TASK_l.md" wt="$PHYS/terea@l"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@l"
+    git -C "$MAIN" worktree add -q "$wt" -b task/l master
+    ln -s ../../proj/terea/context "$wt/context"
+    refused "a checkout whose context/ is a link" "$wt/context: not a directory of the checkout's own" "$task"
+
+    task="$MAIN/context/TASK_split.md" dest="$PHYS/terea@split/context/TASK_split.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@split"
+    run_dispatch "$task"
+    rm -f "$LOG"
+    # What sed -i does to a link: a new regular file in its place.
+    rm "$task"
+    cp "$dest" "$task"
+    echo "CO's note" >> "$task"
+    refused "a regular file in both places" "the checkout holds one too ($dest)" "$task"
+    assert_contains "both places: names the main checkout's path" "git-dispatch: $task: a regular file" "$ERR"
+
+    task="$MAIN/context/TASK_gone.md" wt="$PHYS/terea@gone" dest="$PHYS/terea@gone/context/TASK_gone.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@gone"
+    run_dispatch "$task"
+    rm -f "$LOG"
+    git -C "$MAIN" worktree remove "$wt"
+    assert_eq "git worktree remove deletes the gitignored task file, without --force" "absent" \
+        "$(file_state "$dest")"
+    refused "a dangling link" "which does not exist: the task's worktree, and the task file with it, is gone" \
+        "$task"
+
+    task="$MAIN/context/TASK_other.md" dest="$PHYS/terea@first/context/TASK_other.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@first"
+    run_dispatch "$task"
+    rm -f "$LOG"
+    sed -i 's/^\*\*Checkout: terea@first\*\*$/**Checkout: terea@second**/' "$dest"
+    refused "a link to another checkout than the Checkout line names" \
+        "not to the task's file in the checkout that line 8 names ($PHYS/terea@second/context/TASK_other.md)" "$task"
+
+    task="$MAIN/context/TASK_direct.md" dest="$PHYS/terea@direct/context/TASK_direct.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@direct"
+    run_dispatch "$task"
+    rm -f "$LOG"
+    write_task "$dest" "Returned" "Claude Opus 5.5" "$ID1" "terea@direct" claude-code
+    refused "the checkout's copy named directly" \
+        "this is a checkout's copy of the task; dispatch it by its path in the main checkout ($MAIN/context/TASK_direct.md)" \
+        "$dest"
+
+    git -C "$MAIN" config dispatch.moveTask maybe
+    task="$MAIN/context/TASK_bool.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@bool"
+    refused "a dispatch.moveTask that is not a boolean" "dispatch.moveTask: " "$task"
+}
+
+# --- test 29: no move when an earlier step refuses ------------------------------------------
+
+test29() {
+    begin test29 "dispatch.moveTask: nothing moves when an earlier step refuses"
+    move_project t29
+    local task="$MAIN/context/TASK_early.md" sum
+    write_task "$task" "Bogus" "unassigned" "unassigned" "terea@early"
+    sum=$(sha1sum < "$task")
+    refused "an unknown status" "unknown status 'Bogus'" "$task"
+    assert_eq "an unknown status: the task file is where it was" "file $sum" "$(file_state "$task")"
+
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@early"
+    git -C "$MAIN" branch -q task/early master
+    sum=$(sha1sum < "$task")
+    refused "a task branch without its worktree" "exists but its worktree" "$task"
+    assert_eq "a refused checkout: the task file is where it was" "file $sum" "$(file_state "$task")"
+
+    # 'git worktree add' itself fails, after every check: the file must not move without its checkout.
+    git -C "$MAIN" branch -q -D task/early
+    chmod a-w "$PHYS"
+    run_dispatch "$task"
+    chmod u+w "$PHYS"
+    if [ "$STATUS" -ne 0 ]; then ok "worktree add fails: exits non-zero"; else fail "worktree add fails: exits non-zero"; fi
+    assert_contains "worktree add fails: says so" "git worktree add failed" "$ERR"
+    assert_eq "worktree add fails: the task file is where it was" "file $sum" "$(file_state "$task")"
+    assert_eq "worktree add fails: no agent ran" "(not run)" "$(agent_argv)"
+
+    # The link cannot be made (context/ is read-only): it is made before the move, so nothing moves.
+    # (The failed 'git worktree add' above left its branch behind.)
+    git -C "$MAIN" branch -q -D task/early
+    chmod a-w "$MAIN/context"
+    run_dispatch "$task"
+    chmod u+w "$MAIN/context"
+    if [ "$STATUS" -ne 0 ]; then ok "no link: exits non-zero"; else fail "no link: exits non-zero"; fi
+    assert_contains "no link: says the file did not move" "the task file did not move" "$ERR"
+    assert_eq "no link: the task file is where it was" "file $sum" "$(file_state "$task")"
+    assert_eq "no link: nothing in the checkout's context/" "absent" \
+        "$(file_state "$PHYS/terea@early/context/TASK_early.md")"
+    assert_eq "no link: no temporary link is left" "TASK_early.md" "$(ls -A "$MAIN/context")"
+    assert_eq "no link: no agent ran" "(not run)" "$(agent_argv)"
+}
+
 test1
 test2
 test3
@@ -1078,6 +1351,11 @@ test21
 test22
 test23
 test24
+test25
+test26
+test27
+test28
+test29
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1105,6 +1383,11 @@ echo "21. dispatch.root unset is dirname(main); set moves the worktree ..... tes
 echo "22. a missing, nested, or dependency-breaking root is refused ......... test22"
 echo "23. a Returned task reuses the worktree under dispatch.root ........... test23"
 echo "24. --cwd overrides dispatch.root for the agent's cwd ................. test24"
+echo "25. dispatch.moveTask unset, false, or without a root: nothing moves .. test25"
+echo "26. dispatch.moveTask: the first dispatch moves the task and links it . test26"
+echo "27. dispatch.moveTask: a Returned task is read through its link ....... test27"
+echo "28. dispatch.moveTask: taken, split, bad-link, direct copy refused .... test28"
+echo "29. dispatch.moveTask: nothing moves when an earlier step refuses ..... test29"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do

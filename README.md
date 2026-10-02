@@ -585,7 +585,8 @@ never read, because a task file that describes the format quotes a header of its
 
 `Checkout: <repo>@<slug>` names the worktree. `<repo>` is the directory name of the repo's main checkout, and
 it has to be the repo the task file is in. The worktree is `<project root>/<repo>@<slug>` on
-`task/<slug>`. The task file itself stays in the main checkout's `context/` and is only ever read. A path to
+`task/<slug>`. The task file itself stays in the main checkout's `context/` and is only ever read, unless
+`dispatch.moveTask` moves it into the checkout (below). A path to
 it through any checkout resolves the same way, since the main checkout comes from the repository's common
 git dir (and, for a submodule, from its `core.worktree`).
 
@@ -706,8 +707,8 @@ git -C <repo> config dispatch.root <dir>
 `<dir>` must already exist; git dispatch does not create it. A relative `<dir>` is resolved from the
 main checkout, and the root actually used is the physical path. The worktree is then
 `<root>/<repo>@<slug>` on `task/<slug>`, and the worker starts in `<root>`. The task file stays in the
-main checkout's `context/`. When that path is not under the worker's cwd, the message names it
-absolutely. `--cwd` still chooses the cwd. With the key unset, the root is still the main checkout's
+main checkout's `context/` (unless `dispatch.moveTask` moves it, below). When that path is not under the
+worker's cwd, the message names it absolutely. `--cwd` still chooses the cwd. With the key unset, the root is still the main checkout's
 parent: the worktree path, the worker's cwd and the message are unchanged.
 
 The root needs its own instructions file, because a worker starts there and reads that directory's
@@ -720,6 +721,44 @@ checkout or inside it (a worktree nested in its own repo pollutes the checkout),
 `git report` would break in a worktree placed somewhere else. A blank line or a comment in that file
 is not such a path. `--dry-run` prints the root it would use and whether that came from
 `dispatch.root` or the default.
+
+## `dispatch.moveTask`
+
+```
+git -C <repo> config dispatch.moveTask true
+```
+
+With `dispatch.root` set, the task file is usually not below the worker's cwd, so the message names it
+absolutely. A worker then goes into the main checkout to read it, and the absolute path
+carries the username into whatever the worker quotes. With this key set, the first dispatch **moves** the
+task file into its checkout, to `<root>/<repo>@<slug>/context/TASK_<name>.md`, and leaves a **relative**
+symlink at the original path. The message names the moved file from the root (`Task:
+<repo>@<slug>/context/TASK_<name>.md`), and so do `Follow-up task:` and `Continue task:`. The worker never
+leaves the root or its worktree. There is still one file: CO reads and edits it through the link, `ls
+context/TASK_*.md` still lists it, and `context/TASK_*` is gitignored in the worktree just as in the main
+checkout. The worker is still started in the root. Unset, `false`, or with `dispatch.root` unset, nothing
+moves and nothing differs.
+
+The task is always dispatched by its main-checkout path (`git dispatch context/TASK_<name>.md`). A regular
+file there is moved, once its worktree exists. The link is made first, under a temporary name; then the file
+is renamed into the checkout and the link renamed over the path it left, so one of the two paths holds the
+file at every moment. If the link cannot be made, nothing moves. A link there is a task moved before (a
+`Returned` re-dispatch, say): it is read through, and nothing moves. These are refused before any change:
+a link that points anywhere other than the copy in the checkout its `Checkout:` line names; a dangling link
+(the worktree, and the task file with it, is gone); a regular file in the main checkout while the checkout
+holds one too (the channel has split, and both paths are named); a destination that already exists, or a
+checkout `context/` that is a link; and the checkout's copy named directly. `--dry-run` prints the move and
+the link (`from -> to`) and changes nothing.
+
+* **⚠ `git worktree remove` deletes the task file without a warning.** The file is gitignored, so git does
+  not count it as untracked, and no `--force` is needed. The link is left dangling. **Archive the task file
+  before removing the worktree.**
+* **⚠ Archiving with `mv` on the link moves the link, not the file.** A `git add` then commits a symlink
+  into a worktree. Move the link's target (`realpath context/TASK_<name>.md`) to the archive, then delete
+  the link.
+* **⚠ `sed -i` and other writers that replace the file turn the link into a copy,** and split the channel
+  in two. Edit the target, or use an editor that writes in place. (Claude Code's Edit and Write refuse to
+  write through a link, and say so.)
 
 # Other resources
 

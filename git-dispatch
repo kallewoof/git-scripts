@@ -30,8 +30,8 @@
 #   Opus from Claude Code, Cursor or agy alike), so it is never read.
 #
 #   --dry-run    Print each step -- the project root and where it came from (dispatch.root
-#                or the default), the worktree command, the agent's exact argv and its cwd --
-#                and change nothing.
+#                or the default), the worktree command, the task file's move and link (with
+#                dispatch.moveTask), the agent's exact argv and its cwd -- and change nothing.
 #   --agent A    claude, codex, omp or cursor. Resumes a session whose header has no Harness line
 #                (omp cannot resume); for a new session, picks the agent (default claude).
 #                cursor runs the 'agent' program. Contradicting a Harness is refused.
@@ -55,7 +55,16 @@
 # from a sibling of the main checkout, so a worktree placed elsewhere would break git report.
 # Unset, the root is that parent directory, as before. --cwd still overrides the agent's cwd.
 #
-# The task file is read, never written. Only a status of Pending or Returned is dispatched. An
+# With dispatch.root set and `git config dispatch.moveTask true`, the task file moves into its
+# checkout: the first dispatch moves <main>/context/TASK_<name>.md to <root>/<repo>@<slug>/context/
+# and leaves a relative symlink at the original path, and the message names the moved file
+# (<repo>@<slug>/context/TASK_<name>.md from the root). A later dispatch names the same main-checkout
+# path and reads through the link; nothing moves again. A link that points anywhere else or
+# dangles, a regular file in both places, a destination that already exists, or the checkout's copy
+# named directly, is refused before any change. Unset, false, or without dispatch.root, the task
+# file stays where it is and nothing below differs.
+#
+# The task file is otherwise read, never written. Only a status of Pending or Returned is dispatched. An
 # existing worktree is reused exactly as it is; a task/<slug> branch without its worktree is
 # refused. Everything is checked before the first change, and every refusal exits 1 naming its
 # cause.
@@ -163,8 +172,21 @@ done
 
 # --- the task file --------------------------------------------------------------------------
 
-[ -f "$task" ] || die "no such task file: $task"
-[ -r "$task" ] || die "cannot read the task file: $task"
+# dispatch.moveTask (with dispatch.root, which it needs) as the task's repository sets it.
+move_task_set() {
+    [ "$(git -C "$1" config --get --bool dispatch.moveTask 2>/dev/null)" = "true" ] &&
+        git -C "$1" config --get dispatch.root > /dev/null 2>&1
+}
+
+# A dangling link is a moved task whose checkout is gone. That is said once the repository is
+# known, below; without dispatch.moveTask it is a missing file, as it always was.
+task_dangling=0
+if [ ! -e "$task" ] && [ -L "$task" ] && move_task_set "$(dirname -- "$task")"; then
+    task_dangling=1
+else
+    [ -f "$task" ] || die "no such task file: $task"
+    [ -r "$task" ] || die "cannot read the task file: $task"
+fi
 task_base=$(basename -- "$task")
 case "$task_base" in
     TASK_?*.md) ;;
@@ -253,10 +275,45 @@ if root_cfg=$(git -C "$main" config --get dispatch.root); then
     root_from="git config dispatch.root"
 fi
 
+# dispatch.moveTask is read only under dispatch.root: the move exists so that a task outside the
+# root is not named absolutely. Unset, the task file stays where it is.
+move_task=0
+if [ "$root_from" = "git config dispatch.root" ]; then
+    move_cfg=$(git -C "$main" config --get --bool dispatch.moveTask 2>&1)
+    case $? in
+        0) [ "$move_cfg" = "true" ] && move_task=1 ;;
+        1) ;;
+        *) die "dispatch.moveTask: $move_cfg; set it to true or false, or unset it" \
+               "('git -C $main config --unset dispatch.moveTask')" ;;
+    esac
+fi
+
 # CO writes the task into the main checkout's context/, and the message names it there. A copy
 # elsewhere -- a worktree's own context/, say -- is a different file the worker would never see.
-[ "$main/context/$task_base" -ef "$task_abs" ] ||
-    die "$task: not the task file in the main checkout ($main/context/$task_base)"
+# With dispatch.moveTask the task is always named by that path, even once it has moved: the file
+# in the checkout is reached through the link, never named directly, so one entry point keeps
+# one rule.
+if [ "$move_task" -eq 1 ]; then
+    main_ctx=$(cd -- "$main/context" 2> /dev/null && pwd -P) ||
+        die "$task: not the task file in the main checkout ($main/context/$task_base)"
+    task_main="$main_ctx/$task_base"
+    if [ "$task_dir" != "$main_ctx" ]; then
+        case "$task_dir" in
+            "$root/$repo@"*/context)
+                die "$task: this is a checkout's copy of the task; dispatch it by its path in the" \
+                    "main checkout ($main/context/$task_base)" ;;
+        esac
+        die "$task: not the task file in the main checkout ($main/context/$task_base)"
+    fi
+    if [ "$task_dangling" -eq 1 ]; then
+        die "$task: a link to '$(readlink -- "$task_main")', which does not exist: the task's" \
+            "worktree, and the task file with it, is gone"
+    fi
+else
+    [ "$task_dangling" -eq 0 ] || die "no such task file: $task"
+    [ "$main/context/$task_base" -ef "$task_abs" ] ||
+        die "$task: not the task file in the main checkout ($main/context/$task_base)"
+fi
 
 # The header is line 3 up to the first blank line. Only it is read: the body may quote the header
 # format itself (this tool's own task file does), and a 'Checkout:' found there is not the task's.
@@ -405,11 +462,18 @@ fi
 # The task file as the agent will see it from where it starts: relative when it is below that
 # directory (<repo>/context/TASK_<name>.md from the project root), absolute otherwise. A
 # dispatch.root that is not a parent of the main checkout, or a --cwd that is not, names the
-# file absolutely; the task file itself stays in the main checkout's context/.
+# file absolutely; the task file itself stays in the main checkout's context/. With
+# dispatch.moveTask the file the agent is given is the one in its checkout
+# (<repo>@<slug>/context/TASK_<name>.md from the root), whether it moves now or moved before.
 task_in_main="$main/context/$task_base"
-case "$task_in_main" in
-    "$agent_cwd"/*) task_ref=${task_in_main#"$agent_cwd"/} ;;
-    *) task_ref=$task_in_main ;;
+task_given=$task_in_main
+if [ "$move_task" -eq 1 ]; then
+    task_dest="$root/$repo@$slug/context/$task_base"
+    task_given=$task_dest
+fi
+case "$task_given" in
+    "$agent_cwd"/*) task_ref=${task_given#"$agent_cwd"/} ;;
+    *) task_ref=$task_given ;;
 esac
 
 # A worker's report means it already worked this task: a Blocked task CO answered and set back to
@@ -542,6 +606,47 @@ else
     add=(git -C "$main" worktree add "$wt" -b "$branch" "$base")
 fi
 
+# --- the task file's move -------------------------------------------------------------------
+
+# Relative path from directory $1 to path $2, both absolute and physical.
+relpath() {
+    local base=$1 target=$2 up=""
+    while [ "$base" != "/" ] && [ "${target#"$base"/}" = "$target" ]; do
+        base=$(dirname -- "$base")
+        up+="../"
+    done
+    if [ "$base" = "/" ]; then
+        printf '%s\n' "$up${target#/}"
+    else
+        printf '%s\n' "$up${target#"$base"/}"
+    fi
+}
+
+# A link in the main checkout is a task moved before: it must lead to the copy in the checkout
+# the Checkout line names, and that copy must be a file of its own. A regular file is moved now,
+# into a context/ that is the checkout's own directory, onto a path that holds nothing. A file in
+# both places is the channel split in two -- a writer that replaces files (sed -i) turned the link
+# into a copy -- and which half is current is not this tool's to guess.
+move=0 link_target=""
+if [ "$move_task" -eq 1 ]; then
+    if [ -L "$task_main" ]; then
+        [ -f "$task_dest" ] && [ ! -L "$task_dest" ] && [ "$task_main" -ef "$task_dest" ] ||
+            die "$task: a link to '$(readlink -- "$task_main")', not to the task's file in the checkout" \
+                "that line $l_checkout names ($task_dest); point it there, or restore the file"
+    elif [ -L "$wt/context" ] || { [ -e "$wt/context" ] && [ ! -d "$wt/context" ]; }; then
+        die "$task: cannot move the task file into $wt/context: not a directory of the checkout's own"
+    elif [ -f "$task_dest" ] && [ ! -L "$task_dest" ]; then
+        die "$task: a regular file, and the checkout holds one too ($task_dest): the link was replaced" \
+            "with a copy, and the task now has two files. Keep the current one at $task_dest and put" \
+            "the link back ('ln -sf $(relpath "$main_ctx" "$task_dest") $task_main')"
+    elif [ -e "$task_dest" ] || [ -L "$task_dest" ]; then
+        die "$task: cannot move the task file to $task_dest: that path already exists"
+    else
+        move=1
+        link_target=$(relpath "$main_ctx" "$task_dest")
+    fi
+fi
+
 # --- act ------------------------------------------------------------------------------------
 
 quote() {
@@ -566,6 +671,12 @@ if [ "$create" -eq 1 ]; then
 else
     echo "$SELF: worktree: reuse $wt ($branch) as it is"
 fi
+if [ "$move" -eq 1 ]; then
+    echo "$SELF: move: $task_main -> $task_dest"
+    echo "$SELF: link: $task_main -> $link_target"
+elif [ "$move_task" -eq 1 ]; then
+    echo "$SELF: task file: $task_main links to $task_dest; nothing moves"
+fi
 echo "$SELF: cwd: $agent_cwd"
 echo "$SELF: exec: $(quote "${argv[@]}")"
 
@@ -576,6 +687,32 @@ fi
 
 if [ "$create" -eq 1 ]; then
     "${add[@]}" || die "git worktree add failed; the agent was not started"
+fi
+# The link is made first, under a temporary name beside the task file, so that the one step that
+# can fail for want of a link fails before anything moves. Then the file is renamed into the
+# checkout, and the link renamed over the path it left. At every moment one of the two paths
+# holds the file: the main path until the first rename, the checkout's path from then on. Between
+# the two renames the main path is briefly empty. Should the second rename fail, the file is moved
+# back; should that fail too, where everything is left is said.
+if [ "$move" -eq 1 ]; then
+    tmp_link="$main_ctx/.$task_base.dispatch-link.$$"
+    mkdir -p -- "$wt/context" ||
+        die "cannot create $wt/context; the task file did not move, and the agent was not started"
+    ln -s -- "$link_target" "$tmp_link" ||
+        die "cannot create a link in $main_ctx; the task file did not move, and the agent was not started"
+    if ! mv -- "$task_main" "$task_dest"; then
+        rm -f -- "$tmp_link"
+        die "cannot move $task_main to $task_dest; it is still where it was, and the agent was not started"
+    fi
+    if ! mv -- "$tmp_link" "$task_main"; then
+        if mv -- "$task_dest" "$task_main"; then
+            rm -f -- "$tmp_link"
+            die "cannot put the link at $task_main; the task file was moved back there, and the agent" \
+                "was not started"
+        fi
+        die "cannot put the link at $task_main, nor move the task file back: it is at $task_dest, and" \
+            "the link is at $tmp_link. Rename the link ('mv $tmp_link $task_main'); the agent was not started"
+    fi
 fi
 cd -- "$agent_cwd" || die "cannot enter $agent_cwd"
 exec "${argv[@]}"
