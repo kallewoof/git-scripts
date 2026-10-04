@@ -5,7 +5,7 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 # Usage:
-#   git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file>
+#   git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
 #
 #   Read a task file (<project root>/<repo>/context/TASK_<name>.md), set up its checkout
 #   (<project root>/<repo>@<slug> on task/<slug>, from its 'Checkout: <repo>@<slug>' line), and
@@ -44,6 +44,11 @@
 #   --cwd DIR    Start or resume the agent in DIR instead of the project root, for sessions
 #                started elsewhere before this tool existed. The message then names the task
 #                file relative to DIR.
+#   -- <args...> After the task file, pass arguments verbatim to the agent after dispatch's
+#                flags (including --resume <id>) and before positional arguments. For codex
+#                resume, they go after -C <cwd> and before <session>. For example:
+#                  git dispatch context/TASK_x.md -- --sandbox danger-full-access
+#                A -- before the task still ends dispatch's options; a second -- passes args.
 #
 # Every agent starts in the project root, because a session is found for resuming from where it
 # was started (Claude Code before v2.1.223; Codex asks when the directories differ), and the
@@ -91,7 +96,7 @@ CODEX_EFFORTS=(low medium high xhigh max ultra)
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file>
+  git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
                 Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
                 its worker in the project root (the main checkout's parent, or dispatch.root).
   --dry-run     Print the root and where it came from, the worktree command, the agent's
@@ -103,6 +108,11 @@ Usage:
                 xhigh, max; codex: the same, or ultra. omp and cursor take none; --effort
                 with either is refused.
   --cwd DIR     Run the agent in DIR instead of the project root (older sessions).
+  -- <args...>  After the task, pass arguments unchanged after the agent's flags and before
+                positional arguments (for codex resume: after -C <cwd>, before <session>).
+                A -- before the task ends dispatch's options; use another -- for agent args.
+                Example (a Codex task):
+                  git dispatch context/TASK_x.md -- --sandbox danger-full-access
 EOF
 }
 
@@ -119,6 +129,7 @@ usage_error() {
 
 dry_run=0 agent_opt="" cwd_opt="" task="" seen_agent=0 seen_cwd=0
 effort=$DEFAULT_EFFORT seen_effort=0
+agent_args=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) dry_run=1 ;;
@@ -141,7 +152,17 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         -h|--help) usage; exit 0 ;;
-        --) shift; break ;;
+        --)
+            shift
+            if [ -z "$task" ] && [ "$#" -gt 0 ]; then
+                task=$1
+                shift
+                [ "$#" -eq 0 ] || [ "$1" = "--" ] || usage_error "one task file, not several"
+                [ "$#" -eq 0 ] || shift
+            fi
+            agent_args=("$@")
+            break
+            ;;
         -*) usage_error "unknown option '$1'" ;;
         *)
             [ -z "$task" ] || usage_error "one task file, not several ('$task', '$1')"
@@ -150,10 +171,6 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
-if [ "$#" -gt 0 ]; then
-    [ -z "$task" ] && [ "$#" -eq 1 ] || usage_error "one task file, not several"
-    task=$1
-fi
 [ -n "$task" ] || usage_error "no task file given"
 case "$agent_opt" in
     ""|claude|codex|omp|cursor) ;;
@@ -520,24 +537,24 @@ if [ "$resume" -eq 1 ]; then
         message="Follow-up task: $task_ref"
     fi
     if [ "$agent" = "claude" ]; then
-        argv=(claude --effort "$effort" --resume "$session" "$message")
+        argv=(claude --effort "$effort" --resume "$session" "${agent_args[@]}" "$message")
     elif [ "$agent" = "cursor" ]; then
         # --resume takes the chat id; the message is the prompt. The workspace is the current
         # directory, which is where this exec starts, so no --workspace is passed.
-        argv=("$agent_bin" --resume "$session" "$message")
+        argv=("$agent_bin" --resume "$session" "${agent_args[@]}" "$message")
     else
         # Codex asks which directory to use when a session's saved one differs from the current
         # one. -C names the directory chosen here, and outranks a saved tui.resume_cwd answer.
-        argv=(codex resume "${codex_effort[@]}" -C "$agent_cwd" "$session" "$message")
+        argv=(codex resume "${codex_effort[@]}" -C "$agent_cwd" "${agent_args[@]}" "$session" "$message")
     fi
 else
     message="Task: $task_ref"
     if [ "$agent" = "claude" ]; then
-        argv=(claude --effort "$effort" "$message")
+        argv=(claude --effort "$effort" "${agent_args[@]}" "$message")
     elif [ "$agent" = "omp" ] || [ "$agent" = "cursor" ]; then
-        argv=("$agent_bin" "$message")
+        argv=("$agent_bin" "${agent_args[@]}" "$message")
     else
-        argv=(codex "${codex_effort[@]}" "$message")
+        argv=(codex "${codex_effort[@]}" "${agent_args[@]}" "$message")
     fi
 fi
 

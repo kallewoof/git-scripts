@@ -554,8 +554,26 @@ test the fix rather than the property.
 # git dispatch
 
 ```
-git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file>
+git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
 ```
+
+Everything after a `--` following the task file goes verbatim to the agent program. For a task whose
+Harness is Codex:
+
+```sh
+git dispatch context/TASK_x.md -- --sandbox danger-full-access
+```
+
+The arguments follow dispatch's own agent flags and precede the positional arguments. On a Codex
+resume, they go after `-C <cwd>` and before `<session>`. Claude and Cursor keep `--resume <id>` together,
+then receive the extra arguments before the prompt. omp receives them before the message; dispatch
+still does not support omp resumes. Arguments remain an array: spaces, quotes, order and duplicates
+are preserved, with no parsing or validation by dispatch. The normal `exec:` line and `--dry-run` show
+them with the same shell quoting as the rest of the command.
+
+`git dispatch -- <task>` still ends dispatch's options before the task; use
+`git dispatch -- <task> -- <args...>` to do both. `<task> --` with no arguments adds nothing.
+Without a trailing `--`, the command is unchanged, and two task files are still refused.
 
 Takes a task file that CO wrote, sets up that task's checkout, and execs its worker, which takes over the
 terminal. One task gets one worktree of one repo, placed beside the repo's main checkout in the **project

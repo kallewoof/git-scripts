@@ -1327,6 +1327,158 @@ test29() {
     assert_eq "no link: no agent ran" "(not run)" "$(agent_argv)"
 }
 
+# --- tests 30-37: arguments after the task's -- ---------------------------------------------
+
+test30() {
+    begin test30 "new sessions: agent arguments follow generated flags and precede the prompt"
+    new_project t30
+    local task="$MAIN/context/TASK_args.md" agent
+    local -a expected
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@args"
+    for agent in claude codex cursor omp; do
+        case "$agent" in
+            claude) expected=(claude --effort high) ;;
+            codex) expected=(codex -c 'model_reasoning_effort="high"') ;;
+            cursor) expected=(agent) ;;
+            omp) expected=(omp) ;;
+        esac
+        expected+=(--model chosen "Task: terea/context/TASK_args.md")
+        run_dispatch --dry-run --agent "$agent" "$task" -- --model chosen
+        assert_eq "$agent: exits 0" "0" "$STATUS"
+        assert_eq "$agent: exact dry-run argv" "$(printf '%q ' "${expected[@]}")" \
+            "$(printf '%s\n' "$OUT" | sed -n 's/^git-dispatch: exec: //p') "
+    done
+}
+
+test31() {
+    begin test31 "resumes: preserve resume option values; Codex args follow -C and precede the session"
+    new_project t31
+    local task="$MAIN/context/TASK_args.md" harness
+    local -a expected extra
+    for harness in claude-code codex cursor; do
+        extra=(--model chosen)
+        case "$harness" in
+            claude-code) expected=(claude --effort high --resume "$ID1" "${extra[@]}") ;;
+            codex)
+                extra=(--sandbox danger-full-access)
+                expected=(codex resume -c 'model_reasoning_effort="high"' -C "$MAIN" "${extra[@]}" "$ID1")
+                ;;
+            cursor) expected=(agent --resume "$ID1" "${extra[@]}") ;;
+        esac
+        expected+=("Follow-up task: context/TASK_args.md")
+        write_task "$task" "Returned" "unassigned" "$ID1" "terea@args" "$harness"
+        run_dispatch --dry-run --cwd "$MAIN" "$task" -- "${extra[@]}"
+        assert_eq "$harness: exits 0" "0" "$STATUS"
+        assert_eq "$harness: exact dry-run argv" "$(printf '%q ' "${expected[@]}")" \
+            "$(printf '%s\n' "$OUT" | sed -n 's/^git-dispatch: exec: //p') "
+    done
+}
+
+test32() {
+    begin test32 "real exec preserves spaces, quotes, empty args, duplicates and literal --"
+    new_project t32
+    local task="$MAIN/context/TASK_args.md" harness sid message expected_log dry_exec
+    local -a expected prefix extra=(--model 'two words' --model 'a"quote' "a'quote" '' '*' -- --dry-run)
+    for harness in claude-code codex cursor omp; do
+        for sid in unassigned "$ID1"; do
+            [ "$harness" != omp ] || [ "$sid" = unassigned ] || continue
+            write_task "$task" "Pending" "unassigned" "$sid" "terea@args" "$harness"
+            case "$harness" in
+                claude-code) prefix=(claude --effort high) ;;
+                codex) prefix=(codex -c 'model_reasoning_effort="high"') ;;
+                cursor) prefix=(agent) ;;
+                omp) prefix=(omp) ;;
+            esac
+            message="Task: terea/context/TASK_args.md"
+            if [ "$sid" != unassigned ]; then
+                message="Follow-up task: terea/context/TASK_args.md"
+                if [ "$harness" = codex ]; then
+                    prefix=(codex resume -c 'model_reasoning_effort="high"' -C "$ROOT")
+                else
+                    prefix+=(--resume "$sid")
+                fi
+            fi
+            expected=("${prefix[@]}" "${extra[@]}")
+            if [ "$harness" = codex ] && [ "$sid" != unassigned ]; then expected+=("$sid"); fi
+            expected+=("$message")
+            expected_log=$(printf 'cwd=%s\nargv0=%s\n' "$ROOT" "${expected[0]}"; printf 'arg=%s\n' "${expected[@]:1}")
+            run_dispatch --dry-run "$task" -- "${extra[@]}"
+            assert_eq "$harness/$sid: dry run exits 0" "0" "$STATUS"
+            dry_exec=$(printf '%s\n' "$OUT" | sed -n 's/^git-dispatch: exec: //p')
+            assert_eq "$harness/$sid: quoted arguments" "$(printf '%q ' "${expected[@]}")" "$dry_exec "
+            rm -f "$LOG"
+            run_dispatch "$task" -- "${extra[@]}"
+            assert_eq "$harness/$sid: real run exits 0" "0" "$STATUS"
+            assert_eq "$harness/$sid: exact received argument boundaries" "$expected_log" "$(cat "$LOG" 2>/dev/null)"
+            assert_eq "$harness/$sid: normal exec line matches dry-run" "$dry_exec" \
+                "$(printf '%s\n' "$OUT" | sed -n 's/^git-dispatch: exec: //p')"
+        done
+    done
+}
+
+test33() {
+    begin test33 "-- before the task still ends dispatch's options"
+    new_project t33
+    local task="$MAIN/context/TASK_args.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@args"
+    run_dispatch -- "$task"
+    assert_eq "leading -- accepted" "0" "$STATUS"
+    assert_eq "leading -- adds no arguments" "claude|--effort|high|Task: terea/context/TASK_args.md" "$(agent_argv)"
+}
+
+test34() {
+    begin test34 "-- before and after the task passes only the trailing args"
+    new_project t34
+    local task="$MAIN/context/TASK_args.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@args"
+    run_dispatch -- "$task" -- --model 'two words'
+    assert_eq "two separators accepted" "0" "$STATUS"
+    assert_eq "only trailing args passed" \
+        "claude|--effort|high|--model|two words|Task: terea/context/TASK_args.md" "$(agent_argv)"
+}
+
+test35() {
+    begin test35 "an empty trailing -- adds nothing"
+    new_project t35
+    local task="$MAIN/context/TASK_args.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@args"
+    run_dispatch "$task" --
+    assert_eq "empty trailing args accepted" "0" "$STATUS"
+    assert_eq "no extra argument, including no empty string" \
+        "claude|--effort|high|Task: terea/context/TASK_args.md" "$(agent_argv)"
+    run_dispatch -- "$task" --
+    assert_eq "leading and empty trailing -- accepted" "0" "$STATUS"
+    assert_eq "both separators add nothing" \
+        "claude|--effort|high|Task: terea/context/TASK_args.md" "$(agent_argv)"
+}
+
+test36() {
+    begin test36 "two task files without a separating -- keep their existing errors"
+    new_project t36
+    local task="$MAIN/context/TASK_args.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@args"
+    run_dispatch "$task" "$task"
+    assert_eq "two tasks: usage error" "2" "$STATUS"
+    assert_eq "two tasks: original message" \
+        "git-dispatch: one task file, not several ('$task', '$task')" "${ERR%%$'\n'*}"
+    run_dispatch -- "$task" "$task"
+    assert_eq "two tasks after --: usage error" "2" "$STATUS"
+    assert_eq "two tasks after --: original message" \
+        "git-dispatch: one task file, not several" "${ERR%%$'\n'*}"
+}
+
+test37() {
+    begin test37 "without a trailing -- the exact command line is unchanged"
+    new_project t37
+    local task="$MAIN/context/TASK_args.md"
+    write_task "$task" "Pending" "unassigned" "unassigned" "terea@args"
+    run_dispatch --dry-run --agent codex "$task"
+    assert_eq "no trailing --: exits 0" "0" "$STATUS"
+    assert_eq "no trailing --: original command line" \
+        'codex -c model_reasoning_effort=\"high\" Task:\ terea/context/TASK_args.md' \
+        "$(printf '%s\n' "$OUT" | sed -n 's/^git-dispatch: exec: //p')"
+}
+
 test1
 test2
 test3
@@ -1356,6 +1508,14 @@ test26
 test27
 test28
 test29
+test30
+test31
+test32
+test33
+test34
+test35
+test36
+test37
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1388,6 +1548,14 @@ echo "26. dispatch.moveTask: the first dispatch moves the task and links it . te
 echo "27. dispatch.moveTask: a Returned task is read through its link ....... test27"
 echo "28. dispatch.moveTask: taken, split, bad-link, direct copy refused .... test28"
 echo "29. dispatch.moveTask: nothing moves when an earlier step refuses ..... test29"
+echo "30. trailing args: new-session placement for all four agents .......... test30"
+echo "31. trailing args: resume placement for all three agents .............. test31"
+echo "32. trailing args: real argv boundaries and quoted exec lines ......... test32"
+echo "33. leading -- still ends dispatch's options ......................... test33"
+echo "34. leading and trailing -- together pass agent arguments ............. test34"
+echo "35. empty trailing -- adds no arguments ............................... test35"
+echo "36. two task files keep the existing error messages ................... test36"
+echo "37. without trailing --, the exact command stays unchanged ............ test37"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do
