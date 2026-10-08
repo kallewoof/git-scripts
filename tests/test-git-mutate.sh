@@ -2059,34 +2059,186 @@ EOF
 }
 
 
-test1
-test2
-test3
-test4
-test5
-test6
-test7
-test8
-test9
-test10
-test11
-test12
-test13
-test14
-test15
-test16
-test17
-test18
-test19
-test20
-test21
-test22
-test23
-test24
-test25
+# --- test 26: a script can measure failures without pretending to be a test runner ---------
+
+test26() {
+    echo "test 26: shell checks classify their own failure lines"
+    local d="$WORK/t26" repo="$WORK/t26/repo" pattern
+    mkdir -p "$d"
+    init_repo "$repo"
+    cat > "$repo/state.sh" <<'EOF'
+state=good
+unchecked=one
+EOF
+    cat > "$repo/check.sh" <<'EOF'
+#!/bin/sh
+. ./state.sh
+case "$state" in
+    good) echo 'no tests ran'; exit 0 ;;
+    bad) echo 'FAIL: deploy: release rejected'; exit 1 ;;
+    overlap) echo 'FAIL: deploy: crash cannot find symbol'; exit 1 ;;
+    crash) echo 'CRASH: deploy: SyntaxError: broken'; exit 1 ;;
+    silent) echo 'unrelated diagnostic'; exit 1 ;;
+    twice) printf '\033[31mFAIL: deploy: release rejected\033[0m\nFAIL: deploy: release rejected\n'; exit 1 ;;
+esac
+EOF
+    cat > "$d/mutations.toml" <<'EOF'
+[[mutation]]
+name = "bad"
+file = "state.sh"
+old = 'state=good'
+new = 'state=bad'
+tests = ["deploy"]
+[[mutation]]
+name = "survivor"
+file = "state.sh"
+old = 'unchecked=one'
+new = 'unchecked=two'
+[[mutation]]
+name = "overlap"
+file = "state.sh"
+old = 'state=good'
+new = 'state=overlap'
+[[mutation]]
+name = "crash"
+file = "state.sh"
+old = 'state=good'
+new = 'state=crash'
+[[mutation]]
+name = "silent"
+file = "state.sh"
+old = 'state=good'
+new = 'state=silent'
+[[mutation]]
+name = "twice"
+file = "state.sh"
+old = 'state=good'
+new = 'state=twice'
+EOF
+    commit_all "$repo" fixture
+
+    mutate "$repo" --env lines --fail-pattern '^FAIL: ' --cmd 'sh check.sh' "$d/mutations.toml" bad survivor
+    assert_status "a lines sweep reports a surviving mutation as a finding" 2
+    assert_contains "a shell failure kills by assertion" "bad: reddened 1 -- 1 by assertion, 0 by error."
+    assert_contains "the whole failure line supplies both id and message" \
+        "assertion FAIL: deploy: release rejected -- FAIL: deploy: release rejected"
+    assert_contains "an unchecked mutation survives" "survivor: reddened nothing."
+    assert_contains "lines disables the fast tier loudly" "fast tier: off (--env lines"
+    assert_missing "a shell script's output is not counted as pytest tests" "executed 0 tests"
+
+    mutate "$repo" --env lines --fail-pattern '^FAIL: ' --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_status "an assertion-only lines sweep exits cleanly" 0
+
+    mutate "$repo" --env lines --fail-pattern '^FAIL: ' --error-pattern 'crash|^CRASH:' \
+        --cmd 'sh check.sh' "$d/mutations.toml" overlap crash
+    assert_status "errors alone are findings" 2
+    assert_contains "an error match overrides the default assertion classification" "overlap: reddened 1, ALL BY ERROR"
+    assert_contains "an error pattern also recognizes a standalone crash line" "crash: reddened 1, ALL BY ERROR"
+    assert_contains "the crash message is preserved" "CRASH: deploy: SyntaxError: broken -- CRASH: deploy: SyntaxError: broken"
+    assert_missing "runner compiler heuristics do not override explicit line patterns" "NOT MEASURED"
+
+    mutate "$repo" --env lines --fail-pattern '^FAIL: ' --error-pattern crash \
+        --assertion-pattern '^FAIL: deploy:' --cmd 'sh check.sh' "$d/mutations.toml" overlap
+    assert_status "the assertion pattern still overrides errors by matching the message" 0
+    assert_contains "the override is an assertion kill" "overlap: reddened 1 -- 1 by assertion, 0 by error."
+
+    mutate "$repo" --env lines --fail-pattern '^FAIL: ' --cmd 'sh check.sh' "$d/mutations.toml" silent
+    assert_status "a nonzero exit with no matching line is not measured" 3
+    assert_contains "an unexplained script failure is reported explicitly" "test command exited 1 but matched nothing -- not measured"
+    assert_contains "the remedy names the line patterns" "matched neither --fail-pattern nor --error-pattern"
+    assert_missing "lines diagnostics do not ask for pytest output" "pytest-shaped"
+
+    pattern='^FAIL: (?P<id>[^:]+): (?P<msg>.*)$'
+    mutate "$repo" --env=lines --fail-pattern "$pattern" --cmd 'sh check.sh' \
+        --fast-cmd 'exit 99 # {}' "$d/mutations.toml" bad
+    assert_status "a custom fast command cannot narrow generic checks" 0
+    assert_contains "named groups supply id and message separately" "assertion deploy -- release rejected"
+    assert_missing "a named id satisfies the matching expectation" "== EXPECTATIONS NOT MET"
+    assert_contains "explicit fast commands still disable loudly" "fast tier: off (--env lines"
+
+    mutate "$repo" --env lines --fail-pattern "$pattern" --error-pattern '^FAIL:' \
+        --assertion-pattern '^release rejected$' --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_status "assertion pattern searches the captured message" 0
+
+    mutate "$repo" --env lines --fail-pattern '^FAIL: ' \
+        --error-pattern '^CRASH: (?P<id>[^:]+): (?P<msg>.*)$' \
+        --cmd 'sh check.sh' "$d/mutations.toml" crash
+    assert_contains "an error-only match also supplies named groups" "error     deploy -- SyntaxError: broken"
+
+    mutate "$repo" --env lines --fail-pattern '^FAIL: (?P<id>[^:]+): ' \
+        --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_contains "missing msg falls back independently" "assertion deploy -- FAIL: deploy: release rejected"
+    mutate "$repo" --env lines --fail-pattern '^FAIL: deploy: (?P<msg>.*)$' \
+        --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_contains "missing id falls back independently" "assertion FAIL: deploy: release rejected -- release rejected"
+    mutate "$repo" --env lines --fail-pattern '^(?P<id>unused)?(?P<msg>unused)?FAIL: ' \
+        --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_contains "unmatched optional groups fall back to the line" \
+        "assertion FAIL: deploy: release rejected -- FAIL: deploy: release rejected"
+
+    mutate "$repo" --env lines --fail-pattern "$pattern" --cmd 'sh check.sh' "$d/mutations.toml" twice
+    assert_status "colored lines are recognized" 0
+    assert_contains "every matching line counts, even with a repeated id" "twice: reddened 2 -- 2 by assertion, 0 by error."
+    assert_contains "ANSI codes are stripped before capture" "assertion deploy -- release rejected"
+
+    mutate "$repo" --env lines --fail-pattern "$pattern" \
+        --cmd '. ./state.sh; echo "FAIL: deploy: state is $state"; exit 1' "$d/mutations.toml" bad
+    assert_status "a stable baseline id cannot be credited as a new kill" 2
+    assert_contains "baseline failures are excluded even when messages change" "bad: reddened nothing."
+
+    mutate "$repo" --env lines --fail-pattern '^FAIL: ' --cmd 'exit 1' "$d/mutations.toml" bad
+    assert_status "an unreadable baseline refuses the sweep" 1
+    assert_contains "baseline refusal explains the patterns" "matched neither --fail-pattern nor --error-pattern"
+    assert_missing "baseline refusal is specific to lines" "pytest-shaped"
+
+    mutate "$repo" --env lines --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_status "lines requires a failure pattern" 1
+    assert_contains "the missing-pattern error names the flag" "--env lines requires --fail-pattern"
+    mutate "$repo" --env lines --fail-pattern '[' --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_status "malformed failure regex is a usage error" 1
+    assert_contains "malformed failure regex names its flag" "invalid --fail-pattern regex"
+    mutate "$repo" --env lines --fail-pattern '^FAIL:' --error-pattern '[' --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_status "malformed error regex is a usage error" 1
+    assert_contains "malformed error regex names its flag" "invalid --error-pattern regex"
+    mutate "$repo" --env pytest --fail-pattern '^FAIL:' --cmd 'sh check.sh' "$d/mutations.toml" bad
+    assert_status "line patterns are refused in a runner ecosystem" 1
+    assert_contains "the mode mismatch is explained" "--fail-pattern requires --env lines"
+
+    cat > "$repo/.git/info/git-mutate" <<'EOF'
+env = lines
+cmd = sh check.sh
+fail_pattern = ^FAIL:
+error_pattern = release rejected
+EOF
+    mutate "$repo" "$d/mutations.toml" bad
+    assert_status "project defaults supply both patterns" 2
+    assert_contains "configured error pattern classifies the failure" "bad: reddened 1, ALL BY ERROR"
+    mutate "$repo" --error-pattern '^CRASH:' "$d/mutations.toml" bad
+    assert_status "explicit error pattern overrides project config" 0
+    mutate "$repo" --fail-pattern '^NEVER:' --error-pattern '^CRASH:' "$d/mutations.toml" bad
+    assert_status "explicit failure pattern overrides project config" 3
+
+    assert_clean_tree "$repo" "lines sweeps restore all mutations"
+    assert_no_sweep_state "$repo" "lines sweeps and usage errors leave no state"
+}
+
+# Optional test names keep foreground verification sweeps focused on one behaviour.
+if [ "$#" -eq 0 ]; then
+    set -- test1 test2 test3 test4 test5 test6 test7 test8 test9 test10 test11 test12 test13 \
+        test14 test15 test16 test17 test18 test19 test20 test21 test22 test23 test24 test25 test26
+fi
+for selected_test in "$@"; do
+    case "$selected_test" in
+        test[0-9]|test[0-9][0-9])
+            declare -F "$selected_test" >/dev/null || { echo "Unknown test: $selected_test" >&2; exit 1; }
+            "$selected_test" ;;
+        *) echo "Unknown test: $selected_test" >&2; exit 1 ;;
+    esac
+done
 
 echo
 echo "== behaviour -> test mapping =="
+echo "26. shell checks use line patterns, with explicit error classification ... test26"
 echo "1.  four failure shapes classified; error-only proves nothing ..... test1"
 echo "2.  classification survives colorized output ...................... test2"
 echo "3.  every edit's anchor guarded; no-op and prose anchors refused ... test3"

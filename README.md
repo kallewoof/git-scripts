@@ -327,7 +327,7 @@ only the XML the classifier reads, so no directory is ever removed and a repo's 
 `docs/target/annual-reports` is untouched. No `rm`, no `-rf`, no `-exec`.
 
 **Per-project defaults live in `.git/info/git-mutate`.** A Java or Go repo should not need the same three
-flags on every invocation. Keys are `env`, `cmd`, `assertion_pattern`, `timeout`, `fast`, `fast_cmd` and `fast_max`; an explicit flag
+flags on every invocation. Keys are `env`, `cmd`, `assertion_pattern`, `fail_pattern`, `error_pattern`, `timeout`, `fast`, `fast_cmd` and `fast_max`; an explicit flag
 always beats the file, and an unknown key warns rather than being ignored:
 
 ```
@@ -338,6 +338,14 @@ timeout = 600
 
 `.git/info/` is deliberate: per-clone, never-committed git state. The same reasoning that keeps a mutations
 file out of a commit applies here -- this describes how *this checkout* is tested, not what the code does.
+
+For a shell check instead of a test runner, use `--env lines --fail-pattern '^FAIL: '`
+with `--cmd 'sh scripts/check_clean_install.sh'`. Each matching line is an assertion failure.
+An optional `--error-pattern` recognizes error failures; `--assertion-pattern` can override that
+classification by matching the message. Named regex groups `id` and `msg` supply those fields,
+each falling back to the whole line. A nonzero exit with no matching output is not measured.
+This mode cannot count executed checks and always disables the fast tier. See `git mutate -h`
+for pattern precedence and a structured-message example.
 
 **A baseline run comes first.** If the unmutated suite errors, the sweep refuses: nothing is measurable when
 the suite does not even import, since every mutation would look like a kill. If the unmutated suite merely

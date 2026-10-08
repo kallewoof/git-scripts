@@ -42,7 +42,9 @@ USAGE_TEXT = r"""Usage:
   git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
 
   --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
-  --env <name>            Test ecosystem: pytest (default), mvn, go, rust, dotnet.
+  --env <name>            Test ecosystem: pytest (default), mvn, go, rust, dotnet, lines.
+  --fail-pattern <re>     Failure line regex (required with --env lines).
+  --error-pattern <re>    Error line regex (optional, --env lines only).
   --assertion-pattern <re> Extra regex that marks a message as an assertion kill.
   --timeout <seconds>     Per-mutation timeout (default 900).
   --no-fast               Run the full suite for every mutation (see THE FAST TIER).
@@ -65,7 +67,9 @@ Usage:
   git mutate --recover                    Restore from a stale sweep's snapshot; cmp-verify.
 
   --cmd <shell command>   Test command, instead of the pytest hook in .pre-commit-config.yaml.
-  --env <name>            Test ecosystem: pytest (default), mvn, go, rust, dotnet.
+  --env <name>            Test ecosystem: pytest (default), mvn, go, rust, dotnet, lines.
+  --fail-pattern <re>     Failure line regex (required with --env lines).
+  --error-pattern <re>    Error line regex (optional, --env lines only).
   --assertion-pattern <re> Extra regex that marks a message as an assertion kill.
   --timeout <seconds>     Per-mutation timeout (default 900).
   --no-fast               Run the full suite for every mutation (see THE FAST TIER).
@@ -161,6 +165,28 @@ excluded: a test that passes in the suite but fails alone must not be credited a
 It turns itself off, loudly, when it cannot narrow: a non-pytest --env, a command that is not
 pytest-shaped, or one that already names its own paths (appending ids to 'pytest tests/' would
 widen the run, not narrow it). Use --fast-cmd to drive it yourself, --no-fast to be rid of it.
+
+SHELL CHECKS. Use --env lines for a check that is a script, not a test runner:
+
+  git mutate --env lines --fail-pattern '^FAIL: ' \
+    --cmd 'sh scripts/check_clean_install.sh' mutations.toml
+
+Patterns are Python regular expressions searched on each line after removing ANSI colors.
+Each matching line is one failure, classified as an assertion kill by default.
+--error-pattern also recognizes failures, including lines not matched by --fail-pattern,
+and classifies them as error kills. --assertion-pattern still marks a matching MESSAGE as
+an assertion kill, taking precedence over --error-pattern.
+
+The failure's id and message use named groups 'id' and 'msg', respectively, from the
+--fail-pattern match (or the --error-pattern match if only that matched). Each missing or
+unmatched group falls back to the whole line. For example:
+  --fail-pattern '^FAIL: (?P<id>[^:]+): (?P<msg>.*)$'
+Stable ids let the baseline exclude checks that were already failing.
+
+A nonzero exit with no matching line is not measured. A zero exit with no matching line
+is green; this mode cannot count executed checks. The fast tier is always off for lines,
+including with --fast-cmd. Runner-specific compilation heuristics do not apply.
+Per-project defaults in .git/info/git-mutate accept fail_pattern and error_pattern.
 
 THE INPUT IS EPHEMERAL. Feed it on stdin for one invocation and forget it. Anchors are
 coupled to the code's current text while tests are coupled to its behaviour, so a kept
@@ -509,12 +535,14 @@ def classify_surefire():
     return rows
 
 
-def classify(log_path, env_name, extra_pattern):
+def classify(log_path, env_name, extra_pattern, fail_pattern=None, error_pattern=None):
     if env_name == "mvn":
         return classify_surefire()
 
     assertion = BASE_ASSERTION + ENV_ASSERTION.get(env_name, ())
     extra = re.compile(extra_pattern) if extra_pattern else None
+    failure = re.compile(fail_pattern) if fail_pattern is not None else None
+    error = re.compile(error_pattern) if error_pattern is not None else None
 
     rows, seen = [], set()
     try:
@@ -524,6 +552,21 @@ def classify(log_path, env_name, extra_pattern):
     with fh:
         for raw in fh:
             line = strip_ansi(raw)
+            if env_name == "lines":
+                match = failure.search(line)
+                error_match = error.search(line) if error is not None else None
+                if match is None and error_match is None:
+                    continue
+                groups = (match if match is not None else error_match).groupdict()
+                test_id = groups.get("id")
+                msg = groups.get("msg")
+                test_id = line if test_id is None else test_id
+                msg = line if msg is None else msg
+                kind = "E" if error_match is not None else "A"
+                if extra and extra.search(msg):
+                    kind = "A"
+                rows.append((kind, test_id, msg))
+                continue
             match = re.match(r"^(FAILED|ERROR)\s+(\S.*)$", line)
             if not match:
                 continue
@@ -961,6 +1004,9 @@ def read_project_config(cfg, state):
             elif key == "assertion_pattern":
                 if not state["assertion_pattern"]:
                     state["assertion_pattern"] = val
+            elif key in ("fail_pattern", "error_pattern"):
+                if state[key] is None:
+                    state[key] = val
             elif key == "timeout":
                 if state["timeout_secs"] == str(DEFAULT_TIMEOUT):
                     state["timeout_secs"] = val
@@ -1021,6 +1067,7 @@ def resolve_test_cmd(root, cmd_override):
 
 def run_cli(sweep, argv):
     st = {"cmd_override": "", "timeout_secs": str(DEFAULT_TIMEOUT), "assertion_pattern": "",
+          "fail_pattern": None, "error_pattern": None,
           "env_name": "", "fast_mode": "auto", "fast_cmd_template": "",
           "fast_max": str(DEFAULT_FAST_MAX)}
     mode = "sweep"
@@ -1046,6 +1093,8 @@ def run_cli(sweep, argv):
             need(args, "--timeout"); st["timeout_secs"] = args[1]; del args[:2]
         elif a == "--assertion-pattern":
             need(args, "--assertion-pattern"); st["assertion_pattern"] = args[1]; del args[:2]
+        elif a in ("--fail-pattern", "--error-pattern"):
+            need(args, a); st[a[2:].replace("-", "_")] = args[1]; del args[:2]
         elif a == "--env":
             need(args, "--env"); st["env_name"] = args[1]; del args[:2]
         elif a.startswith("--env="):
@@ -1078,8 +1127,20 @@ def run_cli(sweep, argv):
     read_project_config(os.path.join(gd or ".", "info", "git-mutate"), st)
     env_name = st["env_name"] or "pytest"
 
-    if env_name not in ("pytest", "mvn", "go", "rust", "dotnet"):
-        die("--env takes one of: pytest, mvn, go, rust, dotnet (got '%s')" % env_name)
+    if env_name not in ("pytest", "mvn", "go", "rust", "dotnet", "lines"):
+        die("--env takes one of: pytest, mvn, go, rust, dotnet, lines (got '%s')" % env_name)
+    if mode != "recover":
+        if env_name == "lines" and st["fail_pattern"] is None:
+            die("--env lines requires --fail-pattern")
+        for key in ("fail_pattern", "error_pattern"):
+            if st[key] is not None:
+                flag = "--" + key.replace("_", "-")
+                if env_name != "lines":
+                    die("%s requires --env lines" % flag)
+                try:
+                    re.compile(st[key])
+                except re.error as exc:
+                    die("invalid %s regex: %s" % (flag, exc))
     if not st["timeout_secs"].isdigit():
         die("--timeout takes a whole number of seconds, got '%s'" % st["timeout_secs"])
     if st["fast_mode"] not in ("auto", "on", "off"):
@@ -1138,7 +1199,8 @@ def run_cli(sweep, argv):
 
     return do_sweep(sweep, chosen, n_selected, mutations_file, env_name,
                     st["assertion_pattern"], st["cmd_override"], st["fast_mode"],
-                    st["fast_cmd_template"], fast_max, timeout_secs)
+                    st["fast_cmd_template"], fast_max, timeout_secs,
+                    st["fail_pattern"], st["error_pattern"])
 
 
 def do_recover(sweep):
@@ -1272,6 +1334,9 @@ def resolve_fast(sweep, env_name, fast_mode, fast_cmd_template, test_cmd):
     if fast_mode == "off":
         sweep.fast_why = "disabled with --no-fast"
         return
+    if env_name == "lines":
+        sweep.fast_why = "--env lines cannot select checks by id"
+        return
     if fast_cmd_template:
         if "{}" not in fast_cmd_template:
             die("--fast-cmd needs a '{}' where the test ids go")
@@ -1305,7 +1370,8 @@ def first_match(log_path, pattern, limit=160):
 
 
 def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_pattern,
-             cmd_override, fast_mode, fast_cmd_template, fast_max, timeout_secs):
+             cmd_override, fast_mode, fast_cmd_template, fast_max, timeout_secs,
+             fail_pattern=None, error_pattern=None):
     take_lock(sweep, mutations_file)
     install_signal_handlers(sweep)
 
@@ -1336,13 +1402,17 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
     baseline_log = os.path.join(sweep.work, "baseline.log")
     baseline_started = datetime.datetime.now().timestamp()
     baseline_rc = sweep.run_test_cmd(baseline_log, test_cmd, env_name, timeout_secs)
-    baseline_rows = classify(baseline_log, env_name, assertion_pattern)
+    baseline_rows = classify(baseline_log, env_name, assertion_pattern, fail_pattern, error_pattern)
     if sweep.run_timed_out:
         die("the unmutated test command timed out after %ds. Nothing can be measured; raise "
             "--timeout." % timeout_secs)
     # A failing baseline that matches no FAILED/ERROR line at all is not "no pre-existing
     # failures" -- it is a suite this classifier cannot read.
     if baseline_rc != 0 and not baseline_rows:
+        if env_name == "lines":
+            die("the unmutated test command exited %d but matched neither --fail-pattern "
+                "nor --error-pattern. No mutation would be measurable; check the patterns "
+                "and --cmd." % baseline_rc)
         die("the unmutated test command exited %d but produced no line this classifier\n"
             "recognises as FAILED/ERROR ('%s'). The classifier is pytest-shaped: it cannot "
             "tell a\nreal failure from another runner's output, so no mutation afterwards "
@@ -1483,7 +1553,7 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
                         % timeout_secs)
             continue
 
-        res.rows_all = classify(log, env_name, assertion_pattern)
+        res.rows_all = classify(log, env_name, assertion_pattern, fail_pattern, error_pattern)
         res.rows = [r for r in res.rows_all if r[1] not in baseline_set] \
             if baseline_set else list(res.rows_all)
         res.excluded = dict.fromkeys(baseline_set, "before any mutation")
@@ -1492,8 +1562,8 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
         res.n_u = sum(1 for r in res.rows if r[0] == "U")
         sweep.record_killers(res.rows, fast_max)
 
-        compile_note = first_match(log, COMPILE_RE)
-        if not compile_note and res.rows_all:
+        compile_note = first_match(log, COMPILE_RE) if env_name != "lines" else ""
+        if env_name != "lines" and not compile_note and res.rows_all:
             for _, _, msg in res.rows_all:
                 if re.search(r"Unresolved compilation|cannot be resolved|cannot find symbol",
                              msg):
@@ -1520,6 +1590,9 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
             res.note = ("the test command exited %d but produced no FAILED/ERROR line this "
                         "pytest-shaped classifier recognises; pass a pytest-compatible command "
                         "with --cmd" % mut_rc)
+            if env_name == "lines":
+                res.note = ("the test command exited %d but matched neither --fail-pattern "
+                            "nor --error-pattern; check the patterns and --cmd" % mut_rc)
         elif res.n_a == 0 and res.n_e == 0:
             emit("reddened nothing")
             res.status = "survived"

@@ -1,4 +1,4 @@
-.TH GIT-MUTATE 1 "August 2026" "git-mutate" "Git Manual"
+.TH GIT-MUTATE 1 "October 2026" "git-mutate" "Git Manual"
 .SH NAME
 git-mutate \- break the code on purpose and report whether the tests noticed
 .SH DESCRIPTION
@@ -13,3 +13,50 @@ option instead:
 .RE
 .PP
 That help includes the mutations-file format, a worked example, the guards, and the exit statuses.
+.SH SHELL CHECKS
+Use
+.B \-\-env lines
+for a check that is a script, not a test runner. Other ecosystems are
+pytest (the default), mvn, go, rust, and dotnet.
+.TP
+.BI \-\-fail-pattern " regex"
+Required with lines. Each matching output line is one failure, classified as an
+assertion kill by default. Patterns are Python regular expressions searched after
+ANSI colors are stripped.
+.TP
+.BI \-\-error-pattern " regex"
+Optional, lines only. Recognizes error kills, including lines that do not match
+the failure pattern. If both patterns match, the error classification wins unless
+overridden by the assertion pattern.
+.TP
+.BI \-\-assertion-pattern " regex"
+Marks a matching failure message as an assertion kill, including when the error
+pattern matched. It does not recognize new failure lines by itself.
+.PP
+The named groups
+.B id
+and
+.B msg
+provide the failure id and message. Each absent or unmatched group uses the whole
+line instead. Groups come from the failure pattern when it matches, otherwise
+from the error pattern. Stable ids allow already failing checks to be excluded
+by the baseline.
+.PP
+A nonzero exit with no matching line is not measured. A zero exit with no matches
+is green; executed checks cannot be counted. The fast tier turns itself off,
+even with an explicit fast command. Runner compilation heuristics do not apply.
+.PP
+Example:
+.RS
+.nf
+git mutate \-\-env lines \-\-fail-pattern '^FAIL: ' \\
+  \-\-cmd 'sh scripts/check_clean_install.sh' mutations.toml
+.fi
+.RE
+.PP
+For structured messages, use a pattern such as
+.BR "^FAIL: (?P<id>[^:]+): (?P<msg>.*)$" .
+Per-project defaults in .git/info/git-mutate accept
+.B fail_pattern
+and
+.BR error_pattern .
