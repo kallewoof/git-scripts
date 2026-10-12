@@ -778,13 +778,139 @@ the link (`from -> to`) and changes nothing.
 
 * **⚠ `git worktree remove` deletes the task file without a warning.** The file is gitignored, so git does
   not count it as untracked, and no `--force` is needed. The link is left dangling. **Archive the task file
-  before removing the worktree.**
+  before removing the worktree.** `git collect` (below) refuses to remove a worktree in this state, and
+  names the file.
 * **⚠ Archiving with `mv` on the link moves the link, not the file.** A `git add` then commits a symlink
   into a worktree. Move the link's target (`realpath context/TASK_<name>.md`) to the archive, then delete
   the link.
 * **⚠ `sed -i` and other writers that replace the file turn the link into a copy,** and split the channel
   in two. Edit the target, or use an editor that writes in place. (Claude Code's Edit and Write refuse to
   write through a link, and say so.)
+
+# git collect
+
+```
+git collect [--dry-run] [<slug>...]
+```
+
+Finishes a dispatch the operator has reviewed: it merges `task/<slug>` and removes what the dispatch left on
+disk. By hand that is three steps, and each has a trap:
+
+```sh
+git merge --no-ff task/<slug>              # from a checkout on the default branch
+git worktree remove <root>/<repo>@<slug>   # silently deletes a task file moved into the checkout
+git branch -d task/<slug>                  # measures "merged" against HEAD, so it fails from another branch
+```
+
+Until the worktree and branch are both gone, `git dispatch` also refuses that slug again
+(`task/<slug> exists without its worktree`).
+
+```sh
+git collect                 # what is merged goes; what is finished is listed for review
+git collect failed-call     # after review: merge it (--no-ff) and collect it
+```
+
+**What counts as a dispatch.** A worktree at `<root>/<repo>@<slug>` on `task/<slug>`, with `<root>` and
+`<repo>` resolved exactly as `git dispatch` resolves them (`dispatch.root`, the main checkout, a submodule's
+`core.worktree`). A `task/<slug>` branch that no worktree has checked out also counts. Nothing else is
+touched or listed: a detached worktree, a worktree on another branch or at another path, a `task/<slug>`
+checked out somewhere else, and the main checkout. It works the same from the main checkout or from any of
+the repo's worktrees.
+
+**Modes.**
+* **No arguments: nothing is merged.** A dispatch already merged into the default branch that passes the
+  guards is collected. An unmerged one whose task file says `Finished` or `Author Verified` gets a
+  `finished <slug>:` line, naming the task file, how many commits the branch adds, and what still has to
+  hold before `git collect <slug>` can take it. That is the operator's review queue. A finished task
+  whose worktree is already gone (removed by hand, or registered but missing on disk) is listed as
+  `finished` too, with its next step. Unmerged, that step is review and `git collect <slug>`. Merged, it
+  is archiving the task file, after which `git collect` deletes the branch. With the branch gone as well,
+  nothing is left to collect, and the line says to archive the task file once its work is in the default
+  branch. Every other dispatch gets a `skip <slug>:` line naming each reason. Each dangling `context/TASK_*.md` link in the main
+  checkout is reported: its task file was already lost with its worktree. It is left in place, never
+  deleted. The run exits 0 unless a removal itself failed.
+* **Named slugs: merge and collect, all or nothing.** Naming a slug is the operator saying the work is
+  accepted. Every check for every named slug runs first. Any refusal, including an unknown slug, exits 1
+  with a `refused <slug>: <reason>` line for each, and changes nothing.
+* **`--dry-run`:** the root, the default branch, and every merge, removal, deletion, skip and refusal it
+  would make. It changes nothing and exits as the real run would. A conflict is found only by the merge
+  itself.
+
+The task file's status is read from the files the archived guard (below) finds: one moved into the
+worktree, a link from the main checkout into it, or a main-checkout task file whose header names the
+checkout. Only line 3 (`**Status: …**`) is read. A moved task file lost with its worktree cannot be
+read, so it shows up only as a dangling link.
+
+**The guards.** A dispatch is merged or collected only when every guard that applies to it holds, and all
+of them are checked for every dispatch before the first change. None of these depends on whether the
+branch is merged, so a dispatch that fails one is never merged:
+
+| Guard        | Holds when                                                                                   |
+| :----------- | :------------------------------------------------------------------------------------------- |
+| clean        | the worktree has no modified (or staged) tracked file and no untracked file; ignored files do not count |
+| archived     | no `context/TASK_*.md` is in the worktree; no `context/TASK_*.md` link in the main checkout leads into it; no regular `context/TASK_*.md` in the main checkout has a header `Checkout:` line naming `<repo>@<slug>` |
+| unlocked     | the worktree is not locked (`git worktree lock`), and the current directory is not inside it |
+
+**The task-file guard matters most.** A dispatch that has just started is "merged": its branch is the
+default branch's tip. It is also clean, while its worker is running. Merged and clean alone would collect
+it and delete the moved task file with it. The task file is the one thing that says the work is still
+open. In the worktree, it is a moved task that `git worktree remove` would delete. As a link in the main
+checkout, it is the same task seen from the other side, and a link that already dangles into the
+worktree's path counts too. As a regular file whose header names the checkout, it is a task dispatched
+without `dispatch.moveTask`, or one written for that checkout and not yet dispatched. Only the header is
+read, as `git dispatch` reads it, so a body quoting a `Checkout:` line does not count. Archiving the task
+file (moving it out of `context/`, into `context/archive/` say) is the operator's last step of review,
+and what lets collect go ahead.
+
+**What it does**, for each dispatch it takes, in this order:
+
+1. **Named and not merged:** `git merge --no-ff --no-edit -m "Merge branch 'task/<slug>'"` in the main
+   checkout. A fast-forward is never made, so the merge is always its own commit. The main checkout must
+   already be on the default branch, with no change to a tracked file and no merge under way; it is
+   never switched or stashed for you, and otherwise the slug is refused before anything changes.
+   Untracked files in it do not block the merge. **A conflict is aborted** (`git merge --abort`, leaving
+   the main checkout as it was before that merge), the run stops and exits 1, and the slugs named after
+   it are not attempted. Slugs before it stay collected. Merge that one by hand, then `git collect <slug>`
+   collects it as already merged.
+2. `git worktree remove <path>`, never with `--force`. If git still refuses, its message is reported, the
+   branch is kept, and the run exits 1. A clean worktree that holds an initialized submodule is the usual
+   case: git will not remove it, and `--force` would delete the submodule's checkout with it.
+3. `git branch -D task/<slug>`. That is safe because the branch is now merged into the default branch:
+   every commit on it is already there, so only the label goes away. `-d` would measure against `HEAD`
+   and refuse from any other branch.
+4. A worktree that is registered but missing on disk has its registration removed, and then its branch is
+   deleted. That is `git worktree remove` on the missing path, which touches only that worktree.
+   `git worktree prune` would also prune every other missing worktree, dispatches or not. A locked one is
+   kept: a lock is how git marks a worktree on media that is not mounted.
+5. A `task/<slug>` with no worktree has its branch deleted (after a merge, if named and unmerged). If
+   something is still at its path, that is said and left alone.
+
+**Ignored files go with the worktree**: caches, build and test output, a `context/` note. The removal
+line counts them (`removed <root>/<repo>@<slug> (3 ignored file(s) with it)`), and `--dry-run` counts
+them before anything goes.
+
+Output and exit codes follow `git dispatch`: `git-collect: ...` lines, 1 for a refusal, 2 for a usage
+error. A set `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` is refused.
+
+**Merged means merged into the local default branch, the opposite of `git cleanup`'s choice.** The
+default branch is resolved as `git dispatch` resolves its start point: `dispatch.defaultBranch`, else
+`origin/HEAD`'s branch, else whichever of `main` and `master` exists. It is never `HEAD`, so with nothing
+to merge the main checkout can be on any branch. `git cleanup` deletes branches merged into *origin's*
+default branch, because those branches came from elsewhere and only the remote shows they landed. A
+dispatch's branch never leaves this machine: the operator merges it locally, by hand or through collect,
+and may not have pushed yet. Checked against `origin`, every dispatch would wait for a push it does not
+need, and the worktree would hold its slug in the meantime. Nothing is lost either way: the commits are in
+the local default branch.
+
+**What it leaves to the operator.** Reviewing: collect merges only what is named, and lists, never
+merges, what merely says it is finished. Archiving task files: where and how a repo archives them is its
+own convention, and collect only refuses until it is done. Resolving conflicts. Pushing, remote branches,
+and branches other than `task/<slug>` are `git cleanup`'s job, or the operator's.
+
+The root, main-checkout and default-branch resolution is a copy of `git dispatch`'s, not shared code. Each
+script here is a single file that works wherever it is copied. `tests/test-git-collect.sh` checks that
+both give the same answers for the default root, `dispatch.root`, `origin/HEAD`, `dispatch.defaultBranch`
+and a submodule.
 
 # Other resources
 

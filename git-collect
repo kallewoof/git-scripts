@@ -1,0 +1,584 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Karl-Johan Alm
+# Distributed under the MIT software license, see the accompanying
+# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+
+# Usage:
+#   git collect [--dry-run] [<slug>...]
+#
+#   Merge a reviewed dispatch and remove what it leaves on disk:
+#     git merge --no-ff task/<slug>; git worktree remove <root>/<repo>@<slug>; git branch -D task/<slug>
+#   A dispatch of this repo is a worktree at <root>/<repo>@<slug> on task/<slug> -- <root> and <repo>
+#   resolved exactly as git dispatch resolves them -- or a task/<slug> branch with no worktree.
+#   Nothing else is touched or listed: a detached worktree, a worktree on another branch or at
+#   another path, and the main checkout.
+#
+#   Merged means: task/<slug> is an ancestor of the local default branch (dispatch.defaultBranch,
+#   else origin/HEAD's branch, else the one of main/master that exists) -- never of HEAD, and never
+#   of origin's copy: the operator merges locally and may not have pushed. That is the opposite of
+#   git cleanup's choice; see README.md. Only a named slug is merged, and only in a main checkout
+#   that is on the default branch with no change to a tracked file: it is never switched.
+#
+#   A dispatch is merged or collected only when every guard that applies to it holds, all checked
+#   before the first change:
+#     clean      no modified tracked file and no untracked file in the worktree. Ignored files do
+#                not count; they go with the worktree, and the removal line counts them.
+#     archived   no context/TASK_*.md in the worktree (a moved task file, which `git worktree
+#                remove` would delete without a word: it is gitignored); no context/TASK_*.md link
+#                in the main checkout pointing into the worktree; and no regular context/TASK_*.md
+#                in the main checkout whose header Checkout line names <repo>@<slug>. A dispatch
+#                that has just started is merged (its branch is the default branch's tip) and
+#                clean, so this is the guard that stops collect from removing a running worker.
+#     unlocked   the worktree is not locked (`git worktree lock`), and the current directory is
+#                not inside it.
+#
+#   Then, for each dispatch: `git merge --no-ff` when it is named and not merged (a conflict is
+#   aborted, and nothing after it is attempted); `git worktree remove <path>` (never --force; if
+#   git still refuses, that is reported and the branch is kept); then `git branch -D task/<slug>`,
+#   safe once it is merged. A worktree registered but missing on disk has its registration removed
+#   (`git worktree remove` on the missing path, which touches no other worktree, where `git
+#   worktree prune` would prune all of them); a task/<slug> branch with no worktree is deleted.
+#
+#   No slugs: nothing is merged. Every merged dispatch that passes the guards is collected. One
+#   whose task file says Finished or Author Verified is listed as 'finished' -- with what collecting
+#   it takes -- when it is unmerged (for the operator to review and collect by name) or its worktree
+#   is gone; so is such a task file in the main checkout whose worktree and branch are both gone.
+#   Every other dispatch gets a 'skip' line saying why. Each
+#   dangling context/TASK_*.md link in the main checkout (a task file already lost with its
+#   worktree) is reported and left in place. Exits 0 unless a removal itself failed.
+#
+#   Slugs: every check for every named slug runs first; any refusal, an unknown slug included,
+#   exits 1 naming each refused slug and why, and changes nothing.
+#
+#   --dry-run    Print the root, the default branch, and every merge, removal, deletion, skip and
+#                refusal it would make; change nothing. Exits as the real run would (a conflict
+#                is found only by the merge itself).
+#
+# Archiving task files, pushing and remote branches are the operator's (and git cleanup's), never
+# this tool's. Collect merges only what the operator names after reviewing it.
+#
+# The project root, the main checkout and the default branch are resolved by code duplicated
+# from git-dispatch rather than shared with it: every git- script here is a single file that
+# works wherever it is copied, and a sourced library would make both depend on being installed
+# side by side. tests/test-git-collect.sh compares collect's answers with dispatch's --dry-run,
+# so the two cannot drift apart unnoticed.
+
+set -u
+
+SELF="git-collect"
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  git collect [--dry-run] [<slug>...]
+                Merge (--no-ff, named slugs only) and remove the worktree (<root>/<repo>@<slug>)
+                and branch (task/<slug>) of each dispatch that is clean, has no task file left
+                in it or pointing at it, and is not locked or the current directory.
+                No slugs: collect what is already merged into the local default branch, list
+                the finished ones that are unmerged or whose worktree is gone, report the
+                rest, exit 0.
+                Slugs: all or nothing; any refusal exits 1 and changes nothing. The merge needs
+                the main checkout on the default branch; a conflict is aborted and stops the run.
+  --dry-run     Print every merge, removal, deletion, skip and refusal; change nothing.
+EOF
+}
+
+die() {
+    echo "$SELF: $*" >&2
+    exit 1
+}
+
+usage_error() {
+    echo "$SELF: $*" >&2
+    usage
+    exit 2
+}
+
+dry_run=0
+names=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run) dry_run=1 ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; names+=("$@"); break ;;
+        -*) usage_error "unknown option '$1'" ;;
+        *) names+=("$1") ;;
+    esac
+    shift
+done
+declare -A named
+for n in ${names[@]+"${names[@]}"}; do
+    [ -z "${named[$n]+set}" ] || usage_error "'$n' named twice"
+    named[$n]=1
+done
+
+# As in git dispatch: these would point every git command below at a repository other than the
+# one the current directory is in.
+for var in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE; do
+    [ -z "${!var+set}" ] || die "$var is set ('${!var}'); the repository comes from the current directory -- unset it"
+done
+
+# --- the repository (as git dispatch resolves it) -------------------------------------------
+
+# The main checkout is the working tree of the repository's common git dir -- the same answer from
+# any of its worktrees. A submodule's common dir is <super>/.git/modules/<name>, whose checkout
+# only its core.worktree names.
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+    die "not inside a git repository"
+[ "$(git --git-dir="$common" config --bool core.bare)" != "true" ] ||
+    die "the repository ($common) is bare; dispatches need a main checkout"
+if core_wt=$(git --git-dir="$common" config core.worktree); then
+    main=$(cd -- "$common" && cd -- "$core_wt" && pwd -P) ||
+        die "cannot enter the main checkout ($common has core.worktree '$core_wt')"
+elif [ "$(basename -- "$common")" = ".git" ]; then
+    main=$(dirname -- "$common")
+else
+    die "cannot tell the main checkout of $common (not '<checkout>/.git', no core.worktree)"
+fi
+listing=$(git -C "$main" worktree list --porcelain) || die "cannot list the worktrees of $main"
+repo=$(basename -- "$main")
+root=$(dirname -- "$main")
+root_from="default: the main checkout's parent"
+if root_cfg=$(git -C "$main" config --get dispatch.root); then
+    root_cfg=${root_cfg%$'\r'}
+    if [ -z "$root_cfg" ]; then
+        die "dispatch.root is empty; set it to a directory ('git -C $main config dispatch.root <dir>')" \
+            "or unset it ('git -C $main config --unset dispatch.root')"
+    fi
+    if [ "${root_cfg#/}" = "$root_cfg" ]; then
+        root_candidate=$main/$root_cfg
+    else
+        root_candidate=$root_cfg
+    fi
+    if [ ! -d "$root_candidate" ]; then
+        if [ -e "$root_candidate" ] && [ ! -L "$root_candidate" ]; then
+            die "dispatch.root '$root_cfg' is not a directory; point it at a directory" \
+                "('git -C $main config dispatch.root <dir>'), or unset it" \
+                "('git -C $main config --unset dispatch.root')"
+        fi
+        die "dispatch.root '$root_cfg' does not exist; create that directory, or unset it with" \
+            "'git -C $main config --unset dispatch.root'"
+    fi
+    root=$(cd -- "$root_candidate" && pwd -P) ||
+        die "dispatch.root '$root_cfg' cannot be entered"
+    main_phys=$(cd -- "$main" && pwd -P) || die "cannot enter the main checkout ($main)"
+    if [ "$root" = "$main_phys" ]; then
+        die "dispatch.root '$root' is the main checkout; a worktree nested in its own repo pollutes it." \
+            "Set it to a directory outside the checkout ('git -C $main config dispatch.root <dir>')"
+    elif [[ "$root" == "$main_phys"/* ]]; then
+        die "dispatch.root '$root' is inside the main checkout ($main_phys); a worktree nested in its" \
+            "own repo pollutes it. Set it to a directory outside the checkout" \
+            "('git -C $main config dispatch.root <dir>')"
+    fi
+    root_from="git config dispatch.root"
+fi
+
+if base=$(git -C "$main" config --get dispatch.defaultBranch); then
+    base_from="git config dispatch.defaultBranch"
+elif origin_head=$(git -C "$main" symbolic-ref --quiet --short refs/remotes/origin/HEAD); then
+    base=${origin_head#origin/}
+    base_from="origin/HEAD"
+else
+    candidates=()
+    for b in main master; do
+        git -C "$main" show-ref --verify --quiet "refs/heads/$b" && candidates+=("$b")
+    done
+    [ "${#candidates[@]}" -eq 1 ] ||
+        die "cannot tell $repo's default branch: no origin/HEAD, and" \
+            "${candidates[*]:-neither main nor master exists}${candidates[*]:+ both exist};" \
+            "set it with 'git -C $main config dispatch.defaultBranch <branch>'"
+    base=${candidates[0]}
+    base_from="the only one of main/master"
+fi
+git -C "$main" show-ref --verify --quiet "refs/heads/$base" ||
+    die "the default branch '$base' (from $base_from) has no local branch in $main"
+
+# --- paths ----------------------------------------------------------------------------------
+
+# An absolute path with '.', '..' and repeated slashes removed, without touching the disk: a
+# dangling link's target cannot be resolved any other way.
+normalize() {
+    local IFS=/ part out=()
+    for part in $1; do
+        case "$part" in
+            ""|.) ;;
+            ..) [ "${#out[@]}" -eq 0 ] || unset 'out[${#out[@]}-1]' ;;
+            *) out+=("$part") ;;
+        esac
+    done
+    printf '/%s\n' "${out[*]}"
+}
+
+# Where the link $1 (an absolute path) leads, following a chain of links: physically as far as
+# the directories exist, and literally past that, so a dangling link still says where it points.
+link_dest() {
+    local path=$1 target n=0
+    while [ -L "$path" ] && [ "$n" -lt 40 ]; do
+        target=$(readlink -- "$path") || return 1
+        [ "${target#/}" != "$target" ] || target=$(dirname -- "$path")/$target
+        path=$target
+        n=$((n + 1))
+    done
+    if [ -d "$(dirname -- "$path")" ]; then
+        printf '%s/%s\n' "$(cd -- "$(dirname -- "$path")" && pwd -P)" "$(basename -- "$path")"
+    else
+        normalize "$path"
+    fi
+}
+
+# Is path $1 the directory $2 (given lexically and, when it exists, physically as $3) or under it?
+under() {
+    local p=$1 d
+    for d in "$2" "$3"; do
+        [ -n "$d" ] || continue
+        [ "$p" = "$d" ] || [ "${p#"$d"/}" != "$p" ] && return 0
+    done
+    return 1
+}
+
+here=$(pwd -P)
+main_ctx=""
+[ -d "$main/context" ] && main_ctx=$(cd -- "$main/context" && pwd -P)
+
+# A task file's status, from its line 3 ('**Status: <status>**'), or nothing.
+task_status() {
+    local line
+    line=$(sed -n '3{s/\r$//;p;}' -- "$1" 2>/dev/null)
+    line=${line%"${line##*[![:space:]]}"}
+    [[ "$line" =~ ^\*\*Status:\ *(.*[^[:space:]])\ *\*\*$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# The statuses that say a worker is done and the work waits for review and a merge.
+DONE_RE='^(Finished|Author Verified)$'
+
+# Every context/TASK_*.md in the main checkout, as the guards need it: each link with where it
+# leads, and each regular file with the Checkout lines of its header (line 3 to the first blank
+# line, as git dispatch reads it; a body that quotes a header is not read).
+task_links=() task_link_dest=() task_checkouts=()
+if [ -n "$main_ctx" ]; then
+    for f in "$main_ctx"/TASK_*.md; do
+        if [ -L "$f" ]; then
+            task_links+=("$f")
+            task_link_dest+=("$(link_dest "$f")")
+        elif [ -f "$f" ]; then
+            lineno=0
+            while IFS= read -r line || [ -n "$line" ]; do
+                lineno=$((lineno + 1))
+                line=${line%$'\r'}
+                [ "$lineno" -lt 3 ] && continue
+                [ -z "${line//[[:space:]]/}" ] && break
+                line=${line%"${line##*[![:space:]]}"}
+                if [[ "$line" =~ ^\*\*Checkout:\ *(.*[^[:space:]])\ *\*\*$ ]]; then
+                    task_checkouts+=("${BASH_REMATCH[1]}|$f")
+                fi
+            done < "$f"
+        fi
+    done
+fi
+
+# --- the dispatches -------------------------------------------------------------------------
+
+# From the same listing git dispatch reads: a worktree at <root>/<repo>@<slug> on task/<slug>.
+# Where each task/ branch is checked out, so that a branch checked out anywhere is never taken
+# for one without a worktree.
+slugs=()
+declare -A d_path d_missing d_locked d_broken checked_out
+cur_path="" cur_branch="" cur_locked=0 cur_prunable=0 first=1
+while IFS= read -r line; do
+    case "$line" in
+        "worktree "*) cur_path=${line#worktree } ;;
+        "branch "*) cur_branch=${line#branch } ;;
+        locked|"locked "*) cur_locked=1 ;;
+        prunable|"prunable "*) cur_prunable=1 ;;
+        "")
+            if [ -n "$cur_path" ]; then
+                [ -z "$cur_branch" ] || checked_out[$cur_branch]=$cur_path
+                slug=${cur_path#"$root/$repo@"}
+                if [ "$first" -eq 0 ] && [ "$slug" != "$cur_path" ] && [[ "$slug" =~ $NAME_RE ]] &&
+                    [ "$cur_branch" = "refs/heads/task/$slug" ]; then
+                    slugs+=("$slug")
+                    d_path[$slug]=$cur_path
+                    d_locked[$slug]=$cur_locked
+                    d_missing[$slug]=0 d_broken[$slug]=0
+                    if [ ! -e "$cur_path" ] && [ ! -L "$cur_path" ]; then
+                        d_missing[$slug]=1
+                    elif [ "$cur_prunable" -eq 1 ] || [ ! -d "$cur_path" ]; then
+                        d_broken[$slug]=1
+                    fi
+                fi
+                first=0
+            fi
+            cur_path="" cur_branch="" cur_locked=0 cur_prunable=0
+            ;;
+    esac
+done < <(printf '%s\n\n' "$listing")
+
+while IFS= read -r ref; do
+    slug=${ref#refs/heads/task/}
+    [[ "$slug" =~ $NAME_RE ]] || continue
+    [ -z "${checked_out[$ref]+set}" ] || continue
+    slugs+=("$slug")
+    d_path[$slug]=""
+done < <(git -C "$main" for-each-ref --format='%(refname)' refs/heads/task/)
+
+# --- the guards -----------------------------------------------------------------------------
+
+# Checked for every dispatch before anything changes. Each failed guard adds a reason; a dispatch
+# with none can be collected -- at once when it is merged, and, when it is not, only by name,
+# after a merge. Whether it is merged is kept apart from the reasons for that.
+declare -A reasons unmerged ahead done_file done_status
+add_reason() { reasons[$1]+="${reasons[$1]:+; }$2"; }
+
+# A task file found for $slug: remember it when its status says the worker is done.
+note_status() {
+    local st
+    st=$(task_status "$2") || return 0
+    if [[ "$st" =~ $DONE_RE ]] && [ -z "${done_file[$1]+set}" ]; then
+        done_file[$1]=$2 done_status[$1]=$st
+    fi
+}
+
+# Up to three paths from a status listing, for a reason line.
+first_paths() {
+    local out="" n=0 l
+    while IFS= read -r l; do
+        [ -n "$l" ] || continue
+        n=$((n + 1))
+        [ "$n" -le 3 ] && out+="${out:+, }${l:3}"
+    done <<< "$1"
+    [ "$n" -le 3 ] || out+=", and $((n - 3)) more"
+    printf '%s\n' "$out"
+}
+
+for slug in ${slugs[@]+"${slugs[@]}"}; do
+    branch="task/$slug"
+    wt=${d_path[$slug]}
+    [ -n "$wt" ] || wt="$root/$repo@$slug"
+    wt_phys=""
+    [ -d "$wt" ] && wt_phys=$(cd -- "$wt" && pwd -P)
+
+    unmerged[$slug]=0
+    if ! git -C "$main" merge-base --is-ancestor "refs/heads/$branch" "refs/heads/$base"; then
+        unmerged[$slug]=1
+        ahead[$slug]=$(git -C "$main" rev-list --count "refs/heads/$base..refs/heads/$branch")
+    fi
+
+    if [ -n "${d_path[$slug]}" ] && [ "${d_missing[$slug]}" -eq 0 ]; then
+        if [ "${d_broken[$slug]}" -eq 1 ]; then
+            add_reason "$slug" "$wt is registered but is not a working worktree ('git worktree list' calls it prunable); repair or remove it by hand"
+        else
+            if status=$(git -C "$wt" status --porcelain --untracked-files=all 2>&1); then
+                tracked=$(grep -v '^??' <<< "$status")
+                untracked=$(grep '^??' <<< "$status")
+                [ -z "$tracked" ] || add_reason "$slug" "uncommitted changes to tracked files ($(first_paths "$tracked"))"
+                [ -z "$untracked" ] || add_reason "$slug" "untracked files ($(first_paths "$untracked"))"
+            else
+                add_reason "$slug" "cannot read its status: ${status%%$'\n'*}"
+            fi
+            for f in "$wt"/context/TASK_*.md; do
+                [ -e "$f" ] || [ -L "$f" ] || continue
+                add_reason "$slug" "a task file in the worktree ($f), which removing the worktree would delete; archive it first"
+                note_status "$slug" "$f"
+            done
+        fi
+    fi
+    for i in "${!task_links[@]}"; do
+        if under "${task_link_dest[$i]}" "$wt" "$wt_phys"; then
+            add_reason "$slug" "${task_links[$i]} links into it ($(readlink -- "${task_links[$i]}")); archive the task file and remove the link"
+            note_status "$slug" "${task_links[$i]}"
+        fi
+    done
+    for entry in ${task_checkouts[@]+"${task_checkouts[@]}"}; do
+        if [ "${entry%%|*}" = "$repo@$slug" ]; then
+            add_reason "$slug" "${entry#*|} names this checkout (Checkout: $repo@$slug) and is not archived"
+            note_status "$slug" "${entry#*|}"
+        fi
+    done
+    if [ -n "${d_path[$slug]}" ]; then
+        [ "${d_locked[$slug]}" -eq 0 ] || add_reason "$slug" "the worktree is locked ('git worktree unlock $wt')"
+        if under "$here" "$wt" "$wt_phys" || under "$PWD" "$wt" "$wt_phys"; then
+            add_reason "$slug" "the current directory is inside it"
+        fi
+    fi
+done
+
+# A merge is made in the main checkout, so it must be on the default branch -- never switched
+# there behind the operator's back -- with no change to a tracked file and no merge under way.
+merge_blocker=""
+main_branch=$(git -C "$main" symbolic-ref -q HEAD)
+if [ "$main_branch" != "refs/heads/$base" ]; then
+    on=${main_branch#refs/heads/}
+    merge_blocker="merging it needs the main checkout ($main) on $base, and it is on ${on:-a detached HEAD}"
+elif git -C "$main" rev-parse -q --verify MERGE_HEAD > /dev/null; then
+    merge_blocker="merging it needs the main checkout ($main) with no merge under way"
+else
+    main_changes=$(git -C "$main" status --porcelain --untracked-files=no)
+    [ -z "$main_changes" ] ||
+        merge_blocker="merging it needs no uncommitted change to the main checkout's tracked files ($(first_paths "$main_changes"))"
+fi
+
+# --- what to do -----------------------------------------------------------------------------
+
+ok=() refused=()
+if [ "${#names[@]}" -gt 0 ]; then
+    for n in "${names[@]}"; do
+        if ! [[ "$n" =~ $NAME_RE ]] || [ -z "${d_path[$n]+set}" ]; then
+            why="no dispatch of $repo has that slug (no worktree $root/$repo@$n on task/$n, and no task/$n without a worktree)"
+            case "$n" in
+                task/*|*@*) why="$why; name the slug alone" ;;
+            esac
+            if [[ "$n" =~ $NAME_RE ]] && git -C "$main" show-ref --verify --quiet "refs/heads/task/$n" &&
+                [ -n "${checked_out[refs/heads/task/$n]+set}" ]; then
+                why="task/$n is checked out at ${checked_out[refs/heads/task/$n]}, which is not its dispatch's path ($root/$repo@$n)"
+            fi
+            reasons[$n]=$why
+            refused+=("$n")
+            continue
+        fi
+        if [ "${unmerged[$n]}" -eq 1 ] && [ -n "$merge_blocker" ]; then
+            add_reason "$n" "task/$n is not merged into $base, and $merge_blocker"
+        fi
+        if [ -n "${reasons[$n]:-}" ]; then
+            refused+=("$n")
+        else
+            ok+=("$n")
+        fi
+    done
+else
+    for slug in ${slugs[@]+"${slugs[@]}"}; do
+        if [ -n "${reasons[$slug]:-}" ] || [ "${unmerged[$slug]}" -eq 1 ]; then
+            refused+=("$slug")
+        else
+            ok+=("$slug")
+        fi
+    done
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+    echo "$SELF: root: $root    ($root_from)"
+    echo "$SELF: default branch: $base    (from $base_from)"
+fi
+
+if [ "${#names[@]}" -gt 0 ] && [ "${#refused[@]}" -gt 0 ]; then
+    for n in "${refused[@]}"; do
+        echo "$SELF: refused $n: ${reasons[$n]}" >&2
+    done
+    if [ "$dry_run" -eq 1 ]; then
+        echo "$SELF: dry run -- nothing would be collected: every named slug must pass" >&2
+    else
+        echo "$SELF: nothing collected: every named slug must pass" >&2
+    fi
+    exit 1
+fi
+
+# With no slugs nothing is merged. A dispatch whose task file says the worker is done is listed
+# as finished, with what collecting it takes, when it is unmerged or its worktree is gone; any
+# other dispatch that cannot be collected is skipped with its reasons. A done task file in the
+# main checkout whose checkout has neither worktree nor branch left is listed too: there is
+# nothing to collect, only the task file to archive.
+if [ "${#names[@]}" -eq 0 ]; then
+    [ "${#slugs[@]}" -gt 0 ] || echo "$SELF: no dispatches of $repo under $root"
+    for slug in ${refused[@]+"${refused[@]}"}; do
+        gone=""
+        if [ -z "${d_path[$slug]}" ] || [ "${d_missing[$slug]}" -eq 1 ]; then
+            gone=" its worktree $root/$repo@$slug is gone,"
+        fi
+        if [ -n "${done_file[$slug]+set}" ] && [ "${unmerged[$slug]}" -eq 1 ]; then
+            echo "$SELF: finished $slug: ${done_file[$slug]} says ${done_status[$slug]},$gone and task/$slug has" \
+                "${ahead[$slug]} commit(s) not in $base. Review it, then 'git collect $slug' merges it" \
+                "(--no-ff) and collects it${reasons[$slug]:+, once this holds: ${reasons[$slug]}}"
+        elif [ -n "${done_file[$slug]+set}" ] && [ -n "$gone" ]; then
+            echo "$SELF: finished $slug: ${done_file[$slug]} says ${done_status[$slug]},$gone and task/$slug is" \
+                "merged into $base. Archive the task file; then 'git collect' deletes the branch, once this" \
+                "holds: ${reasons[$slug]}"
+        elif [ "${unmerged[$slug]}" -eq 1 ]; then
+            echo "$SELF: skip $slug: task/$slug is not merged into $base${reasons[$slug]:+; ${reasons[$slug]}}"
+        else
+            echo "$SELF: skip $slug: ${reasons[$slug]}"
+        fi
+    done
+    for entry in ${task_checkouts[@]+"${task_checkouts[@]}"}; do
+        co=${entry%%|*} f=${entry#*|}
+        slug=${co#"$repo@"}
+        [ "$slug" != "$co" ] && [[ "$slug" =~ $NAME_RE ]] || continue
+        [ -z "${d_path[$slug]+set}" ] || continue
+        [ -z "${checked_out[refs/heads/task/$slug]+set}" ] || continue
+        st=$(task_status "$f") && [[ "$st" =~ $DONE_RE ]] || continue
+        echo "$SELF: finished $slug: $f says $st, but its worktree $root/$repo@$slug and task/$slug are" \
+            "both gone: nothing is left to collect. Archive the task file once its work is in $base"
+    done
+    for i in "${!task_links[@]}"; do
+        [ -e "${task_links[$i]}" ] && continue
+        echo "$SELF: dangling: ${task_links[$i]} -> $(readlink -- "${task_links[$i]}"): its task file is gone" \
+            "(lost with its worktree?); left in place"
+    done
+fi
+
+# --- act ------------------------------------------------------------------------------------
+
+# Runs one step, or with --dry-run only says it would: "$1" is what it would do, "$2" what it did,
+# and the rest is the command. A step git refuses is said with git's own words, and returns 1.
+step() {
+    local would=$1 did=$2 err
+    shift 2
+    if [ "$dry_run" -eq 1 ]; then
+        echo "$SELF: $slug: would $would"
+    elif err=$("$@" 2>&1); then
+        echo "$SELF: $slug: $did"
+    else
+        echo "$SELF: $slug: git refused to $would: ${err//$'\n'/ }" >&2
+        return 1
+    fi
+}
+
+failed=0
+for idx in "${!ok[@]}"; do
+    slug=${ok[$idx]}
+    branch="task/$slug"
+    wt=${d_path[$slug]}
+    sha=$(git -C "$main" rev-parse --short "refs/heads/$branch")
+    # Only a named slug gets here unmerged. A merge that fails is undone (a conflict is aborted,
+    # leaving the main checkout as it was), and nothing after it is attempted: the slugs before it
+    # are collected, this one and those after it are as they were.
+    if [ "${unmerged[$slug]}" -eq 1 ]; then
+        if ! step "merge $branch into $base (--no-ff; ${ahead[$slug]} commit(s))" \
+            "merged $branch into $base (--no-ff; ${ahead[$slug]} commit(s))" \
+            git -C "$main" merge --no-ff --no-edit -m "Merge branch '$branch'" "refs/heads/$branch"; then
+            if git -C "$main" rev-parse -q --verify MERGE_HEAD > /dev/null; then
+                git -C "$main" merge --abort > /dev/null 2>&1 ||
+                    echo "$SELF: $slug: 'git merge --abort' failed; the main checkout is mid-merge" >&2
+                echo "$SELF: $slug: the merge was aborted; merge it by hand, then 'git collect $slug'" >&2
+            fi
+            echo "$SELF: $slug: $branch and its worktree are kept" >&2
+            rest=("${ok[@]:idx+1}")
+            [ "${#rest[@]}" -eq 0 ] || echo "$SELF: not attempted: ${rest[*]}" >&2
+            failed=1
+            break
+        fi
+    fi
+    if [ -n "$wt" ] && [ "${d_missing[$slug]}" -eq 1 ]; then
+        if ! step "remove the registration of $wt (missing on disk)" \
+            "removed the registration of $wt (missing on disk)" git -C "$main" worktree remove "$wt"; then
+            echo "$SELF: $slug: $branch is kept" >&2
+            failed=1
+            continue
+        fi
+    elif [ -n "$wt" ]; then
+        ignored=$(git -C "$wt" ls-files --others --ignored --exclude-standard | wc -l)
+        ignored=${ignored//[[:space:]]/}
+        if ! step "remove $wt ($ignored ignored file(s) with it)" \
+            "removed $wt ($ignored ignored file(s) with it)" git -C "$main" worktree remove "$wt"; then
+            echo "$SELF: $slug: $branch is kept" >&2
+            failed=1
+            continue
+        fi
+    elif [ -e "$root/$repo@$slug" ] || [ -L "$root/$repo@$slug" ]; then
+        echo "$SELF: $slug: $root/$repo@$slug exists but is not a worktree of $main; left in place"
+    fi
+    step "delete $branch (at $sha, merged into $base)" "deleted $branch (was $sha, merged into $base)" \
+        git -C "$main" branch -D "$branch" || failed=1
+done
+[ "$dry_run" -eq 0 ] || echo "$SELF: dry run -- nothing changed"
+exit "$failed"
