@@ -1044,6 +1044,67 @@ test28() {
         "$( [ -e "$(wt_of sub)/lib/.git" ] && echo there)"
 }
 
+test29() {
+    begin test29 "the merge opens the editor on git's message, as by hand; an emptied message stops it"
+    new_project t29
+    dispatch_wt edited
+    work edited
+    dispatch_wt emptied
+    work emptied
+    dispatch_wt after
+    work after
+    # A fake editor, standing in for the operator. GIT_MERGE_AUTOEDIT=yes is what a terminal implies.
+    cat > "$D/editor" <<'EOF'
+#!/bin/bash
+{ echo "--- shown"; cat "$1"; } >> "$EDITOR_LOG"
+case "$EDITOR_DO" in
+    reword) { echo "Merge task/edited: reviewed"; echo; echo "The operator's words."; } > "$1" ;;
+    empty) : > "$1" ;;
+esac
+EOF
+    chmod +x "$D/editor"
+    (cd "$MAIN" && GIT_MERGE_AUTOEDIT=yes GIT_EDITOR="$D/editor" EDITOR_DO=reword EDITOR_LOG="$D/editor.log" \
+        PATH="$SAFE_PATH" "$SCRIPT" edited) > "$D/out" 2> "$D/err" < /dev/null
+    assert_eq "edited: exits 0" "0" "$?"
+    assert_contains "the editor was shown git's default message" "Merge branch 'task/edited'" "$(cat "$D/editor.log")"
+    assert_eq "the merge commit has the operator's message" "Merge task/edited: reviewed|The operator's words." \
+        "$(git -C "$MAIN" log -1 --format='%s|%b' master | sed '/^$/d')"
+    assert_eq "it is the --no-ff merge of task/edited" "3" "$(git -C "$MAIN" rev-list --parents -n 1 master | wc -w | tr -d ' ')"
+    collected "edited, then collected" edited
+
+    local head
+    head=$(git -C "$MAIN" rev-parse master)
+    (cd "$MAIN" && GIT_MERGE_AUTOEDIT=yes GIT_EDITOR="$D/editor" EDITOR_DO=empty EDITOR_LOG="$D/editor.log" \
+        PATH="$SAFE_PATH" "$SCRIPT" emptied after) > "$D/out" 2> "$D/err" < /dev/null
+    assert_eq "emptied: exits 1" "1" "$?"
+    assert_eq "emptied: master did not move" "$head" "$(git -C "$MAIN" rev-parse master)"
+    assert_eq "emptied: no merge under way" "none" "$(git -C "$MAIN" rev-parse -q --verify MERGE_HEAD || echo none)"
+    assert_eq "emptied: the main checkout is clean" "" "$(git -C "$MAIN" status --porcelain)"
+    kept "emptied" emptied
+    assert_eq "emptied: its worktree is kept" "refs/heads/task/emptied" "$(git -C "$(wt_of emptied)" symbolic-ref HEAD 2>&1)"
+    kept "the one after it" after
+    assert_contains "emptied: says what was not attempted" "git-collect: not attempted: after" "$(cat "$D/err")"
+}
+
+test30() {
+    begin test30 "on a terminal, with nothing forced, git opens the editor (the merge is not captured)"
+    if ! command -v script > /dev/null 2>&1; then
+        fail "this test needs util-linux 'script' to give git-collect a terminal"
+        return
+    fi
+    new_project t30
+    dispatch_wt tty
+    work tty
+    printf '#!/bin/sh\necho "shown: $(head -n 1 "$1")" > "%s/editor.log"\n' "$D" > "$D/editor"
+    chmod +x "$D/editor"
+    (cd "$MAIN" && env -u GIT_MERGE_AUTOEDIT GIT_EDITOR="$D/editor" PATH="$SAFE_PATH" SHELL=/bin/bash \
+        script -qec "$(printf '%q' "$SCRIPT") tty" /dev/null) > "$D/out" 2>&1 < /dev/null
+    assert_eq "exits 0" "0" "$?"
+    assert_eq "the editor was opened on git's default message" "shown: Merge branch 'task/tty'" \
+        "$(cat "$D/editor.log" 2>&1)"
+    collected "then collected" tty
+}
+
 test1
 test2
 test3
@@ -1072,6 +1133,8 @@ test25
 test26
 test27
 test28
+test29
+test30
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1103,6 +1166,8 @@ echo "25. a conflict is aborted; nothing after it is attempted ............... t
 echo "26. no arguments: unmerged Finished/Author Verified listed for review ... test26"
 echo "27. no arguments: a finished task whose worktree is gone is listed ..... test27"
 echo "28. never --force: a worktree holding a submodule is kept .............. test28"
+echo "29. the merge opens git's editor; an emptied message stops the run .... test29"
+echo "30. on a terminal, git opens the editor with nothing forced ........... test30"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do

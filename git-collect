@@ -33,8 +33,9 @@
 #     unlocked   the worktree is not locked (`git worktree lock`), and the current directory is
 #                not inside it.
 #
-#   Then, for each dispatch: `git merge --no-ff` when it is named and not merged (a conflict is
-#   aborted, and nothing after it is attempted); `git worktree remove <path>` (never --force; if
+#   Then, for each dispatch: `git merge --no-ff task/<slug>` when it is named and not merged, on
+#   the terminal, so git opens the editor on its merge message as it does by hand (a conflict, or
+#   an emptied message, is aborted, and nothing after it is attempted); `git worktree remove <path>` (never --force; if
 #   git still refuses, that is reported and the branch is kept); then `git branch -D task/<slug>`,
 #   safe once it is merged. A worktree registered but missing on disk has its registration removed
 #   (`git worktree remove` on the missing path, which touches no other worktree, where `git
@@ -539,13 +540,17 @@ for idx in "${!ok[@]}"; do
     branch="task/$slug"
     wt=${d_path[$slug]}
     sha=$(git -C "$main" rev-parse --short "refs/heads/$branch")
-    # Only a named slug gets here unmerged. A merge that fails is undone (a conflict is aborted,
-    # leaving the main checkout as it was), and nothing after it is attempted: the slugs before it
-    # are collected, this one and those after it are as they were.
+    # Only a named slug gets here unmerged. The merge is git's own, on the terminal, exactly as by
+    # hand: run interactively, git opens the editor on its default message (and skips it when not,
+    # or under GIT_MERGE_AUTOEDIT=no). A merge that does not complete -- a conflict, or a message
+    # left empty -- is aborted, leaving the main checkout as it was, and nothing after it is
+    # attempted: the slugs before it are collected, this one and those after it are as they were.
     if [ "${unmerged[$slug]}" -eq 1 ]; then
-        if ! step "merge $branch into $base (--no-ff; ${ahead[$slug]} commit(s))" \
-            "merged $branch into $base (--no-ff; ${ahead[$slug]} commit(s))" \
-            git -C "$main" merge --no-ff --no-edit -m "Merge branch '$branch'" "refs/heads/$branch"; then
+        if [ "$dry_run" -eq 1 ]; then
+            echo "$SELF: $slug: would merge $branch into $base (--no-ff; ${ahead[$slug]} commit(s))"
+        elif git -C "$main" merge --no-ff "$branch"; then
+            echo "$SELF: $slug: merged $branch into $base (--no-ff; ${ahead[$slug]} commit(s))"
+        else
             if git -C "$main" rev-parse -q --verify MERGE_HEAD > /dev/null; then
                 git -C "$main" merge --abort > /dev/null 2>&1 ||
                     echo "$SELF: $slug: 'git merge --abort' failed; the main checkout is mid-merge" >&2

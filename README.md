@@ -864,8 +864,13 @@ and what lets collect go ahead.
 
 **What it does**, for each dispatch it takes, in this order:
 
-1. **Named and not merged:** `git merge --no-ff --no-edit -m "Merge branch 'task/<slug>'"` in the main
-   checkout. A fast-forward is never made, so the merge is always its own commit. The main checkout must
+1. **Named and not merged:** `git merge --no-ff task/<slug>` in the main checkout, run on your terminal
+   exactly as you would run it by hand. Git opens your editor on its default message (`Merge branch
+   'task/<slug>'`); save it, edited or not, and collect moves on. Git skips the editor when the output is
+   not a terminal (a script, the tests) or under `GIT_MERGE_AUTOEDIT=no`, and git's own output (the
+   diffstat, a conflict report) goes straight to you. A message left empty means "don't merge": git stops,
+   and collect aborts the merge and stops as for a conflict. A fast-forward is never made, so the merge
+   is always its own commit. The main checkout must
    already be on the default branch, with no change to a tracked file and no merge under way; it is
    never switched or stashed for you, and otherwise the slug is refused before anything changes.
    Untracked files in it do not block the merge. **A conflict is aborted** (`git merge --abort`, leaving
