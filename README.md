@@ -808,6 +808,7 @@ Until the worktree and branch are both gone, `git dispatch` also refuses that sl
 ```sh
 git collect                 # what is merged goes; what is finished is listed for review
 git collect failed-call     # after review: merge it (--no-ff) and collect it
+git collect task/failed-call  # the same: a dispatch is named by its slug or its branch
 ```
 
 **What counts as a dispatch.** A worktree at `<root>/<repo>@<slug>` on `task/<slug>`, with `<root>` and

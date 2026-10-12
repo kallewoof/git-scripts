@@ -601,7 +601,8 @@ test14() {
     refused "a detached worktree, named" "no dispatch of terea has that slug" det
     refused "a worktree on another branch, named" "no dispatch of terea has that slug" foo
     refused "a task branch at another path, named" "task/bar is checked out at $ROOT/elsewhere" bar
-    refused "a slug with its branch prefix" "name the slug alone" task/det
+    refused "a detached worktree, by its branch name" "refused det: no dispatch of terea has that slug" task/det
+    refused "<repo>@<slug>" "name the slug alone (or task/<slug>)" terea@det
 }
 
 # --- tests 15-18: modes ---------------------------------------------------------------------
@@ -1105,6 +1106,39 @@ test30() {
     collected "then collected" tty
 }
 
+test31() {
+    begin test31 "a dispatch is named by its slug or by its branch, task/<slug>"
+    new_project t31
+    ready bybranch
+    run_collect task/bybranch
+    assert_eq "task/<slug>: exits 0" "0" "$STATUS"
+    assert_contains "task/<slug>: reported by its slug" "git-collect: bybranch: deleted task/bybranch" "$OUT"
+    collected "task/<slug>" bybranch
+
+    dispatch_wt merging
+    work merging
+    run_collect task/merging
+    assert_eq "task/<slug>, unmerged: exits 0" "0" "$STATUS"
+    assert_eq "task/<slug>, unmerged: git's message names the branch once" "Merge branch 'task/merging'" \
+        "$(git -C "$MAIN" log -1 --format=%s master)"
+    collected "task/<slug>, unmerged" merging
+
+    ready mixed
+    ready plain
+    run_collect task/mixed plain
+    assert_eq "both forms together: exits 0" "0" "$STATUS"
+    collected "both forms together (task/)" mixed
+    collected "both forms together (bare)" plain
+
+    ready twice
+    local before
+    before=$(snapshot)
+    run_collect twice task/twice
+    assert_eq "the same dispatch both ways: exits 2" "2" "$STATUS"
+    assert_contains "the same dispatch both ways: says so" "'twice' and 'task/twice' name the same dispatch" "$ERR"
+    assert_eq "the same dispatch both ways: nothing changed" "$before" "$(snapshot)"
+}
+
 test1
 test2
 test3
@@ -1135,6 +1169,7 @@ test27
 test28
 test29
 test30
+test31
 
 echo
 echo "== behaviour -> test mapping =="
@@ -1168,6 +1203,7 @@ echo "27. no arguments: a finished task whose worktree is gone is listed ..... t
 echo "28. never --force: a worktree holding a submodule is kept .............. test28"
 echo "29. the merge opens git's editor; an emptied message stops the run .... test29"
 echo "30. on a terminal, git opens the editor with nothing forced ........... test30"
+echo "31. a dispatch is named by its slug or by task/<slug> ................. test31"
 echo
 TESTS_ERRORED=0
 for t in "${ORDER[@]}"; do

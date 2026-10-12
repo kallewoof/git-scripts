@@ -7,6 +7,8 @@
 # Usage:
 #   git collect [--dry-run] [<slug>...]
 #
+#   A slug is named bare or as its branch: 'foo' and 'task/foo' are the same dispatch.
+#
 #   Merge a reviewed dispatch and remove what it leaves on disk:
 #     git merge --no-ff task/<slug>; git worktree remove <root>/<repo>@<slug>; git branch -D task/<slug>
 #   A dispatch of this repo is a worktree at <root>/<repo>@<slug> on task/<slug> -- <root> and <repo>
@@ -82,6 +84,7 @@ Usage:
                 rest, exit 0.
                 Slugs: all or nothing; any refusal exits 1 and changes nothing. The merge needs
                 the main checkout on the default branch; a conflict is aborted and stops the run.
+  <slug>        foo, or its branch task/foo.
   --dry-run     Print every merge, removal, deletion, skip and refusal; change nothing.
 EOF
 }
@@ -109,10 +112,13 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+# A dispatch is named by its slug or by its branch: 'foo' and 'task/foo' are the same one.
 declare -A named
-for n in ${names[@]+"${names[@]}"}; do
-    [ -z "${named[$n]+set}" ] || usage_error "'$n' named twice"
-    named[$n]=1
+for i in ${names[@]+"${!names[@]}"}; do
+    n=${names[$i]#task/}
+    [ -z "${named[$n]+set}" ] || usage_error "'${named[$n]}' and '${names[$i]}' name the same dispatch"
+    named[$n]=${names[$i]}
+    names[$i]=$n
 done
 
 # As in git dispatch: these would point every git command below at a repository other than the
@@ -428,7 +434,7 @@ if [ "${#names[@]}" -gt 0 ]; then
         if ! [[ "$n" =~ $NAME_RE ]] || [ -z "${d_path[$n]+set}" ]; then
             why="no dispatch of $repo has that slug (no worktree $root/$repo@$n on task/$n, and no task/$n without a worktree)"
             case "$n" in
-                task/*|*@*) why="$why; name the slug alone" ;;
+                *@*) why="$why; name the slug alone (or task/<slug>)" ;;
             esac
             if [[ "$n" =~ $NAME_RE ]] && git -C "$main" show-ref --verify --quiet "refs/heads/task/$n" &&
                 [ -n "${checked_out[refs/heads/task/$n]+set}" ]; then
