@@ -793,6 +793,10 @@ class Sweep:
         proc = self.proc
         if proc is None:
             return
+        if os.name == "nt":
+            kill_tree_nt(proc)
+            self.proc = None
+            return
         # Kill the process group we started, by the pgid we own. Never a name match.
         try:
             pgid = os.getpgid(proc.pid)
@@ -848,6 +852,10 @@ class Sweep:
             except subprocess.TimeoutExpired:
                 # What `timeout -k 5` did: TERM the group, then KILL it, and report 124.
                 self.run_timed_out = True
+                if os.name == "nt":
+                    kill_tree_nt(proc)
+                    proc.wait()
+                    return 124
                 try:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except OSError:
@@ -1316,8 +1324,18 @@ This file is untracked and deliberately not gitignored -- it exists to show up i
 """ % (os.getpid(), host, started, mutations_file))
 
 
+def kill_tree_nt(proc):
+    """Windows has no process groups to signal; taskkill /T takes the test command's whole tree
+    by its root pid, which is still never a name match."""
+    subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def install_signal_handlers(sweep):
-    names = {signal.SIGINT: "INT", signal.SIGTERM: "TERM", signal.SIGHUP: "HUP"}
+    names = {signal.SIGINT: "INT", signal.SIGTERM: "TERM"}
+    # Windows has no SIGHUP.
+    if hasattr(signal, "SIGHUP"):
+        names[signal.SIGHUP] = "HUP"
 
     def handler(signum, frame):
         emit_err("")
