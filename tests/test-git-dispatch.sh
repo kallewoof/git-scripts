@@ -77,6 +77,10 @@ for agent in claude codex omp agent; do
     echo "argv0=$(basename "$0")"
     for a in "$@"; do echo "arg=$a"; done
 } > "$AGENT_LOG"
+if [ "${AGENT_FORBIDDEN:-0}" = 1 ]; then
+    echo "FAIL: setup-only invoked an agent" >&2
+    exit 99
+fi
 EOF
     chmod +x "$FAKEBIN/$agent"
 done
@@ -1479,6 +1483,103 @@ test37() {
         "$(printf '%s\n' "$OUT" | sed -n 's/^git-dispatch: exec: //p')"
 }
 
+# Setup-only shares setup and prompt selection with an ordinary dispatch.
+test38() {
+    begin test38 "setup-only moves and links without running an agent; all three prompts match exec"
+    local mode task wt dest sum prompt exec_line sid
+    for mode in new followup continue; do
+        move_project "t38-$mode"
+        task="$MAIN/context/TASK_setup.md"
+        wt="$PHYS/terea@setup"
+        dest="$wt/context/TASK_setup.md"
+        sid=unassigned
+        [ "$mode" = new ] || sid=$ID1
+        write_task "$task" Pending unassigned "$sid" terea@setup codex
+        [ "$mode" != continue ] || printf '\n## Report\nPrevious work.\n' >> "$task"
+        sum=$(sha1sum < "$task")
+        AGENT_FORBIDDEN=1 run_dispatch --setup-only --cwd "$D" "$task" -- --model 'a model'
+        assert_eq "$mode setup succeeds" 0 "$STATUS"
+        assert_eq "$mode agent never ran" '(not run)' "$(agent_argv)"
+        assert_eq "$mode branch created" refs/heads/task/setup "$(git -C "$wt" symbolic-ref HEAD)"
+        assert_eq "$mode bytes moved intact" "file $sum" "$(file_state "$dest")"
+        assert_eq "$mode relative link left" 'link ../../../phys/terea@setup/context/TASK_setup.md' "$(file_state "$task")"
+        assert_contains "$mode checkout field" "git-dispatch: checkout: $wt" "$OUT"
+        assert_contains "$mode task path field" "git-dispatch: task-path: $dest" "$OUT"
+        assert_contains "$mode cwd field" "git-dispatch: cwd: $D" "$OUT"
+        prompt=$(sed -n 's/^git-dispatch: prompt: //p' <<< "$OUT")
+        exec_line=$(sed -n 's/^git-dispatch: exec: //p' <<< "$OUT")
+        run_dispatch --cwd "$D" "$task" -- --model 'a model'
+        assert_eq "$mode normal dispatch succeeds" 0 "$STATUS"
+        assert_eq "$mode exact prompt matches real argv" "arg=$prompt" "$(tail -1 "$LOG")"
+        assert_eq "$mode exact exec line matches" "$exec_line" "$(sed -n 's/^git-dispatch: exec: //p' <<< "$OUT")"
+    done
+}
+
+test39() {
+    begin test39 "setup-only reuses a checkout and a task link without touching existing work"
+    move_project t39
+    local task="$MAIN/context/TASK_setup.md" wt="$PHYS/terea@setup" before
+    write_task "$task" Returned unassigned "$ID1" terea@setup claude-code
+    git -C "$MAIN" worktree add -q "$wt" -b task/setup master
+    echo 'unfinished work' >> "$wt/f.txt"
+    before=$(git -C "$wt" diff)
+    AGENT_FORBIDDEN=1 run_dispatch --setup-only "$task"
+    assert_eq 'existing checkout setup succeeds' 0 "$STATUS"
+    assert_contains 'checkout reused' "worktree: reuse $wt" "$OUT"
+    assert_eq 'existing changes preserved' "$before" "$(git -C "$wt" diff)"
+    [ -L "$task" ] && ok 'task linked' || fail 'task linked'
+    before=$(snapshot)
+    AGENT_FORBIDDEN=1 run_dispatch --setup-only "$task"
+    assert_eq 'already-linked setup succeeds' 0 "$STATUS"
+    assert_eq 'repeat leaves snapshot unchanged' "$before" "$(snapshot)"
+    assert_eq 'agent never ran' '(not run)' "$(agent_argv)"
+}
+
+test40() {
+    begin test40 "dry-run setup-only changes nothing; moving disabled preserves the original task"
+    move_project t40
+    local task="$MAIN/context/TASK_setup.md" before prompt
+    write_task "$task" Pending unassigned unassigned terea@setup
+    before=$(snapshot)
+    AGENT_FORBIDDEN=1 run_dispatch --dry-run --setup-only "$task"
+    assert_eq 'dry setup succeeds' 0 "$STATUS"
+    assert_eq 'dry setup changes nothing' "$before" "$(snapshot)"
+    assert_contains 'dry setup previews move' 'git-dispatch: move:' "$OUT"
+    assert_contains 'dry setup prints prompt' 'git-dispatch: prompt: Task: terea@setup/context/TASK_setup.md' "$OUT"
+    git -C "$MAIN" config dispatch.moveTask false
+    before=$(file_state "$task")
+    AGENT_FORBIDDEN=1 run_dispatch --setup-only "$task"
+    assert_eq 'setup without move succeeds' 0 "$STATUS"
+    assert_eq 'task stays intact' "$before" "$(file_state "$task")"
+    assert_contains 'task path names original file' "git-dispatch: task-path: $task" "$OUT"
+    assert_eq 'agent never ran' '(not run)' "$(agent_argv)"
+}
+
+test41() {
+    begin test41 "setup-only refuses the same headers and reports setup failures without agent claims"
+    move_project t41
+    local task="$MAIN/context/TASK_setup.md" normal_err
+    write_task "$task" Finished unassigned unassigned terea@setup
+    refused 'normal finished header' "status is 'Finished'" "$task"
+    normal_err=$ERR
+    refused 'setup-only finished header' "status is 'Finished'" --setup-only "$task"
+    assert_eq 'same refusal message' "$normal_err" "$ERR"
+    write_task "$task" Pending unassigned bad-session terea@setup codex
+    refused 'setup-only invalid session' 'not a session UUID' --setup-only "$task"
+    write_task "$task" Pending unassigned unassigned terea@setup
+    # Fail the link step after worktree creation, before the task moves.
+    printf '#!/bin/bash\nexit 1\n' > "$FAKEBIN/ln"
+    chmod +x "$FAKEBIN/ln"
+    AGENT_FORBIDDEN=1 run_dispatch --setup-only "$task"
+    rm "$FAKEBIN/ln"
+    assert_eq 'link failure exits 1' 1 "$STATUS"
+    assert_contains 'link failure preserves recovery information' 'the task file did not move' "$ERR"
+    assert_contains 'failure describes setup' 'setup did not complete' "$ERR"
+    assert_eq 'failure makes no agent-start claim' '' "$(grep 'agent was not started' <<< "$ERR")"
+    assert_eq 'failed setup prints no success prompt' '' "$(sed -n 's/^git-dispatch: prompt: //p' <<< "$OUT")"
+    assert_eq 'agent never ran' '(not run)' "$(agent_argv)"
+}
+
 test1
 test2
 test3
@@ -1516,9 +1617,17 @@ test34
 test35
 test36
 test37
+test38
+test39
+test40
+test41
 
 echo
 echo "== behaviour -> test mapping =="
+echo "38. setup-only creates, moves, links; prompts match normal argv ....... test38"
+echo "39. setup-only reuses existing worktrees and links .................... test39"
+echo "40. dry setup changes nothing; setup respects disabled task moves ..... test40"
+echo "41. setup-only shares refusals and reports setup failures ............. test41"
 echo "1. new task: worktree from the default branch, claude in the root ..... test1"
 echo "2. Returned task: worktree reused untouched, claude --resume .......... test2"
 echo "3. routed follow-up, new slug: new worktree, resume in the root ....... test3"

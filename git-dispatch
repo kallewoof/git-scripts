@@ -5,7 +5,7 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 # Usage:
-#   git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
+#   git dispatch [--dry-run] [--setup-only] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
 #
 #   Read a task file (<project root>/<repo>/context/TASK_<name>.md), set up its checkout
 #   (<project root>/<repo>@<slug> on task/<slug>, from its 'Checkout: <repo>@<slug>' line), and
@@ -32,6 +32,8 @@
 #   --dry-run    Print each step -- the project root and where it came from (dispatch.root
 #                or the default), the worktree command, the task file's move and link (with
 #                dispatch.moveTask), the agent's exact argv and its cwd -- and change nothing.
+#   --setup-only Prepare the checkout and task file, print the paths, prompt and argv,
+#                then stop before cd/exec. Combine with --dry-run to preview without changes.
 #   --agent A    claude, codex, omp or cursor. Resumes a session whose header has no Harness line
 #                (omp cannot resume); for a new session, picks the agent (default claude).
 #                cursor runs the 'agent' program. Contradicting a Harness is refused.
@@ -96,11 +98,14 @@ CODEX_EFFORTS=(low medium high xhigh max ultra)
 usage() {
     cat >&2 <<'EOF'
 Usage:
-  git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
+  git dispatch [--dry-run] [--setup-only] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
                 Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
                 its worker in the project root (the main checkout's parent, or dispatch.root).
   --dry-run     Print the root and where it came from, the worktree command, the agent's
                 argv and its cwd; change nothing.
+  --setup-only Prepare the checkout and task file, then stop before cd/exec. Print the
+                checkout, task-path, cwd, exact prompt and informational exec argv.
+                With --dry-run, preview the same setup without changing anything.
   --agent A     claude, codex, omp or cursor; picks a new session's agent (default claude), and
                 names the one to resume when the header has no Harness line (omp cannot resume).
                 cursor runs the 'agent' program.
@@ -127,12 +132,13 @@ usage_error() {
     exit 2
 }
 
-dry_run=0 agent_opt="" cwd_opt="" task="" seen_agent=0 seen_cwd=0
+dry_run=0 setup_only=0 agent_opt="" cwd_opt="" task="" seen_agent=0 seen_cwd=0
 effort=$DEFAULT_EFFORT seen_effort=0
 agent_args=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run) dry_run=1 ;;
+        --setup-only) setup_only=1 ;;
         --agent|--cwd|--effort)
             [ "$#" -ge 2 ] || usage_error "$1 needs a value"
             case "$1" in
@@ -694,16 +700,29 @@ if [ "$move" -eq 1 ]; then
 elif [ "$move_task" -eq 1 ]; then
     echo "$SELF: task file: $task_main links to $task_dest; nothing moves"
 fi
-echo "$SELF: cwd: $agent_cwd"
-echo "$SELF: exec: $(quote "${argv[@]}")"
+setup_summary() {
+    echo "$SELF: checkout: $wt"
+    echo "$SELF: task-path: $task_given"
+    echo "$SELF: cwd: $agent_cwd"
+    echo "$SELF: prompt: $message"
+    echo "$SELF: exec: $(quote "${argv[@]}")"
+}
+
+if [ "$setup_only" -eq 0 ]; then
+    echo "$SELF: cwd: $agent_cwd"
+    echo "$SELF: exec: $(quote "${argv[@]}")"
+fi
 
 if [ "$dry_run" -eq 1 ]; then
+    [ "$setup_only" -eq 0 ] || setup_summary
     echo "$SELF: dry run -- nothing changed"
     exit 0
 fi
 
+failure_outcome="the agent was not started"
+[ "$setup_only" -eq 0 ] || failure_outcome="setup did not complete"
 if [ "$create" -eq 1 ]; then
-    "${add[@]}" || die "git worktree add failed; the agent was not started"
+    "${add[@]}" || die "git worktree add failed; $failure_outcome"
 fi
 # The link is made first, under a temporary name beside the task file, so that the one step that
 # can fail for want of a link fails before anything moves. Then the file is renamed into the
@@ -714,22 +733,25 @@ fi
 if [ "$move" -eq 1 ]; then
     tmp_link="$main_ctx/.$task_base.dispatch-link.$$"
     mkdir -p -- "$wt/context" ||
-        die "cannot create $wt/context; the task file did not move, and the agent was not started"
+        die "cannot create $wt/context; the task file did not move, and $failure_outcome"
     ln -s -- "$link_target" "$tmp_link" ||
-        die "cannot create a link in $main_ctx; the task file did not move, and the agent was not started"
+        die "cannot create a link in $main_ctx; the task file did not move, and $failure_outcome"
     if ! mv -- "$task_main" "$task_dest"; then
         rm -f -- "$tmp_link"
-        die "cannot move $task_main to $task_dest; it is still where it was, and the agent was not started"
+        die "cannot move $task_main to $task_dest; it is still where it was, and $failure_outcome"
     fi
     if ! mv -- "$tmp_link" "$task_main"; then
         if mv -- "$task_dest" "$task_main"; then
             rm -f -- "$tmp_link"
-            die "cannot put the link at $task_main; the task file was moved back there, and the agent" \
-                "was not started"
+            die "cannot put the link at $task_main; the task file was moved back there, and $failure_outcome"
         fi
         die "cannot put the link at $task_main, nor move the task file back: it is at $task_dest, and" \
-            "the link is at $tmp_link. Rename the link ('mv $tmp_link $task_main'); the agent was not started"
+            "the link is at $tmp_link. Rename the link ('mv $tmp_link $task_main'); $failure_outcome"
     fi
+fi
+if [ "$setup_only" -eq 1 ]; then
+    setup_summary
+    exit 0
 fi
 cd -- "$agent_cwd" || die "cannot enter $agent_cwd"
 exec "${argv[@]}"

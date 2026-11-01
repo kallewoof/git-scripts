@@ -562,7 +562,7 @@ test the fix rather than the property.
 # git dispatch
 
 ```
-git dispatch [--dry-run] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
+git dispatch [--dry-run] [--setup-only] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
 ```
 
 Everything after a `--` following the task file goes verbatim to the agent program. For a task whose
@@ -689,6 +689,32 @@ the same steps (the project root and whether it came from `dispatch.root` or the
 command, the exact argv as `printf %q` would quote it, and the cwd) and changes nothing. A set
 `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` is refused: it would point every git command,
 the agent's included, at a repository the task file did not name.
+
+## `--setup-only`
+
+Use `git dispatch --setup-only <task file>` from an already-running worker to prepare the
+checkout and task file, then continue in that session. It performs all normal validation
+(including checking the selected agent on `PATH`), worktree creation or reuse, and the configured
+`dispatch.moveTask` move/link sequence. It exits 0 before changing to the agent's cwd or executing
+it. Validation and setup failures exit non-zero, with the same cause and recovery instructions.
+
+After successful setup it prints these stable, line-oriented fields on stdout:
+
+```text
+git-dispatch: checkout: <root>/<repo>@<slug>
+git-dispatch: task-path: <root>/<repo>@<slug>/context/TASK_<name>.md
+git-dispatch: cwd: <root>
+git-dispatch: prompt: Task: <repo>@<slug>/context/TASK_<name>.md
+git-dispatch: exec: <shell-quoted agent argv>
+```
+
+Match the exact prefixes, and take the remainder of each line as its value. Paths are absolute
+and unquoted; `task-path` names the actual task file (in the main checkout when moving is disabled).
+The prompt is unquoted and exactly the text normal dispatch would pass, including its choice of
+`Task:`, `Follow-up task:` or `Continue task:` and paths relative to `cwd` where applicable.
+The `exec` value uses Bash `printf %q` quoting and is informational. Only consume the summary as
+successful setup when the command exits 0. `--dry-run --setup-only` prints the planned steps and
+these same fields without changing anything; its paths may not yet exist.
 
 ## Why every worker starts in the project root
 
