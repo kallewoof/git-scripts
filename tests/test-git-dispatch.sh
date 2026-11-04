@@ -142,7 +142,7 @@ write_task() {
 
 # run_dispatch [args...]: runs from $D (outside every checkout); sets OUT, ERR, STATUS.
 run_dispatch() {
-    (cd "$D" && PATH="$SAFE_PATH" AGENT_LOG="$LOG" "$SCRIPT" "$@") > "$D/out" 2> "$D/err"
+    (cd "${DISPATCH_RUN_IN:-$D}" && PATH="$SAFE_PATH" AGENT_LOG="$LOG" "$SCRIPT" "$@") > "$D/out" 2> "$D/err"
     STATUS=$?
     OUT=$(cat "$D/out")
     ERR=$(cat "$D/err")
@@ -1621,6 +1621,238 @@ test38
 test39
 test40
 test41
+
+begin test_track_default "trackTask false has byte-identical output to unset"
+new_project track-default
+git -C "$MAIN" config dispatch.root "$ROOT"
+T="$MAIN/context/TASK_track.md"
+write_task "$T" Pending unassigned unassigned terea@track
+run_dispatch --dry-run --setup-only "$T"
+track_unset_out=$OUT track_unset_err=$ERR
+git -C "$MAIN" config dispatch.trackTask false
+run_dispatch --dry-run --setup-only "$T"
+assert_eq "stdout unchanged" "$track_unset_out" "$OUT"
+assert_eq "stderr unchanged" "$track_unset_err" "$ERR"
+
+begin test_track_first "trackTask previews, commits and removes draft without a link"
+git -C "$MAIN" config dispatch.trackTask true
+before=$(snapshot)
+run_dispatch --dry-run --setup-only "$T"
+assert_eq "preview succeeds" 0 "$STATUS"
+assert_eq "preview changes nothing" "$before" "$(snapshot)"
+assert_contains "prints force-add" 'add -f -- context/TASK_track.md' "$OUT"
+assert_contains "prints commit" 'Dispatch\ TASK_track' "$OUT"
+assert_contains "prints absence of link" 'link: none' "$OUT"
+run_dispatch --setup-only "$T"
+assert_eq "setup succeeds" 0 "$STATUS"
+WT="$ROOT/terea@track"
+[ ! -e "$T" ] && [ ! -L "$T" ] && ok "main task absent" || fail "main task absent"
+assert_eq "fixed dispatch message" 'Dispatch TASK_track' "$(git -C "$WT" log -1 --format=%s)"
+assert_eq "task tracked" context/TASK_track.md "$(git -C "$WT" ls-files context/)"
+assert_eq "worktree clean" '' "$(git -C "$WT" status --porcelain)"
+assert_contains "stable task-path" "git-dispatch: task-path: $WT/context/TASK_track.md" "$OUT"
+assert_eq "setup does not start agent" '(not run)' "$(agent_argv)"
+
+begin test_track_return "Returned notes committed; root path, filename, slug and clean resume work"
+write_task "$WT/context/TASK_track.md" Returned Codex "$ID1" terea@track codex
+DISPATCH_RUN_IN=$ROOT
+for name in terea@track/context/TASK_track.md TASK_track.md track; do
+    run_dispatch --setup-only "$name"
+    assert_eq "redispatch by $name" 0 "$STATUS"
+    assert_contains "resumes recorded worker" "resume" "$OUT"
+done
+assert_eq "return message" 'Return TASK_track' "$(git -C "$WT" log -1 --format=%s)"
+assert_eq "only one return commit" 3 "$(git -C "$WT" rev-list --count HEAD)"
+unset DISPATCH_RUN_IN
+
+begin test_track_list "list shows worktree status, session and undispatched drafts"
+write_task "$MAIN/context/TASK_draft.md" Pending unassigned unassigned terea@draft
+DISPATCH_RUN_IN=$ROOT
+run_dispatch --list
+assert_eq "list succeeds" 0 "$STATUS"
+assert_contains "returned inventory row" $'terea\ttrack\tReturned\t'"$ID1" "$OUT"
+assert_contains "draft inventory row" $'terea\tdraft\tPending\tunassigned' "$OUT"
+unset DISPATCH_RUN_IN
+
+begin test_track_hook "new worktree hook refusal removes only its new worktree and branch"
+new_project track-hook
+git -C "$MAIN" config dispatch.root "$ROOT"
+git -C "$MAIN" config dispatch.trackTask true
+T="$MAIN/context/TASK_hook.md"
+write_task "$T" Pending unassigned unassigned terea@hook
+cat > "$MAIN/.git/hooks/pre-commit" <<'HOOK'
+#!/bin/sh
+echo hook-damage >> f.txt
+echo hook-damage >> context/TASK_hook.md
+echo new > hook-created.txt
+git add f.txt hook-created.txt
+exit 1
+HOOK
+chmod +x "$MAIN/.git/hooks/pre-commit"
+refused "initial hook refusal" "new worktree and branch removed" --setup-only "$T"
+
+begin test_track_existing_rollback "existing worktree refusal preserves large ignored files and worker edits"
+git -C "$MAIN" worktree add -q "$ROOT/terea@hook" -b task/hook master
+WT="$ROOT/terea@hook"
+echo dirty >> "$WT/f.txt"
+mkdir "$WT/scratch"
+printf '/scratch/\n' >> "$MAIN/.git/info/exclude"
+truncate -s 1100M "$WT/scratch/large"
+ignored_before=$(stat -c '%i:%s:%Y' "$WT/scratch/large")
+worker_before=$(stat -c '%i:%s:%Y' "$WT/f.txt")
+task_before=$(cat "$T")
+head_before=$(git -C "$WT" rev-parse HEAD)
+cat > "$MAIN/.git/hooks/pre-commit" <<'HOOK'
+#!/bin/sh
+echo hook-damage >> context/TASK_hook.md
+echo new > hook-created.txt
+exit 1
+HOOK
+# Refuse snapshot commands outright: neither the ignored tree nor the task needs a temp copy.
+for tool in tar mktemp; do
+    printf '#!/bin/sh\necho unexpected-copy > "$FORBIDDEN_COPY_LOG"\nexit 99\n' > "$FAKEBIN/$tool"
+    chmod +x "$FAKEBIN/$tool"
+done
+FORBIDDEN_COPY_LOG="$D/copy.log" run_dispatch --setup-only "$T"
+assert_eq "existing hook refusal exits 1" 1 "$STATUS"
+assert_contains "refusal explains side effects" 'hook side effects, if any, are left in place' "$ERR"
+assert_eq "draft contents preserved" "$task_before" "$(cat "$T")"
+assert_eq "copied task index entry removed" '' "$(git -C "$WT" ls-files --stage context/TASK_hook.md)"
+[ ! -e "$WT/context/TASK_hook.md" ] && ok "copied task removed" || fail "copied task removed"
+[ ! -d "$WT/context" ] && ok "new empty context removed" || fail "new empty context removed"
+assert_eq "worker content untouched" $'one\ndirty' "$(cat "$WT/f.txt")"
+assert_eq "worker inode untouched" "$worker_before" "$(stat -c '%i:%s:%Y' "$WT/f.txt")"
+assert_eq "large ignored inode and size untouched" "$ignored_before" "$(stat -c '%i:%s:%Y' "$WT/scratch/large")"
+assert_eq "hook side effect retained" new "$(cat "$WT/hook-created.txt")"
+assert_eq "refused commit did not move branch" "$head_before" "$(git -C "$WT" rev-parse HEAD)"
+[ ! -e "$D/copy.log" ] && ok "no snapshot command called" || fail "no snapshot command called"
+rm "$MAIN/.git/hooks/pre-commit"
+FORBIDDEN_COPY_LOG="$D/copy.log" run_dispatch --setup-only "$T"
+assert_eq "existing worktree without task adopts draft" 0 "$STATUS"
+
+begin test_track_return_rollback "Returned refusal restores only the task index entry and preserves worker data"
+write_task "$WT/context/TASK_hook.md" Returned Codex "$ID1" terea@hook codex
+git -C "$WT" add context/TASK_hook.md
+echo reviewer-note >> "$WT/context/TASK_hook.md"
+index_before=$(git -C "$WT" ls-files --stage context/TASK_hook.md)
+task_before=$(cat "$WT/context/TASK_hook.md")
+task_inode_before=$(stat -c '%i' "$WT/context/TASK_hook.md")
+head_before=$(git -C "$WT" rev-parse HEAD)
+cat > "$MAIN/.git/hooks/commit-msg" <<'HOOK'
+#!/bin/sh
+echo hook-effect > hook-return.txt
+exit 1
+HOOK
+chmod +x "$MAIN/.git/hooks/commit-msg"
+FORBIDDEN_COPY_LOG="$D/copy.log" run_dispatch --setup-only "$WT/context/TASK_hook.md"
+assert_eq "Returned hook refusal exits 1" 1 "$STATUS"
+assert_contains "Returned refusal explains side effects" 'hook side effects, if any, are left in place' "$ERR"
+assert_eq "partial staging restored" "$index_before" "$(git -C "$WT" ls-files --stage context/TASK_hook.md)"
+assert_eq "Returned notes preserved" "$task_before" "$(cat "$WT/context/TASK_hook.md")"
+assert_eq "existing task inode unchanged" "$task_inode_before" "$(stat -c '%i' "$WT/context/TASK_hook.md")"
+assert_eq "worker content still untouched" $'one\ndirty' "$(cat "$WT/f.txt")"
+assert_eq "worker inode still untouched" "$worker_before" "$(stat -c '%i:%s:%Y' "$WT/f.txt")"
+assert_eq "Returned ignored inode and size unchanged" "$ignored_before" "$(stat -c '%i:%s:%Y' "$WT/scratch/large")"
+assert_eq "unrelated hook content preserved" hook-effect "$(cat "$WT/hook-return.txt")"
+assert_eq "Returned refusal leaves branch unchanged" "$head_before" "$(git -C "$WT" rev-parse HEAD)"
+[ ! -e "$D/copy.log" ] && ok "no snapshots on redispatch" || fail "no snapshots on redispatch"
+rm "$FAKEBIN/tar" "$FAKEBIN/mktemp"
+
+begin test_track_migration "legacy moved task adopted; hook rejection keeps link"
+new_project track-migration
+git -C "$MAIN" config dispatch.root "$ROOT"
+git -C "$MAIN" config dispatch.moveTask true
+T="$MAIN/context/TASK_legacy.md"
+write_task "$T" Pending unassigned unassigned terea@legacy
+run_dispatch --setup-only "$T"
+assert_eq "legacy setup succeeds" 0 "$STATUS"
+git -C "$MAIN" config dispatch.trackTask true
+printf '#!/bin/sh\nexit 1\n' > "$MAIN/.git/hooks/pre-commit"
+chmod +x "$MAIN/.git/hooks/pre-commit"
+refused "adoption refusal" 'task index entry restored' --setup-only "$T"
+rm "$MAIN/.git/hooks/pre-commit"
+run_dispatch --setup-only "$T"
+assert_eq "adoption succeeds" 0 "$STATUS"
+[ ! -e "$T" ] && [ ! -L "$T" ] && ok "legacy link removed" || fail "legacy link removed"
+assert_eq "legacy task tracked" context/TASK_legacy.md "$(git -C "$ROOT/terea@legacy" ls-files context/)"
+
+begin test_track_guards "trackTask needs root and refuses ambiguous short names"
+new_project track-guards
+T="$MAIN/context/TASK_guard.md"
+write_task "$T" Pending unassigned unassigned terea@guard
+git -C "$MAIN" config dispatch.trackTask true
+refused "root required" 'requires dispatch.root' --setup-only "$T"
+git -C "$MAIN" config dispatch.root "$ROOT"
+write_task "$MAIN/context/TASK_duplicate.md" Pending unassigned unassigned terea@guard
+DISPATCH_RUN_IN=$ROOT
+refused "ambiguous slug" 'ambiguous task' --setup-only guard
+unset DISPATCH_RUN_IN
+
+
+begin test_track_external "inventory spans repositories, discovers external mains, needs no agent"
+new_project track-external
+EXTERNAL_ROOT="$D/work root"
+mkdir -p "$EXTERNAL_ROOT"
+git -C "$MAIN" config dispatch.root "$EXTERNAL_ROOT"
+git -C "$MAIN" config dispatch.trackTask true
+git -C "$MAIN" config dispatch.moveTask false
+T="$MAIN/context/TASK_external.md"
+write_task "$T" Pending unassigned unassigned terea@external
+run_dispatch --setup-only "$T"
+assert_eq "trackTask implies move despite moveTask false" 0 "$STATUS"
+write_task "$MAIN/context/TASK_draft.md" Pending unassigned unassigned terea@draft
+init_repo "$EXTERNAL_ROOT/other"
+echo init > "$EXTERNAL_ROOT/other/file"
+commit_all "$EXTERNAL_ROOT/other" init
+mkdir "$EXTERNAL_ROOT/other/context"
+write_task "$EXTERNAL_ROOT/other/context/TASK_other.md" Pending unassigned unassigned other@draft
+write_task "$EXTERNAL_ROOT/other/context/TASK_proposal.md" Proposal unassigned unassigned -
+DISPATCH_RUN_IN=$EXTERNAL_ROOT
+run_dispatch --list
+assert_eq "external root list succeeds" 0 "$STATUS"
+assert_contains "dispatched task in root" $'terea\texternal\tPending' "$OUT"
+assert_contains "external main draft discovered" $'terea\tdraft\tPending' "$OUT"
+assert_contains "another repository draft" $'other\tdraft\tPending' "$OUT"
+assert_contains "draft before checkout assigned" $'other\tunassigned\tProposal' "$OUT"
+DISPATCH_RUN_IN=$MAIN
+run_dispatch --setup-only external
+assert_eq "slug resolves from external main" 0 "$STATUS"
+run_dispatch TASK_external.md
+assert_eq "normal dispatch starts agent" 0 "$STATUS"
+assert_eq "normal dispatch uses worktree task" 'claude|--effort|high|Task: terea@external/context/TASK_external.md' "$(agent_argv)"
+rm -f "$LOG"
+(cd "$EXTERNAL_ROOT" && PATH=/usr/bin:/bin "$SCRIPT" --list) > "$D/list-no-agent"
+assert_eq "listing needs no agent" 0 "$?"
+unset DISPATCH_RUN_IN
+
+begin test_track_staged "unrelated staged changes block automatic commit without changes"
+WT="$EXTERNAL_ROOT/terea@external"
+write_task "$WT/context/TASK_external.md" Returned Codex "$ID1" terea@external codex
+echo staged > "$WT/f.txt"
+git -C "$WT" add f.txt
+SNAP_EXTRA=("$EXTERNAL_ROOT")
+refused "unrelated index content" 'other staged changes' --setup-only "$WT/context/TASK_external.md"
+
+begin test_track_hook_dirty "successful hook leaving task edits uncommitted rolls back"
+new_project track-hook-dirty
+git -C "$MAIN" config dispatch.root "$ROOT"
+git -C "$MAIN" config dispatch.trackTask true
+T="$MAIN/context/TASK_dirty.md"
+write_task "$T" Pending unassigned unassigned terea@dirty
+printf '#!/bin/sh\necho hook-note >> context/TASK_dirty.md\n' > "$MAIN/.git/hooks/post-commit"
+chmod +x "$MAIN/.git/hooks/post-commit"
+refused "hook left task dirty" 'new worktree and branch removed' --setup-only "$T"
+
+begin test_track_checkout_hook "post-checkout hook refusal removes its newly created worktree and branch"
+new_project track-checkout-hook
+git -C "$MAIN" config dispatch.root "$ROOT"
+git -C "$MAIN" config dispatch.trackTask true
+T="$MAIN/context/TASK_hook.md"
+write_task "$T" Pending unassigned unassigned terea@hook
+printf '#!/bin/sh\nexit 1\n' > "$MAIN/.git/hooks/post-checkout"
+chmod +x "$MAIN/.git/hooks/post-checkout"
+refused "checkout hook refusal" 'git worktree add failed' --setup-only "$T"
+
 
 echo
 echo "== behaviour -> test mapping =="

@@ -677,12 +677,12 @@ search term, or as an option if it starts with `-`.
 <default branch>`. The start point is the local branch as it stands: `git config dispatch.defaultBranch` if
 set, else the branch `origin/HEAD` names, else whichever one of `main` and `master` exists. It is never
 `origin`'s copy and never the main checkout's current branch. A worktree that already exists on `task/<slug>`
-is reused exactly as it is: no rebase, no reset, no clean. It refuses, and names the cause, when:
+is reused without rebase or cleanup; `dispatch.trackTask` may commit task notes (below). It refuses, and names the cause, when:
 `task/<slug>` exists without its worktree, the branch is checked out somewhere else, the path holds
 something that is not the task's worktree, the worktree is on another branch, or it is registered but
 missing on disk.
 
-**Every check runs before the first change.** Status, header, Checkout, repo, session ID, agent on `PATH`,
+**Validation runs before the first change.** Status, header, Checkout, repo, session ID, agent on `PATH`,
 `dispatch.root`, checkout state and default branch are all settled before `git worktree add`. Every refusal
 exits 1 and names the task file line or the path that was wrong (a usage error exits 2). `--dry-run` prints
 the same steps (the project root and whether it came from `dispatch.root` or the default, the worktree
@@ -695,7 +695,7 @@ the agent's included, at a repository the task file did not name.
 Use `git dispatch --setup-only <task file>` from an already-running worker to prepare the
 checkout and task file, then continue in that session. It performs all normal validation
 (including checking the selected agent on `PATH`), worktree creation or reuse, and the configured
-`dispatch.moveTask` move/link sequence. It exits 0 before changing to the agent's cwd or executing
+`dispatch.moveTask` move/link sequence or `dispatch.trackTask` commit. It exits 0 before changing to the agent's cwd or executing
 it. Validation and setup failures exit non-zero, with the same cause and recovery instructions.
 
 After successful setup it prints these stable, line-oriented fields on stdout:
@@ -776,6 +776,8 @@ is not such a path. `--dry-run` prints the root it would use and whether that ca
 
 ## `dispatch.moveTask`
 
+This section describes the legacy layout when `dispatch.trackTask` is off.
+
 ```
 git -C <repo> config dispatch.moveTask true
 ```
@@ -812,6 +814,81 @@ the link (`from -> to`) and changes nothing.
 * **⚠ `sed -i` and other writers that replace the file turn the link into a copy,** and split the channel
   in two. Edit the target, or use an editor that writes in place. (Claude Code's Edit and Write refuse to
   write through a link, and say so.)
+
+## `dispatch.trackTask` and `--list`
+
+```sh
+git -C <repo> config dispatch.root <root>
+git -C <repo> config dispatch.trackTask true
+# Optional; relative to the repository, default history/tasks:
+git -C <repo> config dispatch.archiveDir history/tasks
+```
+
+`trackTask` is opt-in and **requires `dispatch.root`**. It implies moving the task, even when
+`dispatch.moveTask` is unset or false. Unset or false, existing dispatch and collect behavior is
+unchanged. Start with an untracked draft in the main checkout's `context/`. On the first dispatch,
+the file is force-added despite ignore rules and committed on `task/<slug>` with message
+`Dispatch TASK_<name>`. After the commit succeeds, dispatch removes the original draft and leaves
+**no symlink**. The worker receives the worktree's task path.
+
+Commits run normal repository hooks and use the repository's signing configuration. If a hook
+refuses or leaves the task uncommitted, dispatch does not start the worker. It removes a new worktree
+and branch it created. In an existing worktree, it restores only the task's index entry and removes
+the task copy if dispatch created it; the original draft or legacy link remains in place. No worktree
+snapshot is made, and other files are never deleted or restored. Hook side effects are left in place
+and the refusal says so, including edits to an existing task and any commit already completed before
+a post-commit check failed. If rollback itself fails, the error names the task path and what remains.
+Do not edit the task concurrently with setup.
+
+For Returned tasks and resumes, from the root use any of:
+
+```sh
+git dispatch <repo>@<slug>/context/TASK_<name>.md
+git dispatch TASK_<name>.md
+git dispatch <slug>
+```
+
+Filename and slug lookup also work from a repository checkout using its configured root. Ambiguous
+names are refused; use the worktree path. Status and session come from that file's current contents.
+Only Pending and Returned are dispatchable, as before. Changed task notes are committed automatically
+as `Return TASK_<name>` before resuming; a clean task needs no new commit. This is the recommended
+workflow: the reviewer's Returned notes become versioned before the worker starts. Other staged changes
+must be committed or unstaged first when a task commit is needed; unrelated working edits stay in place.
+Workers should commit their report edits with their work.
+
+When enabling `trackTask` on an existing `moveTask` dispatch, the next dispatch adopts the worktree's
+file: it force-adds and commits it, then removes the old link. A refusing hook preserves the legacy
+layout. Until adoption, collect continues to protect the untracked task and its main-checkout link.
+Adoption on redispatch is recommended so reports become versioned immediately.
+
+Before merging, the reviewer edits the closure report and archives the file **on the task branch**:
+
+```sh
+mkdir -p history/tasks
+git mv context/TASK_<name>.md history/tasks/TASK_<number>_<name>.md
+git commit -m "Archive reviewed task"
+git collect <slug>
+```
+
+The reviewer chooses the archive filename. `dispatch.archiveDir` changes the directory suggested by
+collect's refusal; it must be relative, outside `context`, with no `.` or `..` components. Collect never moves
+the file itself. It refuses to merge a branch whose committed tree still contains `context/TASK_*.md`,
+even without a worktree. A clean, committed task file does not prevent removing an already-merged
+worktree: its contents are safe in Git. Dirty task files still block collection. Collect warns when
+the default branch tracks a task in `context/`, including after its own merge and when collecting a
+manually merged branch whose archive step was skipped.
+
+`git dispatch --list` replaces browsing main-checkout symlinks. Run it in the root or a repository
+checkout. It prints a tab-separated header and one row per task: `repository`, `slug`, `status`
+(from line 3), `implementer-session`, and absolute `task-path`. It scans checkouts under the root and
+their main checkouts, including undispatched drafts; links are deduplicated. A main checkout outside
+the root is discoverable through its worktree, or by running the command in that main checkout.
+Drafts without a Checkout or session use `unassigned` for those columns. Listing does not need an
+agent executable and does not change files.
+
+`--dry-run` and `--setup-only` print the force-add, commit, and `link: none (dispatch.trackTask)`.
+Legacy adoption also prints `unlink:`. The stable `checkout:`, `task-path:`, `cwd:`, `prompt:` and
+`exec:` setup summary lines keep exactly the same format; `/dispatch-here` can continue parsing them.
 
 # git collect
 

@@ -1171,6 +1171,76 @@ test29
 test30
 test31
 
+begin test_track_merge "tracked task refuses merge; reviewer archive makes it collectable"
+new_project track-merge
+git -C "$MAIN" config dispatch.trackTask true
+git -C "$MAIN" config dispatch.root "$ROOT"
+dispatch_wt tracked
+WT=$(wt_of tracked)
+mkdir -p "$WT/context"
+write_task "$WT/context/TASK_tracked.md" Finished terea@tracked
+git -C "$WT" add -f context/TASK_tracked.md
+git -C "$WT" commit -qm task
+refused "unarchived branch" 'history/tasks/<archive-name>.md' tracked
+# The tree guard also applies when there is no worktree.
+git -C "$MAIN" worktree remove "$WT"
+refused "branch without worktree" 'still tracks context/TASK_tracked.md' tracked
+git -C "$MAIN" worktree add -q "$WT" task/tracked
+git -C "$MAIN" config dispatch.archiveDir archive/reviews
+refused "configured archive directory" 'archive/reviews/<archive-name>.md' tracked
+mkdir -p "$WT/archive/reviews"
+git -C "$WT" mv context/TASK_tracked.md archive/reviews/TASK_0042_tracked.md
+git -C "$WT" commit -qm archive
+GIT_MERGE_AUTOEDIT=no run_collect tracked
+assert_eq "archived task merges and collects" 0 "$STATUS"
+assert_eq "archive arrives in main" archive/reviews/TASK_0042_tracked.md "$(git -C "$MAIN" ls-files archive/)"
+[ ! -d "$WT" ] && ok "worktree removed" || fail "worktree removed"
+
+begin test_track_merged "committed clean task allows collection after manual merge; warning fires"
+new_project track-merged
+git -C "$MAIN" config dispatch.trackTask true
+git -C "$MAIN" config dispatch.root "$ROOT"
+dispatch_wt tracked
+WT=$(wt_of tracked)
+mkdir -p "$WT/context"
+write_task "$WT/context/TASK_tracked.md" Finished terea@tracked
+git -C "$WT" add -f context/TASK_tracked.md
+git -C "$WT" commit -qm task
+merge tracked
+echo dirty >> "$WT/context/TASK_tracked.md"
+refused "dirty tracked task" 'uncommitted changes to tracked files' tracked
+git -C "$WT" restore context/TASK_tracked.md
+run_collect tracked
+assert_eq "clean committed task does not block" 0 "$STATUS"
+assert_contains "manual merge warning" 'warning: master still tracks context/TASK_tracked.md; archive step was skipped' "$ERR"
+[ ! -d "$WT" ] && ok "tracked task worktree collected" || fail "tracked task worktree collected"
+
+begin test_track_post_merge "successful collect merge warns about task already on main"
+new_project track-post-merge
+git -C "$MAIN" config dispatch.trackTask true
+git -C "$MAIN" config dispatch.root "$ROOT"
+dispatch_wt archived
+work archived
+write_task "$MAIN/context/TASK_old.md" Finished terea@old
+git -C "$MAIN" add -f context/TASK_old.md
+git -C "$MAIN" commit -qm 'manual merge skipped archive'
+GIT_MERGE_AUTOEDIT=no run_collect archived
+assert_eq "merge succeeds" 0 "$STATUS"
+assert_contains "post-merge warning" 'archive step was skipped' "$ERR"
+assert_eq "warned before and after merge" 2 "$(grep -c 'warning:.*TASK_old' <<< "$ERR")"
+
+begin test_track_legacy "trackTask still protects unadopted moveTask files"
+new_project track-legacy
+git -C "$MAIN" config dispatch.trackTask true
+git -C "$MAIN" config dispatch.root "$ROOT"
+dispatch_wt legacy
+WT=$(wt_of legacy)
+mkdir -p "$WT/context"
+write_task "$WT/context/TASK_legacy.md" Finished terea@legacy
+ln -s ../../terea@legacy/context/TASK_legacy.md "$MAIN/context/TASK_legacy.md"
+refused "legacy file protected" 'task file in the worktree' legacy
+
+
 echo
 echo "== behaviour -> test mapping =="
 echo "1. merged, clean, archived: worktree and branch gone, main untouched ... test1"

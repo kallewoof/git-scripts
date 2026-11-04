@@ -29,6 +29,7 @@
 #   'Implementer' line is a model name, and a model does not say which program ran it (Claude
 #   Opus from Claude Code, Cursor or agy alike), so it is never read.
 #
+#   --list       List tasks and drafts under the root, without starting an agent.
 #   --dry-run    Print each step -- the project root and where it came from (dispatch.root
 #                or the default), the worktree command, the task file's move and link (with
 #                dispatch.moveTask), the agent's exact argv and its cwd -- and change nothing.
@@ -71,10 +72,22 @@
 # named directly, is refused before any change. Unset, false, or without dispatch.root, the task
 # file stays where it is and nothing below differs.
 #
-# The task file is otherwise read, never written. Only a status of Pending or Returned is dispatched. An
-# existing worktree is reused exactly as it is; a task/<slug> branch without its worktree is
-# refused. Everything is checked before the first change, and every refusal exits 1 naming its
-# cause.
+# With dispatch.trackTask true (requires dispatch.root; implies moveTask), force-add and
+# commit the task on task/<slug> as "Dispatch TASK_<name>", then remove the original without
+# a link. Hooks run normally; refusal removes a new worktree/branch. In an existing worktree,
+# restore only the task index entry and undo dispatch's copy; hook side effects are left in place.
+# Changed notes on redispatch are committed as "Return TASK_<name>". Other
+# staged changes are refused when a commit is needed. Legacy moveTask links are adopted on
+# redispatch. Worktree path, bare filename or slug locate tracked tasks; ambiguous names refuse.
+# --list prints tab-separated repository, slug, line-3 status, implementer session and task path
+# for worktree tasks and main-checkout drafts under the root. No agent is needed for listing.
+# The reviewer commits a git mv into dispatch.archiveDir (default history/tasks) before collect.
+# Setup summary prefixes stay unchanged; add:, commit:, link: none and unlink: describe new steps.
+#
+# Without trackTask the task file is read, never written. Only a status of Pending or Returned is dispatched. An
+# existing worktree is reused (trackTask may commit notes); a task/<slug> branch without its worktree is
+# refused. Validation runs before the first change; a trackTask commit refusal rolls setup back.
+# Every refusal exits 1 naming its cause.
 #
 # The branch a new worktree starts from: git config dispatch.defaultBranch if set, else the
 # branch origin/HEAD names, else whichever one of 'main' and 'master' exists -- always the local
@@ -98,6 +111,8 @@ CODEX_EFFORTS=(low medium high xhigh max ultra)
 usage() {
     cat >&2 <<'EOF'
 Usage:
+  git dispatch --list
+                List root-wide tasks and drafts: repository, slug, status, session, task-path (TSV).
   git dispatch [--dry-run] [--setup-only] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
                 Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
                 its worker in the project root (the main checkout's parent, or dispatch.root).
@@ -132,11 +147,13 @@ usage_error() {
     exit 2
 }
 
+list_only=0
 dry_run=0 setup_only=0 agent_opt="" cwd_opt="" task="" seen_agent=0 seen_cwd=0
 effort=$DEFAULT_EFFORT seen_effort=0
 agent_args=()
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --list) list_only=1 ;;
         --dry-run) dry_run=1 ;;
         --setup-only) setup_only=1 ;;
         --agent|--cwd|--effort)
@@ -177,7 +194,8 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
-[ -n "$task" ] || usage_error "no task file given"
+[ -n "$task" ] || [ "$list_only" -eq 1 ] || usage_error "no task file given"
+[ "$list_only" -eq 0 ] || [ -z "$task" ] || usage_error "--list takes no task"
 case "$agent_opt" in
     ""|claude|codex|omp|cursor) ;;
     *) usage_error "--agent must be 'claude', 'codex', 'omp' or 'cursor', not '$agent_opt'" ;;
@@ -200,6 +218,92 @@ move_task_set() {
     [ "$(git -C "$1" config --get --bool dispatch.moveTask 2>/dev/null)" = "true" ] &&
         git -C "$1" config --get dispatch.root > /dev/null 2>&1
 }
+
+# Inventory the root's checkouts, plus main checkouts outside the root discovered through
+# their worktrees. Used for --list and trackTask's filename/slug lookup; links are deduplicated.
+declare -A inventory_repos
+inventory() {
+    local scan=$PWD common_dir main_dir cfg dir f real
+    local -a dirs=() mains=() scans=()
+    local -A seen=()
+    if common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+        if cfg=$(git --git-dir="$common_dir" config core.worktree); then
+            main_dir=$(cd -- "$common_dir" && cd -- "$cfg" && pwd -P) || return 1
+        else
+            main_dir=${common_dir%/.git}
+        fi
+        mains+=("$main_dir")
+        scan=$(dirname -- "$main_dir")
+        if cfg=$(git -C "$main_dir" config --get dispatch.root); then
+            case "$cfg" in /*) scan=$cfg ;; *) scan=$main_dir/$cfg ;; esac
+        fi
+    fi
+    [ -d "$scan" ] || die "dispatch root does not exist: $scan"
+    scan=$(cd -- "$scan" && pwd -P)
+    scans=("$scan" "$PWD")
+    for scan in "${scans[@]}"; do
+        for dir in "$scan"/*; do
+            [ -e "$dir/.git" ] || continue
+            dirs+=("$dir")
+            common_dir=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+            if cfg=$(git --git-dir="$common_dir" config core.worktree); then
+                main_dir=$(cd -- "$common_dir" && cd -- "$cfg" && pwd -P) || continue
+            else
+                main_dir=${common_dir%/.git}
+            fi
+            mains+=("$main_dir")
+        done
+    done
+    inventory_files=()
+    for dir in "${dirs[@]}" "${mains[@]}"; do
+        common_dir=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+        if cfg=$(git --git-dir="$common_dir" config core.worktree); then
+            main_dir=$(cd -- "$common_dir" && cd -- "$cfg" && pwd -P) || continue
+        else
+            main_dir=${common_dir%/.git}
+        fi
+        for f in "$dir"/context/TASK_*.md; do
+            [ -f "$f" ] || continue
+            real=$(realpath -- "$f") || continue
+            [ -z "${seen[$real]+set}" ] || continue
+            seen[$real]=1
+            inventory_files+=("$real")
+            inventory_repos[$real]=$(basename -- "$main_dir")
+        done
+    done
+}
+
+# Only the header (line 3 through the first blank line) supplies inventory metadata.
+inventory_field() {
+    awk -v key="$2" 'NR < 3 {next} /^[[:space:]]*$/ {exit}
+        {sub(/\r$/, ""); sub(/[[:space:]]*$/, "")}
+        index($0, "**" key ": ") == 1 {sub("^\\*\\*" key ": *", ""); sub(/\*\*$/, ""); print; exit}' "$1"
+}
+if [ "$list_only" -eq 1 ]; then
+    inventory
+    printf 'repository\tslug\tstatus\timplementer-session\ttask-path\n'
+    for f in "${inventory_files[@]}"; do
+        co=$(inventory_field "$f" Checkout)
+        st=$(sed -n '3{s/\r$//;s/^\*\*Status: *//;s/\*\*[[:space:]]*$//;p;}' "$f")
+        sid=$(inventory_field "$f" 'Implementer Session ID')
+        case "$co" in *@*) list_slug=${co#*@} ;; *) list_slug=unassigned ;; esac
+        printf '%s\t%s\t%s\t%s\t%s\n' "${inventory_repos[$f]}" "$list_slug" "$st" "${sid:-unassigned}" "$f"
+    done
+    exit 0
+fi
+if [ ! -e "$task" ] && [ ! -L "$task" ] && [[ "$task" != */* ]]; then
+    inventory
+    matches=()
+    for f in "${inventory_files[@]}"; do
+        [ "$(git -C "$(dirname -- "$f")" config --bool dispatch.trackTask 2>/dev/null)" = true ] || continue
+        co=$(inventory_field "$f" Checkout)
+        if [ "$(basename -- "$f")" = "$task" ] || [ "${co#*@}" = "$task" ]; then
+            matches+=("$f")
+        fi
+    done
+    [ "${#matches[@]}" -le 1 ] || die "ambiguous task '$task': ${matches[*]}; use its worktree path"
+    [ "${#matches[@]}" -eq 0 ] || task=${matches[0]}
+fi
 
 # A dangling link is a moved task whose checkout is gone. That is said once the repository is
 # known, below; without dispatch.moveTask it is a missing file, as it always was.
@@ -311,12 +415,28 @@ if [ "$root_from" = "git config dispatch.root" ]; then
     esac
 fi
 
+track_task=0
+track_cfg=$(git -C "$main" config --get --bool dispatch.trackTask 2>&1)
+case $? in
+    0) [ "$track_cfg" != true ] || track_task=1 ;;
+    1) ;;
+    *) die "dispatch.trackTask: $track_cfg; set it to true or false" ;;
+esac
+if [ "$track_task" -eq 1 ]; then
+    [ "$root_from" = "git config dispatch.root" ] || die "dispatch.trackTask requires dispatch.root"
+    move_task=1
+fi
+
 # CO writes the task into the main checkout's context/, and the message names it there. A copy
 # elsewhere -- a worktree's own context/, say -- is a different file the worker would never see.
 # With dispatch.moveTask the task is always named by that path, even once it has moved: the file
 # in the checkout is reached through the link, never named directly, so one entry point keeps
 # one rule.
-if [ "$move_task" -eq 1 ]; then
+if [ "$track_task" -eq 1 ]; then
+    main_ctx="$main/context"
+    task_main="$main_ctx/$task_base"
+    [ ! -L "$main_ctx" ] || die "trackTask needs context to be the main checkout's own directory"
+elif [ "$move_task" -eq 1 ]; then
     main_ctx=$(cd -- "$main/context" 2> /dev/null && pwd -P) ||
         die "$task: not the task file in the main checkout ($main/context/$task_base)"
     task_main="$main_ctx/$task_base"
@@ -650,8 +770,49 @@ relpath() {
 # into a context/ that is the checkout's own directory, onto a path that holds nothing. A file in
 # both places is the channel split in two -- a writer that replaces files (sed -i) turned the link
 # into a copy -- and which half is current is not this tool's to guess.
-move=0 link_target=""
-if [ "$move_task" -eq 1 ]; then
+move=0 link_target="" adopt_link=0 task_commit=0
+if [ "$track_task" -eq 1 ]; then
+    [ ! -L "$wt/context" ] && [ ! -L "$task_dest" ] &&
+        { [ ! -e "$wt/context" ] || [ -d "$wt/context" ]; } ||
+        die "trackTask needs a regular task file in the checkout's own context"
+    if [ "$task_abs" = "$task_main" ] && [ ! -L "$task_main" ]; then
+        [ ! -e "$task_dest" ] || die "$task: both main and worktree hold a task file; resolve the duplicate first"
+        git -C "$main" ls-files --error-unmatch -- "context/$task_base" >/dev/null 2>&1 &&
+            die "$task: already tracked in main; the draft must be untracked"
+        move=1
+    elif [ "$task_abs" = "$task_dest" ] || { [ -L "$task_main" ] && [ "$task_abs" = "$task_main" ]; }; then
+        [ -f "$task_dest" ] || die "$task: missing task in $wt"
+        if [ -L "$task_main" ]; then
+            [ "$task_main" -ef "$task_dest" ] || die "$task_main: link points elsewhere"
+            adopt_link=1
+        elif [ -e "$task_main" ]; then
+            die "$task: both main and worktree hold a task file; resolve the duplicate first"
+        fi
+    else
+        die "$task: expected $task_main or $task_dest"
+    fi
+    task_rel="context/$task_base"
+    if [ "$create" -eq 1 ]; then
+        [ -z "$(git -C "$main" ls-tree "$base" -- context)" ] || {
+            context_mode=$(git -C "$main" ls-tree "$base" -- context)
+            [[ "$context_mode" == 040000* ]] || die "context on $base is not a directory"
+        }
+        git -C "$main" cat-file -e "$base:$task_rel" 2>/dev/null &&
+            die "$task_rel already exists on $base; archive it before dispatch"
+    fi
+    commit_message="Dispatch ${task_base%.md}"
+    if [ "$create" -eq 1 ] || ! git -C "$wt" cat-file -e "HEAD:$task_rel" 2>/dev/null; then
+        task_commit=1
+    elif ! git -C "$wt" diff --quiet HEAD -- "$task_rel"; then
+        task_commit=1
+        commit_message="Return ${task_base%.md}"
+    fi
+    if [ "$task_commit" -eq 1 ] && [ "$create" -eq 0 ]; then
+        # Keep unrelated staged work out of this automatic task commit.
+        other_staged=$(git -C "$wt" diff --cached --name-only -- . ":(exclude,literal)$task_rel")
+        [ -z "$other_staged" ] || die "commit the other staged changes before dispatch: $other_staged"
+    fi
+elif [ "$move_task" -eq 1 ]; then
     if [ -L "$task_main" ]; then
         [ -f "$task_dest" ] && [ ! -L "$task_dest" ] && [ "$task_main" -ef "$task_dest" ] ||
             die "$task: a link to '$(readlink -- "$task_main")', not to the task's file in the checkout" \
@@ -694,7 +855,17 @@ if [ "$create" -eq 1 ]; then
 else
     echo "$SELF: worktree: reuse $wt ($branch) as it is"
 fi
-if [ "$move" -eq 1 ]; then
+if [ "$track_task" -eq 1 ]; then
+    [ "$move" -eq 0 ] || echo "$SELF: move: $task_main -> $task_dest"
+    echo "$SELF: link: none (dispatch.trackTask)"
+    [ "$adopt_link" -eq 0 ] || echo "$SELF: unlink: $task_main (adopt legacy moveTask)"
+    if [ "$task_commit" -eq 1 ]; then
+        echo "$SELF: add: $(quote git -C "$wt" add -f -- "$task_rel")"
+        echo "$SELF: commit: $(quote git -C "$wt" commit --only -m "$commit_message" -- "$task_rel")"
+    else
+        echo "$SELF: task file: $task_dest is committed; nothing moves"
+    fi
+elif [ "$move" -eq 1 ]; then
     echo "$SELF: move: $task_main -> $task_dest"
     echo "$SELF: link: $task_main -> $link_target"
 elif [ "$move_task" -eq 1 ]; then
@@ -721,8 +892,82 @@ fi
 
 failure_outcome="the agent was not started"
 [ "$setup_only" -eq 0 ] || failure_outcome="setup did not complete"
+# A new branch/path belongs to this attempt. Also undo a post-checkout hook refusal,
+# which can make worktree add fail after Git has created the worktree successfully.
+remove_new_worktree() {
+    [ "$create" -eq 1 ] || return 0
+    if git -C "$main" worktree list --porcelain | grep -Fxq "worktree $wt"; then
+        git -C "$main" worktree remove --force "$wt" || return 1
+    fi
+    if git -C "$main" show-ref --verify --quiet "refs/heads/$branch"; then
+        git -C "$main" branch -D "$branch" || return 1
+    fi
+}
 if [ "$create" -eq 1 ]; then
-    "${add[@]}" || die "git worktree add failed; $failure_outcome"
+    if ! "${add[@]}"; then
+        if [ "$track_task" -eq 1 ]; then
+            remove_new_worktree || die "worktree add failed; cannot remove new $wt / $branch; $failure_outcome"
+        fi
+        die "git worktree add failed; $failure_outcome"
+    fi
+fi
+# Keep the draft/link until the commit succeeds. In an existing worktree, undo only
+# dispatch's own changes: the task's index entry and a copied-in task (whose original
+# remains in main). Never snapshot or replace the worker's files to undo hook effects.
+if [ "$track_task" -eq 1 ]; then
+    if [ "$task_commit" -eq 1 ]; then
+        task_index="" task_copied=0 context_created=0
+        if [ "$create" -eq 0 ]; then
+            # ls-files quotes special path characters; --index-info reads that same format.
+            # Keep all stages, so even a partially staged task can be restored exactly.
+            task_index=$(git -C "$wt" ls-files --stage -- ":(literal)$task_rel") ||
+                die "cannot read the task's index entry; task unchanged; $failure_outcome"
+        fi
+        rollback_task() {
+            if [ "$create" -eq 1 ]; then
+                remove_new_worktree
+                return $?
+            fi
+            git -C "$wt" update-index --force-remove -- "$task_rel" || return 1
+            if [ -n "$task_index" ]; then
+                printf '%s\n' "$task_index" | git -C "$wt" update-index --index-info || return 1
+            fi
+            if [ "$task_copied" -eq 1 ]; then
+                rm -f -- "$task_dest" || return 1
+            fi
+            if [ "$context_created" -eq 1 ]; then
+                # A hook may have put another file here; leave it and its directory alone.
+                rmdir -- "$wt/context" 2>/dev/null || :
+            fi
+        }
+        commit_task() {
+            [ -d "$wt/context" ] || context_created=1
+            mkdir -p -- "$wt/context" || return 1
+            if [ "$move" -eq 1 ]; then
+                task_copied=1
+                cp -p -- "$task_main" "$task_dest" || return 1
+            fi
+            git -C "$wt" add -f -- "$task_rel" &&
+                git -C "$wt" commit --only -m "$commit_message" -- "$task_rel" || return 1
+            # Hooks may change the index. Never remove the draft unless its task really
+            # reached the commit, with no task edits still waiting in the worktree.
+            git -C "$wt" cat-file -e "HEAD:$task_rel" &&
+                git -C "$wt" diff --quiet HEAD -- "$task_rel"
+        }
+        if ! commit_task; then
+            rollback_task || die "task setup failed; cannot fully undo its index entry or copied file at $task_dest;" \
+                "original draft/link retained; hook side effects, if any, are left in place; $failure_outcome"
+            if [ "$create" -eq 1 ]; then
+                die "task commit refused; original draft retained; new worktree and branch removed; $failure_outcome"
+            fi
+            die "task commit refused; task index entry restored and dispatch's copied file removed if created;" \
+                "original draft/link retained; hook side effects, if any, are left in place (including any completed commit); $failure_outcome"
+        fi
+    fi
+    if [ "$move" -eq 1 ] || [ "$adopt_link" -eq 1 ]; then
+        rm -- "$task_main" || die "task committed at $task_dest, but cannot remove $task_main; $failure_outcome"
+    fi
+    move=0
 fi
 # The link is made first, under a temporary name beside the task file, so that the one step that
 # can fail for want of a link fails before anything moves. Then the file is renamed into the

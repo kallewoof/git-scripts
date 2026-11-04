@@ -58,6 +58,13 @@
 #                refusal it would make; change nothing. Exits as the real run would (a conflict
 #                is found only by the merge itself).
 #
+# With dispatch.trackTask true (requires dispatch.root), clean committed task files do not
+# block removal of an already-merged worktree. A branch still tracking context/TASK_*.md is
+# refused before a merge, with a git mv suggestion into dispatch.archiveDir (default
+# history/tasks); the reviewer chooses the archive name and commits it. Warn after a merge,
+# and on later collection, if the default branch still tracks a context task. Unadopted legacy
+# moveTask files/links retain their original guards. Unset or false preserves old behavior.
+#
 # Archiving task files, pushing and remote branches are the operator's (and git cleanup's), never
 # this tool's. Collect merges only what the operator names after reviewing it.
 #
@@ -181,6 +188,41 @@ if root_cfg=$(git -C "$main" config --get dispatch.root); then
     fi
     root_from="git config dispatch.root"
 fi
+
+track_task=0
+track_cfg=$(git -C "$main" config --get --bool dispatch.trackTask 2>&1)
+case $? in
+    0) [ "$track_cfg" != true ] || track_task=1 ;;
+    1) ;;
+    *) die "dispatch.trackTask: $track_cfg; set it to true or false" ;;
+esac
+archive_dir=history/tasks
+if [ "$track_task" -eq 1 ]; then
+    [ "$root_from" = "git config dispatch.root" ] || die "dispatch.trackTask requires dispatch.root"
+    archive_dir=$(git -C "$main" config --get dispatch.archiveDir) || archive_dir=history/tasks
+    case "$archive_dir" in
+        ""|/*|.|./*|*/./*|*/.|..|../*|*/../*|*/..|context|context/*)
+            die "dispatch.archiveDir must be a repository-relative directory outside context, without dot components" ;;
+    esac
+fi
+
+# Read the committed tree, including branches with no worktree. Literal paths are
+# NUL-delimited so the refusal names every matching file without Git's quoting.
+tracked_tasks() {
+    git -C "$main" ls-tree -r -z --name-only "$1" -- context/ |
+        while IFS= read -r -d '' path; do
+            case "$path" in
+                context/TASK_*.md) [[ "${path#context/}" != */* ]] && printf '%s\0' "$path" ;;
+            esac
+        done
+}
+warn_unarchived() {
+    local path
+    [ "$track_task" -eq 1 ] || return 0
+    while IFS= read -r -d '' path; do
+        echo "$SELF: warning: $base still tracks $path; archive step was skipped; git mv -- '$path' '$archive_dir/<archive-name>.md'" >&2
+    done < <(tracked_tasks "refs/heads/$base")
+}
 
 if base=$(git -C "$main" config --get dispatch.defaultBranch); then
     base_from="git config dispatch.defaultBranch"
@@ -386,7 +428,10 @@ for slug in ${slugs[@]+"${slugs[@]}"}; do
             fi
             for f in "$wt"/context/TASK_*.md; do
                 [ -e "$f" ] || [ -L "$f" ] || continue
-                add_reason "$slug" "a task file in the worktree ($f), which removing the worktree would delete; archive it first"
+                if [ "$track_task" -eq 0 ] ||
+                    ! git -C "$wt" cat-file -e "HEAD:context/$(basename -- "$f")" 2>/dev/null; then
+                    add_reason "$slug" "a task file in the worktree ($f), which removing the worktree would delete; archive it first"
+                fi
                 note_status "$slug" "$f"
             done
         fi
@@ -399,10 +444,18 @@ for slug in ${slugs[@]+"${slugs[@]}"}; do
     done
     for entry in ${task_checkouts[@]+"${task_checkouts[@]}"}; do
         if [ "${entry%%|*}" = "$repo@$slug" ]; then
-            add_reason "$slug" "${entry#*|} names this checkout (Checkout: $repo@$slug) and is not archived"
+            if [ "$track_task" -eq 0 ] ||
+                ! git -C "$main" cat-file -e "refs/heads/$base:context/$(basename -- "${entry#*|}")" 2>/dev/null; then
+                add_reason "$slug" "${entry#*|} names this checkout (Checkout: $repo@$slug) and is not archived"
+            fi
             note_status "$slug" "${entry#*|}"
         fi
     done
+    if [ "$track_task" -eq 1 ] && [ "${unmerged[$slug]}" -eq 1 ]; then
+        while IFS= read -r -d '' path; do
+            add_reason "$slug" "branch $branch still tracks $path; before merging, run git mv -- '$path' '$archive_dir/<archive-name>.md' on the task branch and commit the archive"
+        done < <(tracked_tasks "refs/heads/$branch")
+    fi
     if [ -n "${d_path[$slug]}" ]; then
         [ "${d_locked[$slug]}" -eq 0 ] || add_reason "$slug" "the worktree is locked ('git worktree unlock $wt')"
         if under "$here" "$wt" "$wt_phys" || under "$PWD" "$wt" "$wt_phys"; then
@@ -540,6 +593,8 @@ step() {
     fi
 }
 
+# Also diagnose an archive skipped by a manual merge before this invocation.
+warn_unarchived
 failed=0
 for idx in "${!ok[@]}"; do
     slug=${ok[$idx]}
@@ -556,6 +611,7 @@ for idx in "${!ok[@]}"; do
             echo "$SELF: $slug: would merge $branch into $base (--no-ff; ${ahead[$slug]} commit(s))"
         elif git -C "$main" merge --no-ff "$branch"; then
             echo "$SELF: $slug: merged $branch into $base (--no-ff; ${ahead[$slug]} commit(s))"
+            warn_unarchived
         else
             if git -C "$main" rev-parse -q --verify MERGE_HEAD > /dev/null; then
                 git -C "$main" merge --abort > /dev/null 2>&1 ||
