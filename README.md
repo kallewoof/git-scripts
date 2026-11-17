@@ -380,17 +380,23 @@ So the tier short-circuits in one direction only:
 Every **finding** therefore still comes from a complete run. A badly chosen subset costs time, never
 correctness -- which is what lets the subset be chosen by a heuristic at all.
 
-**The subset primes itself.** Mutations in a real sweep cluster: they are written against one behaviour, so
-the same handful of tests kills most of them. Every assertion kill from a full run is remembered, and later
-mutations try that set first. No coverage instrumentation, no dependency graph, no plugin -- the sweep learns
-its own subset as it goes, and the set is capped (`--fast-max`, default 25) so it stays quick.
+**A hinted mutation runs its own tests; the others, the sweep's killers.** A mutation that names the tests it
+expects to fail (see below) runs just those first. One that names none runs the tests that have killed so far:
+mutations in a real sweep cluster, written against one behaviour, so the same handful of tests kills most of
+them. No coverage instrumentation, no dependency graph, no plugin -- the sweep learns its own subset as it
+goes, and the set is capped (`--fast-max`, default 25) so it stays quick. The killers are not added to a
+hinted set: they would make every later mutation rerun each of them, a slow one included, when its own test
+settles it.
 
 **A test that fails only in isolation would be a false kill.** Shared module state, ordering, a fixture
 another test primed -- run alone, such a test is red for reasons that have nothing to do with the mutation,
-and crediting it would swallow a survivor. So each distinct kill set is priced once against a *clean* tree
-and whatever is red there is excluded, exactly as the full baseline is. Memoized on the set's contents, so
-it costs a couple of tiny runs per sweep. Note the direction of this failure: it hides a finding rather than
-inventing one, which is still wrong, and it is the reason the guard is not optional.
+and crediting it would swallow a survivor. So each test is priced once against a *clean* tree, run as the tier
+runs it, and whatever is red there is excluded, exactly as the full baseline is. The hinted tests are priced
+together before the first mutation; any other test, the first time a candidate set includes it. A test is
+priced in the company it had then, not in every set it later joins: pricing each set instead cost a clean run
+for every new set, and ran a slow killer twice for every mutation after it. Note the direction of this
+failure: it hides a finding rather than inventing one, which is still wrong, and it is the reason the guard is
+not optional.
 
 **It turns itself off, loudly, rather than guess.** Appending test ids to `pytest tests/` runs all of
 `tests/` *and* the ids -- slower than the full run it replaced. So the resolved command is parsed, and the
@@ -413,7 +419,7 @@ priced that iteration).
 
 ### Telling it what you expect to fail
 
-A `[[mutation]]` may carry the ids you expect this mutation to redden. The fast tier tries them
+A `[[mutation]]` may carry the ids you expect this mutation to redden. The fast tier runs just those
 first:
 
 ```toml
@@ -430,10 +436,10 @@ falls through to the full suite like any other subset, so a wrong or stale one c
 verdict -- the same asymmetry the tier rests on everywhere else. Dropping every `tests` line from a
 mutations file changes no result, only the wall clock.
 
-What it actually buys is the *first* mutation of a sweep. Without a hint the tier has nothing primed
-yet, so mutation 1 always pays a full run; with one, it can be settled in seconds, and its kill then
-primes the rest. On a clustered eight-mutation sweep over a four-second suite: 40s unhinted with
-`--no-fast`, 12s with the tier priming itself, 9s with every mutation hinted.
+What it buys is a narrow run for every mutation, the first included. Without a hint the tier has nothing
+primed yet, so mutation 1 always pays a full run, and later ones run every test that has killed so far; with
+one, each is settled by its own test. On a clustered eight-mutation sweep over a four-second suite: 40s
+unhinted with `--no-fast`, 12s with the tier priming itself, 9s with every mutation hinted.
 
 One sharp edge, which is why a bad hint is reported rather than ignored: **pytest collects nothing at
 all when any id fails to match** -- it exits 4 and drops the valid ids alongside the bad one. A single

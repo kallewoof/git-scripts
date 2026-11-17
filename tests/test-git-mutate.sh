@@ -2267,13 +2267,15 @@ sys.path.insert(0, repo)
 sys.dont_write_bytecode = True
 import mod
 
+selection = next((a[len("-Dtest="):] for a in sys.argv[1:] if a.startswith("-Dtest=")), None)
 TESTS = [
     ("Mod", "testAdd", lambda: mod.add(2, 3) == 5),
     ("Mod", "testMul", lambda: mod.mul(2, 3) == 6),
     ("Mod$Nested", "testSub", lambda: mod.sub(5, 3) == 2),
     ("Other", "testAlways", lambda: True),
+    # Passes in the full suite, fails whenever tests are selected: a test that relies on another.
+    ("Other", "testNeedsTheSuite", lambda: selection is None),
 ]
-selection = next((a[len("-Dtest="):] for a in sys.argv[1:] if a.startswith("-Dtest=")), None)
 
 
 def selected(cls, method):
@@ -2320,7 +2322,7 @@ name = "mul-broken"
 tests = ["Mod::testMul"]
 file = "mod.py"
 old = '''    return a * b'''
-new = '''    return a + b + 1'''
+new = '''    return a * b + 1'''
 
 [[mutation]]
 name = "sub-broken"
@@ -2342,6 +2344,19 @@ tests = ["Mod::testAdd(int)[1]"]
 file = "mod.py"
 old = '''    return a + b'''
 new = '''    return a + b + 2'''
+
+[[mutation]]
+name = "add-unhinted"
+file = "mod.py"
+old = '''    return a + b'''
+new = '''    return a + b + 3'''
+
+[[mutation]]
+name = "order-dependent"
+tests = ["Other::testNeedsTheSuite"]
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 4'''
 
 [[mutation]]
 name = "unmatched"
@@ -2438,11 +2453,48 @@ test28() {
     assert_missing "a hint naming the outer class owns its nested classes' tests" "sub-broken: expected"
 }
 
+# --- test 29: a hinted mutation runs its own tests, and each test is priced once ------------
+#
+# A hinted mutation's candidate set used to be its hints plus every test that had killed so far,
+# and each new set was priced on a clean tree before it ran. One slow test that killed once was
+# then run twice for every mutation after it, and a sweep with the tier on took twice as long as
+# one without. A hinted mutation now runs just its hints; the tests that have killed so far are
+# for the mutations that name none. Each test is priced once: the hinted ones together before
+# the first mutation. Pricing still keeps a test red only when run alone from being credited.
+test29() {
+    echo "test 29: a hinted mutation runs its own tests, and each test is priced once"
+    local d="$WORK/t29" repo="$WORK/t29/repo"
+    mkdir -p "$d"
+    make_mvn_fixture "$repo"
+    local toml="$repo/mutations.toml"
+
+    : > "$d/mvn-calls.log"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q test" "$toml" \
+        add-broken mul-broken add-unhinted
+    assert_status "every mutation is killed (exit 0)" 0
+    OUT=$(cat "$d/mvn-calls.log")
+    assert_contains "the hinted tests are priced together on the clean tree, before any mutation" \
+        "-Dtest=Mod#testAdd,Mod#testMul -Dsurefire"
+    assert_contains "a hinted mutation runs its own test" "-Dtest=Mod#testMul -Dsurefire"
+    assert_missing "and not the tests that killed before it" "-Dtest=Mod#testMul,Mod#testAdd"
+    assert_eq "one baseline, one pricing, one run per mutation: nothing priced twice" \
+        5 "$(wc -l < "$d/mvn-calls.log" | tr -d ' ')"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q test" "$toml" \
+        add-broken add-unhinted
+    assert_contains "a mutation that names no test runs the tests that have killed so far" \
+        "add-unhinted ... reddened 1 by assertion in the 1-test candidate set"
+
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q test" "$toml" order-dependent
+    assert_contains "a test red when selected alone is not credited as a kill" \
+        "order-dependent: reddened nothing."
+    assert_status "so the survivor is still a finding (exit 2)" 2
+}
+
 # Optional test names keep foreground verification sweeps focused on one behaviour.
 if [ "$#" -eq 0 ]; then
     set -- test1 test2 test3 test4 test5 test6 test7 test8 test9 test10 test11 test12 test13 \
         test14 test15 test16 test17 test18 test19 test20 test21 test22 test23 test24 test25 test26 \
-        test27 test28
+        test27 test28 test29
 fi
 for selected_test in "$@"; do
     case "$selected_test" in
@@ -2483,6 +2535,7 @@ echo "25. a Surefire hint owns JUnit 5's name(args)[n] cases ........ test25"
 echo "20. a green baseline that ran nothing refuses; stale reports uncounted  test20"
 echo "27. under --env mvn the fast tier narrows with a Surefire selection  test27"
 echo "28. a Surefire test is named by its own class, nested ones included  test28"
+echo "29. a hinted mutation runs its own tests; each test is priced once .... test29"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
 [ "$TESTS_FAILED" -eq 0 ]

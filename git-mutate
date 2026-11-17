@@ -151,9 +151,10 @@ rest of the sweep run. A refusal is "not measured", never a survivor:
 Use 'git mutate --check -' with the same heredoc form to put the input through every guard
 in seconds, running no tests and touching nothing.
 
-THE FAST TIER. Mutations in one sweep cluster -- they are written against one behaviour, so
-the same few tests kill most of them. Once a test has killed by assertion, later mutations run
-just that set first. An assertion kill there ENDS that mutation: running more tests can only
+THE FAST TIER. A mutation that names the tests it expects to fail, in 'tests', runs just those
+first. One that names none runs the tests that have killed so far in the sweep: mutations in one
+sweep cluster, written against one behaviour, so the same few tests kill most of them. An
+assertion kill there ENDS that mutation: running more tests can only
 add reddened tests, never remove one, so the full suite's verdict is provably the same
 'killed'. Only the row list is shorter, and the report says so.
 
@@ -161,8 +162,9 @@ Nothing else short-circuits. No assertion kill, a line the classifier cannot rea
 compile failure all fall through to the full unnarrowed suite -- so every FINDING still comes
 from a complete run. A badly primed set costs time, never a false survivor.
 
-The set is re-priced against a CLEAN tree whenever it changes, and anything red there is
-excluded: a test that passes in the suite but fails alone must not be credited as a kill.
+Each test is priced once against a CLEAN tree, and anything red there is excluded: a test that
+passes in the suite but fails alone must not be credited as a kill. The hinted tests are priced
+together before the first mutation; any other test, the first time a candidate set includes it.
 
 Under --env mvn the subset is a Surefire selection, appended to the command's last command:
 -Dtest=Cls#method,... -Dsurefire.failIfNoSpecifiedTests=false. That last command must be the
@@ -774,8 +776,9 @@ class Sweep:
         self.fast_why = ""
         self.fast_cmd_template = ""
         self.fast_surefire = False    # '{}' takes a Surefire selection, not pytest ids
-        self.fast_iso = {}            # key -> set(ids) red in isolation
-        self.fast_iso_ids = None
+        self.fast_priced = set()      # ids run on the clean tree, as the fast tier runs them
+        self.fast_iso_red = set()     # ids red there: never credited as a kill
+        self.fast_pricings = 0
         self.hintwarn = []
         self.n_unmet = 0
         self.n_unchecked = 0
@@ -965,30 +968,30 @@ class Sweep:
                 return
             self.killers.append(test_id)
 
-    def ensure_iso_baseline(self, subset, env_name, extra_pattern, timeout_secs):
+    def price(self, ids, env_name, extra_pattern, timeout_secs):
         """A test can pass in the full suite and fail when run alone -- shared state, ordering,
         a fixture another test primed. Scored naively that would be this mutation's kill, and
-        would hide a finding. Memoized on the set's contents."""
-        key = "\n".join(sorted(subset))
-        if key in self.fast_iso:
-            self.fast_iso_ids = self.fast_iso[key]
-            return True
-        cmd = self.fast_cmd_for(subset)
+        would hide a finding. So each id is run once on a clean tree, the ids not yet priced
+        together, and whatever is red there is never credited. Priced per id rather than per
+        candidate set, a test is priced in the company it had then, not in every set it later
+        joins; per set, every new set cost a clean run, and a slow test that had killed once
+        was run twice for every mutation after it."""
+        unpriced = [i for i in ids if i not in self.fast_priced]
+        if not unpriced:
+            return
+        cmd = self.fast_cmd_for(unpriced)
         if cmd is None:
-            self.fast_iso_ids = None
-            return False
-        log = os.path.join(self.work, "iso.%d.log" % len(self.fast_iso))
+            return
+        self.fast_pricings += 1
+        log = os.path.join(self.work, "iso.%d.log" % self.fast_pricings)
         self.run_test_cmd(log, cmd, env_name, timeout_secs)
         if self.run_timed_out:
-            emit_err("%s: the primed kill set timed out on a clean tree; fast tier off from here."
+            emit_err("%s: the candidate tests timed out on a clean tree; fast tier off from here."
                      % SELF)
             self.fast_enabled = False
-            self.fast_iso_ids = None
-            return False
-        ids = {r[1] for r in classify(log, env_name, extra_pattern)}
-        self.fast_iso[key] = ids
-        self.fast_iso_ids = ids
-        return True
+            return
+        self.fast_priced.update(unpriced)
+        self.fast_iso_red.update(r[1] for r in classify(log, env_name, extra_pattern))
 
 
 def read_bytes(path):
@@ -1547,6 +1550,12 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
         emit_err("")
     baseline_set = set(baseline_ids)
 
+    # Every hinted test priced on the clean tree in one run, rather than one run per mutation.
+    if sweep.fast_enabled:
+        hinted = list(dict.fromkeys(t for m in chosen for t in (m.hints or []) if t))
+        if hinted:
+            sweep.price(hinted, env_name, assertion_pattern, timeout_secs)
+
     # -- the sweep ------------------------------------------------------------------------
     for i, mut in enumerate(chosen, start=1):
         idx = "%03d" % i
@@ -1562,18 +1571,15 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
             res.status, res.note = "refused", exc.msg
             continue
 
-        # This mutation's candidate set: the caller's "I expect these to fail" first, then
-        # everything that has killed so far. Deduped, first-seen order kept.
-        subset, seen = [], set()
-        for tid in (mut.hints or []) + sweep.killers:
-            if tid and tid not in seen:
-                seen.add(tid)
-                subset.append(tid)
+        # This mutation's candidate set: the tests the caller expects to fail, when it names
+        # any; otherwise everything that has killed so far. Adding the earlier killers to a
+        # hinted set would make every mutation run each of them, the slow ones included, though
+        # its own test settles it; a hint that kills nothing falls through to the full suite.
+        subset = list(dict.fromkeys(t for t in (mut.hints or sweep.killers) if t))
 
-        # Price the candidate set on a CLEAN tree before anything is applied.
-        sweep.fast_iso_ids = None
+        # Price what is new in it on a CLEAN tree before anything is applied.
         if sweep.fast_enabled and subset:
-            sweep.ensure_iso_baseline(subset, env_name, assertion_pattern, timeout_secs)
+            sweep.price(subset, env_name, assertion_pattern, timeout_secs)
 
         # Snapshot at mutation time, from the tree about to change.
         if not all(sweep.snapshot_file(rel) for rel in order):
@@ -1590,7 +1596,7 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
         # The fast tier. Only a clean assertion kill short-circuits.
         fast_hit = False
         fast_rows = []
-        if sweep.fast_enabled and subset and sweep.fast_iso_ids is not None:
+        if sweep.fast_enabled and subset:
             fcmd = sweep.fast_cmd_for(subset)
             if fcmd:
                 flog = os.path.join(sweep.work, "log.%s.fast" % idx)
@@ -1609,7 +1615,7 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
                                           % mut.name)
                 if not sweep.run_timed_out:
                     rows_all = classify(flog, env_name, assertion_pattern)
-                    excl = baseline_set | sweep.fast_iso_ids
+                    excl = baseline_set | sweep.fast_iso_red
                     fast_rows = [r for r in rows_all if r[1] not in excl]
                     f_a = sum(1 for r in fast_rows if r[0] == "A")
                     f_u = sum(1 for r in fast_rows if r[0] == "U")
@@ -1632,8 +1638,9 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
 
         if fast_hit:
             res.rows = fast_rows
-            res.excluded = dict.fromkeys(sweep.fast_iso_ids,
-                                         "on the unmutated tree, run as the fast tier's subset")
+            res.excluded = dict.fromkeys(
+                (r for r in sweep.fast_iso_red if any(hint_owns(t, r) for t in subset)),
+                "on the unmutated tree, run as the fast tier's subset")
             res.excluded.update(dict.fromkeys(baseline_set, "before any mutation"))
             res.n_a = sum(1 for r in fast_rows if r[0] == "A")
             res.n_e = sum(1 for r in fast_rows if r[0] == "E")
