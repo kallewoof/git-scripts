@@ -2490,11 +2490,50 @@ test29() {
     assert_status "so the survivor is still a finding (exit 2)" 2
 }
 
+# --- test 30: --no-baseline skips the unmutated run, for a suite known to pass --------------
+#
+# CI tests the tree before its mutations are swept, so the unmutated run repeats a run that has
+# just passed, once per worker per module. --no-baseline, or `baseline = off` in the project
+# configuration, skips it, and the header says what that costs: a test that does fail is
+# credited as a kill.
+test30() {
+    echo "test 30: --no-baseline skips the unmutated run, for a suite known to pass"
+    local d="$WORK/t30" repo="$WORK/t30/repo"
+    mkdir -p "$d"
+    make_mvn_fixture "$repo"
+    local toml="$repo/mutations.toml"
+
+    : > "$d/mvn-calls.log"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --no-fast --cmd "mvn -B -q test" "$toml" \
+        add-broken mul-broken
+    assert_eq "with the baseline: one unmutated run, then one per mutation" \
+        3 "$(wc -l < "$d/mvn-calls.log" | tr -d ' ')"
+
+    : > "$d/mvn-calls.log"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --no-fast --no-baseline --cmd "mvn -B -q test" \
+        "$toml" add-broken mul-broken
+    assert_status "both mutations are still killed (exit 0)" 0
+    assert_eq "--no-baseline runs one per mutation and nothing else" \
+        2 "$(wc -l < "$d/mvn-calls.log" | tr -d ' ')"
+    assert_contains "the header says the baseline was skipped, and what that costs" \
+        "baseline: skipped; the suite is taken to pass unmutated"
+
+    printf 'baseline = off\n' >> "$repo/.git/info/git-mutate"
+    : > "$d/mvn-calls.log"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --no-fast --cmd "mvn -B -q test" "$toml" add-broken
+    assert_eq "the project configuration can turn it off as well" \
+        1 "$(wc -l < "$d/mvn-calls.log" | tr -d ' ')"
+
+    printf 'baseline = sometimes\n' >> "$repo/.git/info/git-mutate"
+    mutate "$repo" --env mvn --no-fast --cmd "mvn -B -q test" "$toml" add-broken
+    assert_contains "a value other than on or off is refused" "baseline takes 'on' or 'off'"
+}
+
 # Optional test names keep foreground verification sweeps focused on one behaviour.
 if [ "$#" -eq 0 ]; then
     set -- test1 test2 test3 test4 test5 test6 test7 test8 test9 test10 test11 test12 test13 \
         test14 test15 test16 test17 test18 test19 test20 test21 test22 test23 test24 test25 test26 \
-        test27 test28 test29
+        test27 test28 test29 test30
 fi
 for selected_test in "$@"; do
     case "$selected_test" in
@@ -2536,6 +2575,7 @@ echo "20. a green baseline that ran nothing refuses; stale reports uncounted  te
 echo "27. under --env mvn the fast tier narrows with a Surefire selection  test27"
 echo "28. a Surefire test is named by its own class, nested ones included  test28"
 echo "29. a hinted mutation runs its own tests; each test is priced once .... test29"
+echo "30. --no-baseline skips the unmutated run, for a suite known to pass .. test30"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
 [ "$TESTS_FAILED" -eq 0 ]

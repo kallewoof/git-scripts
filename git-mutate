@@ -51,6 +51,7 @@ USAGE_TEXT = r"""Usage:
   --fast-cmd <template>   Subset command; '{}' is replaced by the test ids (under --env mvn,
                           by a Surefire selection such as Cls#method,Cls2#other).
   --fast-max <n>          Cap the primed kill set (default 25).
+  --no-baseline           Skip the unmutated run, for a suite known to pass (see THE BASELINE).
 
 For the mutations-file format, and what each guard refuses: git mutate -h
 """
@@ -76,6 +77,7 @@ Usage:
   --no-fast               Run the full suite for every mutation (see THE FAST TIER).
   --fast-cmd <template>   Subset command; '{}' is replaced by the test ids.
   --fast-max <n>          Cap the primed kill set (default 25).
+  --no-baseline           Skip the unmutated run, for a suite known to pass (see THE BASELINE).
 
 MUTATIONS are TOML. Prefer a heredoc into 'git mutate -': it is visibly one-use, leaves no
 temporary file to clean up, and cannot become a stale mutation suite by accident:
@@ -176,6 +178,12 @@ that is not pytest-shaped, or one that already names its own paths (appending id
 tests/' would widen the run, not narrow it); under --env mvn, a last command that is not an mvn
 run of the test phase, or one that already selects tests with -Dtest. Use --fast-cmd to drive it
 yourself, --no-fast to be rid of it.
+
+THE BASELINE. Before the first mutation, the unmutated suite runs once. A test already failing
+there would go red under every mutation, so it is excluded from the kills; a suite that errors,
+or that ran no test, is refused, since no mutation would be measurable. --no-baseline skips that
+run, for a suite already known to pass, such as one CI has just tested on the same tree: a test
+that does fail is then credited as a kill of every mutation it reddens.
 
 SHELL CHECKS. Use --env lines for a check that is a script, not a test runner:
 
@@ -1093,6 +1101,9 @@ def read_project_config(cfg, state):
             elif key == "fast":
                 if state["fast_mode"] == "auto":
                     state["fast_mode"] = val
+            elif key == "baseline":
+                if not state["baseline_flag"]:
+                    state["baseline"] = val
             elif key == "fast_cmd":
                 if not state["fast_cmd_template"]:
                     state["fast_cmd_template"] = val
@@ -1149,7 +1160,7 @@ def run_cli(sweep, argv):
     st = {"cmd_override": "", "timeout_secs": str(DEFAULT_TIMEOUT), "assertion_pattern": "",
           "fail_pattern": None, "error_pattern": None,
           "env_name": "", "fast_mode": "auto", "fast_cmd_template": "",
-          "fast_max": str(DEFAULT_FAST_MAX)}
+          "fast_max": str(DEFAULT_FAST_MAX), "baseline": "on", "baseline_flag": False}
     mode = "sweep"
     mutations_file = ""
     selected = []
@@ -1181,6 +1192,8 @@ def run_cli(sweep, argv):
             st["env_name"] = a[len("--env="):]; args.pop(0)
         elif a == "--no-fast":
             st["fast_mode"] = "off"; args.pop(0)
+        elif a == "--no-baseline":
+            st["baseline"], st["baseline_flag"] = "off", True; args.pop(0)
         elif a == "--fast-cmd":
             need(args, "--fast-cmd"); st["fast_cmd_template"] = args[1]; del args[:2]
         elif a == "--fast-max":
@@ -1225,6 +1238,8 @@ def run_cli(sweep, argv):
         die("--timeout takes a whole number of seconds, got '%s'" % st["timeout_secs"])
     if st["fast_mode"] not in ("auto", "on", "off"):
         die("fast takes 'on' or 'off' (got '%s')" % st["fast_mode"])
+    if st["baseline"] not in ("on", "off"):
+        die("baseline takes 'on' or 'off' (got '%s')" % st["baseline"])
     if not st["fast_max"].isdigit():
         die("--fast-max takes a whole number, got '%s'" % st["fast_max"])
     timeout_secs = int(st["timeout_secs"])
@@ -1280,7 +1295,7 @@ def run_cli(sweep, argv):
     return do_sweep(sweep, chosen, n_selected, mutations_file, env_name,
                     st["assertion_pattern"], st["cmd_override"], st["fast_mode"],
                     st["fast_cmd_template"], fast_max, timeout_secs,
-                    st["fail_pattern"], st["error_pattern"])
+                    st["fail_pattern"], st["error_pattern"], baseline=st["baseline"] == "on")
 
 
 def do_recover(sweep):
@@ -1468,36 +1483,11 @@ def first_match(log_path, pattern, limit=160):
     return ""
 
 
-def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_pattern,
-             cmd_override, fast_mode, fast_cmd_template, fast_max, timeout_secs,
-             fail_pattern=None, error_pattern=None):
-    take_lock(sweep, mutations_file)
-    install_signal_handlers(sweep)
-
-    test_cmd, test_cmd_source = resolve_test_cmd(sweep.root, cmd_override)
-    sweep.test_cmd = test_cmd
-    resolve_fast(sweep, env_name, fast_mode, fast_cmd_template, test_cmd)
-
-    emit("%s: %d mutation(s) from %s" % (SELF, n_selected, mutations_file))
-    emit("%s: test command (%s): %s" % (SELF, test_cmd_source, test_cmd))
-    if sweep.fast_enabled:
-        emit("%s: fast tier: on -- once a test has killed, later mutations try that set first;"
-             % SELF)
-        emit("%s:            an assertion kill there is conclusive. Findings still come from"
-             % SELF)
-        emit("%s:            the full suite. --no-fast turns this off." % SELF)
-    else:
-        emit("%s: fast tier: off (%s); every mutation runs the full suite."
-             % (SELF, sweep.fast_why or "unavailable"))
-        n_hinted = sum(1 for m in chosen if m.hints)
-        if n_hinted:
-            emit_err("%s: NOTE: %d mutation(s) carry a 'tests' hint, which only the fast tier "
-                     "reads." % (SELF, n_hinted))
-    emit("%s: sweep in flight; '%s' marks this tree as transiently dirty."
-         % (SELF, MARKER_NAME))
-    emit()
-
-    # -- baseline -------------------------------------------------------------------------
+def run_baseline(sweep, test_cmd, env_name, timeout_secs, assertion_pattern, fail_pattern,
+                 error_pattern):
+    """The unmutated suite, run once: the ids of the tests already failing, which no mutation is
+    credited with. Refuses a suite that cannot be measured: one that times out, errors, or runs no
+    test."""
     baseline_log = os.path.join(sweep.work, "baseline.log")
     baseline_started = datetime.datetime.now().timestamp()
     baseline_rc = sweep.run_test_cmd(baseline_log, test_cmd, env_name, timeout_secs)
@@ -1548,7 +1538,45 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
         emit_err("%s: they are excluded from every mutation's kills -- a test already red "
                  "cannot be a kill." % SELF)
         emit_err("")
-    baseline_set = set(baseline_ids)
+    return set(baseline_ids)
+
+
+def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_pattern,
+             cmd_override, fast_mode, fast_cmd_template, fast_max, timeout_secs,
+             fail_pattern=None, error_pattern=None, baseline=True):
+    take_lock(sweep, mutations_file)
+    install_signal_handlers(sweep)
+
+    test_cmd, test_cmd_source = resolve_test_cmd(sweep.root, cmd_override)
+    sweep.test_cmd = test_cmd
+    resolve_fast(sweep, env_name, fast_mode, fast_cmd_template, test_cmd)
+
+    emit("%s: %d mutation(s) from %s" % (SELF, n_selected, mutations_file))
+    emit("%s: test command (%s): %s" % (SELF, test_cmd_source, test_cmd))
+    if sweep.fast_enabled:
+        emit("%s: fast tier: on -- once a test has killed, later mutations try that set first;"
+             % SELF)
+        emit("%s:            an assertion kill there is conclusive. Findings still come from"
+             % SELF)
+        emit("%s:            the full suite. --no-fast turns this off." % SELF)
+    else:
+        emit("%s: fast tier: off (%s); every mutation runs the full suite."
+             % (SELF, sweep.fast_why or "unavailable"))
+        n_hinted = sum(1 for m in chosen if m.hints)
+        if n_hinted:
+            emit_err("%s: NOTE: %d mutation(s) carry a 'tests' hint, which only the fast tier "
+                     "reads." % (SELF, n_hinted))
+    if not baseline:
+        emit("%s: baseline: skipped; the suite is taken to pass unmutated, so a test that fails"
+             % SELF)
+        emit("%s:           anyway is credited as a kill." % SELF)
+    emit("%s: sweep in flight; '%s' marks this tree as transiently dirty."
+         % (SELF, MARKER_NAME))
+    emit()
+
+    # -- baseline -------------------------------------------------------------------------
+    baseline_set = set() if not baseline else run_baseline(
+        sweep, test_cmd, env_name, timeout_secs, assertion_pattern, fail_pattern, error_pattern)
 
     # Every hinted test priced on the clean tree in one run, rather than one run per mutation.
     if sweep.fast_enabled:

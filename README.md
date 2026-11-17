@@ -328,7 +328,7 @@ only the XML the classifier reads, so no directory is ever removed and a repo's 
 `docs/target/annual-reports` is untouched. No `rm`, no `-rf`, no `-exec`.
 
 **Per-project defaults live in `.git/info/git-mutate`.** A Java or Go repo should not need the same three
-flags on every invocation. Keys are `env`, `cmd`, `assertion_pattern`, `fail_pattern`, `error_pattern`, `timeout`, `fast`, `fast_cmd` and `fast_max`; an explicit flag
+flags on every invocation. Keys are `env`, `cmd`, `assertion_pattern`, `fail_pattern`, `error_pattern`, `timeout`, `fast`, `fast_cmd`, `fast_max` and `baseline` (`on` or `off`); an explicit flag
 always beats the file, and an unknown key warns rather than being ignored:
 
 ```
@@ -355,6 +355,15 @@ cannot be a kill. And if the unmutated suite exits non-zero while matching no li
 recognises at all, the sweep refuses too, naming the command and pointing at `--cmd`: that is not "no
 pre-existing failures", it is a suite this pytest-shaped classifier cannot read, and every mutation
 afterwards would be unmeasurable.
+
+### Skipping the baseline
+
+Before the first mutation the unmutated suite runs once. A test already failing there would go red under every
+mutation, so it is excluded from the kills; a suite that errors, or that ran no test, is refused. When the
+suite is already known to pass -- CI has just tested the same tree, and fails the build when a test fails --
+that run repeats one that just happened. `--no-baseline`, or `baseline = off` in the project configuration,
+skips it. The cost is said in the header: a test that does fail is then credited as a kill of every mutation
+it reddens, so it is safe only where something else stops a red suite from passing.
 
 ## The fast tier: narrowing that cannot invent a kill
 
