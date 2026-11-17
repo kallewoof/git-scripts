@@ -48,7 +48,8 @@ USAGE_TEXT = r"""Usage:
   --assertion-pattern <re> Extra regex that marks a message as an assertion kill.
   --timeout <seconds>     Per-mutation timeout (default 900).
   --no-fast               Run the full suite for every mutation (see THE FAST TIER).
-  --fast-cmd <template>   Subset command; '{}' is replaced by the test ids.
+  --fast-cmd <template>   Subset command; '{}' is replaced by the test ids (under --env mvn,
+                          by a Surefire selection such as Cls#method,Cls2#other).
   --fast-max <n>          Cap the primed kill set (default 25).
 
 For the mutations-file format, and what each guard refuses: git mutate -h
@@ -122,11 +123,12 @@ claims, and folding them together would make a clean sweep unreadable.
 
 A hint names everything its runner selects for it: a bare parametrized test every case of it,
 a class or module every test in it, a directory every test under it; for Surefire,
-'Cls::testFoo' owns JUnit 5's 'Cls::testFoo(int)[1]'. The expectation is met when ANY of those
+'Cls::testFoo' owns JUnit 5's 'Cls::testFoo(int)[1]', and 'Cls' the tests of its @Nested
+classes, which are named 'Cls$In::testBar'. The expectation is met when ANY of those
 fails by assertion -- "this test defends the behaviour" -- whatever the others did. Only
 failures are visible, so "every case failed" could not be checked anyway; to expect one case
 in particular, name it: 'test_foo[case1]' matches only itself. The match stops at a boundary
-('[', '::', '/', '('), so 'test_foo' never claims 'test_foobar[...]'.
+('[', '::', '/', '(', '$'), so 'test_foo' never claims 'test_foobar[...]'.
 
 A hint that was already red without the mutation -- before any mutation, or on the clean
 tree as the fast tier ran it -- is neither met nor unmet: its failure was excluded from the
@@ -162,9 +164,16 @@ from a complete run. A badly primed set costs time, never a false survivor.
 The set is re-priced against a CLEAN tree whenever it changes, and anything red there is
 excluded: a test that passes in the suite but fails alone must not be credited as a kill.
 
-It turns itself off, loudly, when it cannot narrow: a non-pytest --env, a command that is not
-pytest-shaped, or one that already names its own paths (appending ids to 'pytest tests/' would
-widen the run, not narrow it). Use --fast-cmd to drive it yourself, --no-fast to be rid of it.
+Under --env mvn the subset is a Surefire selection, appended to the command's last command:
+-Dtest=Cls#method,... -Dsurefire.failIfNoSpecifiedTests=false. That last command must be the
+mvn run whose tests it narrows, so '(cd lib && mvn install) && cd app && mvn test' narrows
+app's tests. Surefire cannot select one parametrized case, so 'Cls::m(int)[1]' selects Cls#m.
+
+It turns itself off, loudly, when it cannot narrow: an --env other than pytest or mvn, a command
+that is not pytest-shaped, or one that already names its own paths (appending ids to 'pytest
+tests/' would widen the run, not narrow it); under --env mvn, a last command that is not an mvn
+run of the test phase, or one that already selects tests with -Dtest. Use --fast-cmd to drive it
+yourself, --no-fast to be rid of it.
 
 SHELL CHECKS. Use --env lines for a check that is a script, not a test runner:
 
@@ -520,8 +529,11 @@ def classify_surefire():
             root = ET.parse(path).getroot()
         except (ET.ParseError, OSError):
             continue
-        cls = root.get("name", "?").split(".")[-1]
+        suite = root.get("name", "?")
         for case in root.iter("testcase"):
+            # A @Nested test is reported in its outer class's suite, under its own classname,
+            # such as 'p.ATest$In': the id names the class that holds the test.
+            cls = (case.get("classname") or suite).split(".")[-1]
             node = case.find("failure")
             if node is None:
                 node = case.find("error")
@@ -687,6 +699,59 @@ def fast_probe(cmd):
     return None
 
 
+# The Maven phases that run Surefire: the test phase and every phase after it.
+MVN_TEST_PHASES = {"test", "package", "integration-test", "verify", "install", "deploy"}
+# Shell operators that end one command and begin another, as shlex's punctuation reads them.
+SHELL_OPERATORS = {"&&", "||", ";", ";;", "|", "|&", "&", "(", ")"}
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def fast_probe_mvn(cmd):
+    """Can a Surefire selection be appended to this command? Returns None, or the reason it cannot.
+
+    The selection is appended as -Dtest, so it reaches the command's LAST command, which has to be
+    the mvn run whose tests it narrows: '(cd lib && mvn install) && cd app && mvn test' narrows
+    app's tests, where 'mvn test && ./report' would hand the selection to the report.
+    """
+    try:
+        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        toks = list(lexer)
+    except ValueError as exc:
+        return "the test command cannot be tokenised (%s)" % exc
+    if not toks:
+        return "the test command is empty"
+    if toks[-1] in SHELL_OPERATORS:
+        return ("the test command ends in '%s', so a selection appended to it would not reach "
+                "mvn" % toks[-1])
+    start = max((i + 1 for i, t in enumerate(toks) if t in SHELL_OPERATORS), default=0)
+    last = toks[start:]
+    while last and ASSIGNMENT.match(last[0]):
+        last = last[1:]
+    if not last or os.path.basename(last[0]) not in ("mvn", "mvnw"):
+        return ("the test command's last command is not mvn ('%s'), so a selection appended to "
+                "it would not reach the tests" % (last[0] if last else ""))
+    if not any(t in MVN_TEST_PHASES or t.endswith(":test") for t in last[1:]):
+        return "the test command's mvn runs no test phase, so there is nothing to narrow"
+    if any(t == "-Dtest" or t.startswith("-Dtest=") for t in last):
+        return ("the test command already selects tests with -Dtest; appending a selection "
+                "would replace it")
+    return None
+
+
+def surefire_selection(ids):
+    """The ids as Surefire's -Dtest value: 'Cls::method(int)[1]' selects Cls#method, as Surefire
+    cannot select one parametrized case, and an id with no method selects its class."""
+    selected = []
+    for tid in ids:
+        cls, sep, rest = tid.partition("::")
+        method = re.split(r"[(\[]", rest, maxsplit=1)[0] if sep else ""
+        selector = "%s#%s" % (cls, method) if method else cls
+        if selector not in selected:
+            selected.append(selector)
+    return ",".join(selected)
+
+
 # ---------------------------------------------------------------------------------------
 # The sweep
 # ---------------------------------------------------------------------------------------
@@ -708,6 +773,7 @@ class Sweep:
         self.fast_enabled = False
         self.fast_why = ""
         self.fast_cmd_template = ""
+        self.fast_surefire = False    # '{}' takes a Surefire selection, not pytest ids
         self.fast_iso = {}            # key -> set(ids) red in isolation
         self.fast_iso_ids = None
         self.hintwarn = []
@@ -880,7 +946,10 @@ class Sweep:
         quotes, and it is handed to bash -c."""
         if not ids:
             return None
-        joined = "".join(" " + shlex.quote(i) for i in ids)
+        if self.fast_surefire:
+            joined = shlex.quote(surefire_selection(ids))
+        else:
+            joined = "".join(" " + shlex.quote(i) for i in ids)
         pre, _, post = self.fast_cmd_template.partition("{}")
         return pre + joined + post
 
@@ -1355,15 +1424,24 @@ def resolve_fast(sweep, env_name, fast_mode, fast_cmd_template, test_cmd):
     if env_name == "lines":
         sweep.fast_why = "--env lines cannot select checks by id"
         return
+    sweep.fast_surefire = env_name == "mvn"
     if fast_cmd_template:
         if "{}" not in fast_cmd_template:
             die("--fast-cmd needs a '{}' where the test ids go")
         sweep.fast_cmd_template = fast_cmd_template
         sweep.fast_enabled = True
         return
+    if env_name == "mvn":
+        why = fast_probe_mvn(test_cmd)
+        if why:
+            sweep.fast_why = why + "; pass --fast-cmd"
+            return
+        sweep.fast_cmd_template = test_cmd + " -Dtest={} -Dsurefire.failIfNoSpecifiedTests=false"
+        sweep.fast_enabled = True
+        return
     if env_name != "pytest":
-        sweep.fast_why = ("only the pytest env selects by test id (--env %s); pass --fast-cmd"
-                          % env_name)
+        sweep.fast_why = ("only the pytest and mvn envs select by test id (--env %s); pass "
+                          "--fast-cmd" % env_name)
         return
     if "pytest" not in test_cmd:
         sweep.fast_why = "the test command is not pytest-shaped; pass --fast-cmd"
@@ -1516,6 +1594,7 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
             fcmd = sweep.fast_cmd_for(subset)
             if fcmd:
                 flog = os.path.join(sweep.work, "log.%s.fast" % idx)
+                f_started = datetime.datetime.now().timestamp()
                 f_rc = sweep.run_test_cmd(flog, fcmd, env_name, timeout_secs)
                 # pytest exits 4 and collects NOTHING when any id fails to match -- one typo
                 # in a 'tests' hint drops the whole subset, valid ids included.
@@ -1523,7 +1602,9 @@ def do_sweep(sweep, chosen, n_selected, mutations_file, env_name, assertion_patt
                     ftext = open(flog, errors="replace").read()
                 except OSError:
                     ftext = ""
-                if f_rc == 4 or "no match in any of" in ftext or "ERROR: not found:" in ftext:
+                surefire_none = env_name == "mvn" and count_tests(flog, f_started, env_name) == 0
+                if (f_rc == 4 or "no match in any of" in ftext or "ERROR: not found:" in ftext
+                        or surefire_none):
                     sweep.hintwarn.append("%s: selected no test that could be collected"
                                           % mut.name)
                 if not sweep.run_timed_out:
@@ -1680,8 +1761,9 @@ def section(sweep, title, *wanted):
 
 # What may follow a hint in an id it owns. pytest: '[' a parametrization, '::' a class's or
 # module's tests, '/' a directory's. Surefire: '(' a JUnit 5 method's parameter list, as in
-# 'testFoo(int)[1]'. JUnit 4's 'testFoo[0]' is already the '['.
-HINT_BOUNDARIES = ("[", "::", "/", "(")
+# 'testFoo(int)[1]', and '$' a nested class's tests, so 'ATest' owns 'ATest$In::scales'.
+# JUnit 4's 'testFoo[0]' is already the '['.
+HINT_BOUNDARIES = ("[", "::", "/", "(", "$")
 
 
 def hint_owns(tid, test_id):

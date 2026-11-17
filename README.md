@@ -293,7 +293,8 @@ summary lines at all -- the per-test outcome exists only in `target/surefire-rep
 console log therefore finds nothing to classify and reports *every* mutation as "not measured", however well
 tested the code is. Under `--env mvn` the XML is parsed instead and the console is ignored; `<failure>` and
 `<error>` are **not** used to classify, since Surefire files an `AssertionFailedError` under `<error>` --
-the exception type is what decides.
+the exception type is what decides. A test is named by its own `classname`, not its suite's: Surefire reports
+a `@Nested` class's tests inside the outer class's suite, so the suite would give them the wrong class.
 
 Four things are set for the child, all load-bearing:
 
@@ -393,9 +394,17 @@ inventing one, which is still wrong, and it is the reason the guard is not optio
 
 **It turns itself off, loudly, rather than guess.** Appending test ids to `pytest tests/` runs all of
 `tests/` *and* the ids -- slower than the full run it replaced. So the resolved command is parsed, and the
-tier stays off, with a printed reason, whenever ids cannot simply be appended: a non-pytest `--env`, a
-command that is not pytest-shaped, one that already names its own paths, or an option the parser cannot
-prove is not a value. `--fast-cmd '<cmd> {}'` drives it manually; `--no-fast` disables it.
+tier stays off, with a printed reason, whenever ids cannot simply be appended: an `--env` other than
+pytest or mvn, a command that is not pytest-shaped, one that already names its own paths, or an option the
+parser cannot prove is not a value. `--fast-cmd '<cmd> {}'` drives it manually; `--no-fast` disables it.
+
+**Under `--env mvn` the subset is a Surefire selection.** The ids become `-Dtest=Cls#method,...` with
+`-Dsurefire.failIfNoSpecifiedTests=false`, appended to the command's last command, which must be the `mvn`
+run whose tests it narrows: `(cd lib && mvn install) && cd app && mvn test` narrows `app`'s tests, where
+`mvn test && ./report` would hand the selection to the report, and the tier stays off. It stays off too when
+that `mvn` runs no test phase, or already selects tests with `-Dtest`. Surefire cannot select one
+parametrized case, so `Cls::m(int)[1]` selects `Cls#m`; a `@Nested` class is selected as `Cls$In#m`. With
+`--fast-cmd`, the `{}` takes the same selection, so `--fast-cmd 'mvn test -Dtest={}'` is a whole template.
 
 One consequence worth knowing: `--timeout` bounds a single run, and an escalating mutation makes two, so a
 mutation that escalates can take up to twice the timeout in wall clock (three times if its kill set is being
@@ -449,11 +458,13 @@ that reddens only by error does not count as met either, and says so.
 A hint names everything its runner selects for it. A bare id for a parametrized test --
 `tests/test_mod.py::test_score` where the suite runs `test_score[zero]`, `test_score[one]` -- names every
 case of it; a class or module names every test in it; a directory, every test under it. For Surefire,
-`Mod::testScore` owns the `Mod::testScore(int)[1]` that JUnit 5 reports. The expectation is met when
+`Mod::testScore` owns the `Mod::testScore(int)[1]` that JUnit 5 reports, and `Mod` the tests of its
+`@Nested` classes, which are named after the class that holds them: `Mod$Refunds::testPartial`. The
+expectation is met when
 **any** of those fails by assertion, whatever the others did: *this test defends the behaviour*. Only
 failures are visible to the sweep, so *every case failed* could not be checked anyway; to expect a
 particular case, name it -- `test_score[zero]` matches only itself. The match stops at a boundary
-(`[`, `::`, `/`, `(`), so `test_score` never claims `test_scorecard[...]`, nor `tests` claim
+(`[`, `::`, `/`, `(`, `$`), so `test_score` never claims `test_scorecard[...]`, nor `tests` claim
 `tests_more/`. When nothing a hint names failed by assertion but some errored, the line names the ones
 that errored.
 

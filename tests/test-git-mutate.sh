@@ -1274,7 +1274,7 @@ test17() {
         "already names a path or test id"
     mutate "$repo" --env go --cmd "python3 -m pytest -q" "$d/mutations.toml" survivor
     assert_contains "a non-pytest env turns the fast tier off, and says why" \
-        "only the pytest env selects by test id"
+        "only the pytest and mvn envs select by test id"
     mutate "$repo" --no-fast --cmd "python3 -m pytest -q" "$d/mutations.toml" survivor
     assert_contains "--no-fast says so plainly in the header" \
         "fast tier: off (disabled with --no-fast)"
@@ -2222,10 +2222,227 @@ EOF
     assert_no_sweep_state "$repo" "lines sweeps and usage errors leave no state"
 }
 
+# --- test 27: under --env mvn the fast tier narrows with a Surefire selection ----------------
+#
+# Surefire selects tests with -Dtest=Cls#method, not with ids appended to the command, so without
+# a translation the fast tier is off for every Maven sweep and each mutation pays a full suite.
+# The selection reaches only the command's LAST command, so the tier must stay off when that is
+# not the mvn run whose tests it narrows -- a selection handed to anything else narrows nothing,
+# and one that replaced the command's own -Dtest would widen the run.
+#
+# The fake mvn honours -Dtest as Surefire does (Cls#method and Cls, comma-separated), writes the
+# XML the way Surefire does -- a @Nested class's tests inside the outer class's suite, under
+# their own classname -- and logs every argument list it was called with.
+make_mvn_fixture() {
+    local repo="$1"
+    init_repo "$repo"
+    mkdir -p "$repo/bin"
+    cat > "$repo/mod.py" <<'EOF'
+def add(a, b):
+    return a + b
+
+
+def mul(a, b):
+    return a * b
+
+
+def sub(a, b):
+    return a - b
+
+
+def unused(n):
+    return n * 2
+EOF
+    cat > "$repo/bin/mvn" <<'EOF'
+#!/usr/bin/env python3
+import os
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+repo = os.path.dirname(here)
+with open(os.path.join(os.path.dirname(repo), "mvn-calls.log"), "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\n")
+
+sys.path.insert(0, repo)
+sys.dont_write_bytecode = True
+import mod
+
+TESTS = [
+    ("Mod", "testAdd", lambda: mod.add(2, 3) == 5),
+    ("Mod", "testMul", lambda: mod.mul(2, 3) == 6),
+    ("Mod$Nested", "testSub", lambda: mod.sub(5, 3) == 2),
+    ("Other", "testAlways", lambda: True),
+]
+selection = next((a[len("-Dtest="):] for a in sys.argv[1:] if a.startswith("-Dtest=")), None)
+
+
+def selected(cls, method):
+    if selection is None:
+        return True
+    for selector in selection.split(","):
+        sel_cls, _, sel_method = selector.partition("#")
+        if (cls == sel_cls or cls.startswith(sel_cls + "$")) and sel_method in ("", method):
+            return True
+    return False
+
+
+suites, failed = {}, False
+for cls, method, check in TESTS:
+    if not selected(cls, method):
+        continue
+    case = '<testcase name="%s" classname="com.example.%s"' % (method, cls)
+    if check():
+        case += "/>"
+    else:
+        failed = True
+        case += '><failure type="org.opentest4j.AssertionFailedError" message="no"/></testcase>'
+    suites.setdefault(cls.split("$")[0], []).append(case)
+reports = os.path.join(repo, "target", "surefire-reports")
+os.makedirs(reports, exist_ok=True)
+for suite, cases in suites.items():
+    with open(os.path.join(reports, "TEST-com.example.%s.xml" % suite), "w") as out:
+        out.write('<testsuite name="com.example.%s" tests="%d">%s</testsuite>\n'
+                  % (suite, len(cases), "".join(cases)))
+sys.exit(1 if failed else 0)
+EOF
+    chmod +x "$repo/bin/mvn"
+    printf 'target/\n' > "$repo/.gitignore"
+    cat > "$repo/mutations.toml" <<'EOF'
+[[mutation]]
+name = "add-broken"
+tests = ["Mod::testAdd"]
+file = "mod.py"
+old = '''    return a + b'''
+new = '''    return a - b'''
+
+[[mutation]]
+name = "mul-broken"
+tests = ["Mod::testMul"]
+file = "mod.py"
+old = '''    return a * b'''
+new = '''    return a + b + 1'''
+
+[[mutation]]
+name = "sub-broken"
+tests = ["Mod$Nested::testSub"]
+file = "mod.py"
+old = '''    return a - b'''
+new = '''    return b - a'''
+
+[[mutation]]
+name = "survivor"
+tests = ["Mod::testAdd"]
+file = "mod.py"
+old = '''    return n * 2'''
+new = '''    return n * 3'''
+
+[[mutation]]
+name = "param-hint"
+tests = ["Mod::testAdd(int)[1]"]
+file = "mod.py"
+old = '''    return a + b'''
+new = '''    return a + b + 2'''
+
+[[mutation]]
+name = "unmatched"
+tests = ["Nope::testNothing"]
+file = "mod.py"
+old = '''    return a + b'''
+new = '''    return a + b + 1'''
+EOF
+    commit_all "$repo" "mvn fixture"
+}
+
+test27() {
+    echo "test 27: under --env mvn the fast tier narrows with a Surefire selection"
+    local d="$WORK/t27" repo="$WORK/t27/repo" fast slow
+    mkdir -p "$d"
+    make_mvn_fixture "$repo"
+    local toml="$repo/mutations.toml"
+
+    : > "$d/mvn-calls.log"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q test" "$toml" \
+        add-broken mul-broken sub-broken survivor
+    fast="$OUT"
+    assert_contains "a plain mvn test run turns the fast tier on" "fast tier: on"
+    assert_status "the survivor is still a finding (exit 2)" 2
+    assert_contains "a hinted mutation is settled by its candidate set" \
+        "reddened 1 by assertion in the 1-test candidate set -- full suite not run"
+    OUT=$(cat "$d/mvn-calls.log")
+    assert_contains "the subset is a Surefire selection, with an empty selection allowed" \
+        "test -Dtest=Mod#testAdd -Dsurefire.failIfNoSpecifiedTests=false"
+    assert_contains "a nested class is selected by its own name" 'Mod$Nested#testSub'
+    OUT="$fast"
+    if printf '%s\n' "$fast" | grep "survivor" | grep -q "candidate set"; then
+        fail "the survivor verdict came from the subset, not the full suite"
+    else
+        ok "the survivor verdict did not come from the subset"
+    fi
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --no-fast --cmd "mvn -B -q test" "$toml" \
+        add-broken mul-broken sub-broken survivor
+    slow="$OUT"
+    assert_eq "the Surefire subset changes no verdict: the summary line is identical" \
+        "$(printf '%s' "$slow" | sed -n 's/.*: \([0-9]* killed by assertion.*\)/\1/p')" \
+        "$(printf '%s' "$fast" | sed -n 's/.*: \([0-9]* killed by assertion.*\)/\1/p')"
+
+    : > "$d/mvn-calls.log"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q test" "$toml" param-hint
+    OUT=$(cat "$d/mvn-calls.log")
+    assert_contains "a parametrized case is selected by its method, which Surefire can select" \
+        "-Dtest=Mod#testAdd -Dsurefire"
+
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q test" "$toml" unmatched
+    assert_contains "a selection that ran no test is reported, as an unmatched pytest id is" \
+        "unmatched: selected no test that could be collected"
+
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "true && mvn -B -q test" "$toml" survivor
+    assert_contains "a command whose last command is the mvn run keeps the tier on" "fast tier: on"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q test && true" "$toml" survivor
+    assert_contains "a selection that would reach another command turns the tier off" \
+        "the test command's last command is not mvn"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q -Dtest=Mod test" "$toml" survivor
+    assert_contains "a command that already selects tests turns the tier off" \
+        "already selects tests with -Dtest"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q compile" "$toml" survivor
+    assert_contains "an mvn run of no test phase turns the tier off" "runs no test phase"
+
+    : > "$d/mvn-calls.log"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --cmd "mvn -B -q test" \
+        --fast-cmd "mvn -B -q test -Dtest={}" "$toml" add-broken
+    OUT=$(cat "$d/mvn-calls.log")
+    assert_contains "--fast-cmd's {} takes the Surefire selection under --env mvn" "-Dtest=Mod#testAdd"
+}
+
+
+# --- test 28: a Surefire test is named by the class that holds it --------------------------
+#
+# Surefire reports a @Nested class's tests inside the OUTER class's suite, each under its own
+# classname. Named after the suite, 'Mod$Nested::testSub' reads as 'Mod::testSub': a hint
+# naming the nested class is never met though its test killed, and the fast tier's selection
+# names a method the outer class does not have. A hint naming the outer class still owns them.
+test28() {
+    echo "test 28: a Surefire test is named by the class that holds it, nested ones included"
+    local d="$WORK/t28" repo="$WORK/t28/repo"
+    mkdir -p "$d"
+    make_mvn_fixture "$repo"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --no-fast --cmd "mvn -B -q test" \
+        "$repo/mutations.toml" sub-broken
+    assert_status "the nested test's kill is a kill (exit 0)" 0
+    assert_contains "the nested test is reported under its own class" 'assertion Mod$Nested::testSub'
+    assert_missing "a hint naming the nested class is met" "sub-broken: expected"
+
+    sed -i 's/tests = \["Mod\$Nested::testSub"\]/tests = ["Mod"]/' "$repo/mutations.toml"
+    commit_all "$repo" "hint the outer class"
+    PATH="$repo/bin:$PATH" mutate "$repo" --env mvn --no-fast --cmd "mvn -B -q test" \
+        "$repo/mutations.toml" sub-broken
+    assert_missing "a hint naming the outer class owns its nested classes' tests" "sub-broken: expected"
+}
+
 # Optional test names keep foreground verification sweeps focused on one behaviour.
 if [ "$#" -eq 0 ]; then
     set -- test1 test2 test3 test4 test5 test6 test7 test8 test9 test10 test11 test12 test13 \
-        test14 test15 test16 test17 test18 test19 test20 test21 test22 test23 test24 test25 test26
+        test14 test15 test16 test17 test18 test19 test20 test21 test22 test23 test24 test25 test26 \
+        test27 test28
 fi
 for selected_test in "$@"; do
     case "$selected_test" in
@@ -2264,6 +2481,8 @@ echo "23. a bare hint for a parametrized test owns its cases ... test23"
 echo "24. class/module/dir hints own their tests; red hints unchecked  test24"
 echo "25. a Surefire hint owns JUnit 5's name(args)[n] cases ........ test25"
 echo "20. a green baseline that ran nothing refuses; stale reports uncounted  test20"
+echo "27. under --env mvn the fast tier narrows with a Surefire selection  test27"
+echo "28. a Surefire test is named by its own class, nested ones included  test28"
 echo
 echo "$TESTS_RUN assertions, $TESTS_FAILED failed, $TESTS_SKIPPED test(s) skipped"
 [ "$TESTS_FAILED" -eq 0 ]
