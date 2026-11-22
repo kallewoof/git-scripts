@@ -718,16 +718,14 @@ the agent's included, at a repository the task file did not name.
 ## Configured models
 
 Use `dispatch.model.<name>` to give an existing harness a model-specific environment.
-For example, to run Claude Code against a local Anthropic Messages API server:
+For example, to run Claude Code against a local llama.cpp server:
 
 ```sh
 git config --global dispatch.model.local.harness claude-code
 git config --global dispatch.model.local.implementer '<display name>'
-git config --global --add dispatch.model.local.env 'ANTHROPIC_BASE_URL=<url>'
+git config --global dispatch.model.local.server '<url>'
+git config --global dispatch.model.local.server-model '<model>'
 git config --global --add dispatch.model.local.env 'ANTHROPIC_AUTH_TOKEN=<token>'
-git config --global --add dispatch.model.local.env 'ANTHROPIC_MODEL=<model>'
-git config --global --add dispatch.model.local.env 'ANTHROPIC_DEFAULT_HAIKU_MODEL=<model>'
-git config --global --add dispatch.model.local.env 'CLAUDE_CODE_MAX_CONTEXT_TOKENS=<n>'
 git config --global --add dispatch.model.local.env 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1'
 git dispatch --agent local context/TASK_x.md
 ```
@@ -738,13 +736,29 @@ Each model needs a supported harness and a unique, single-line implementer displ
 Use repository-local config to add models or override settings. For repeated environment keys,
 the last assignment in Git config order wins. Values are literal, including spaces and equals signs.
 
+Set `server` and `server-model` together to read settings on every start, resume, and preview.
+Dispatch uses Python 3 and curl to query `GET <url>/v1/models` with a five-second timeout and
+match the exact model ID. It supplies the URL as `ANTHROPIC_BASE_URL` and the ID as both
+`ANTHROPIC_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`. Explicit `env` assignments take
+precedence for each variable.
+
+For a router, dispatch reads the selected entry's `status.args`, including for an unloaded model.
+With fixed, split slots, `--ctx-size 262144 --parallel 2` gives 131072 tokens per request.
+Unified KV shares the pool. Dispatch accounts for a per-slot cap and a reported training limit.
+For a plain single-model server it reads `default_generation_settings.n_ctx` from `GET /props`
+directly. If the context is unavailable, pin `CLAUDE_CODE_MAX_CONTEXT_TOKENS` in `env`.
+Dispatch still requires a reachable server and a listed model. Current llama.cpp enables Jinja
+by default, so omitting `--jinja` needs no warning.
+[llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+
 Add this instruction to the repository's worker rules: **If `GIT_DISPATCH_IMPLEMENTER` is set,
 write its value verbatim as `Implementer` in the task header.** Dispatch supplies this variable
 from the model's configured display name. On resume, the same header selects the current settings
 for that model without `--agent`. A configured `--agent` on resume requires a matching header.
 
 Both `--dry-run` and `--setup-only` show the model name and its environment assignments. They mask
-values whose variable names contain TOKEN, KEY or SECRET, regardless of case.
+values whose variable names contain TOKEN, KEY or SECRET, regardless of case. Derived assignments
+identify the server. A separate server-context line shows the calculated token count when used.
 
 ## `--setup-only`
 

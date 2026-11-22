@@ -126,12 +126,12 @@ Usage:
                 cursor runs the 'agent' program. Configure a local Claude Code model with:
                   git config dispatch.model.local.harness claude-code
                   git config dispatch.model.local.implementer '<display name>'
-                  git config --add dispatch.model.local.env 'ANTHROPIC_BASE_URL=<url>'
+                  git config dispatch.model.local.server '<url>'
+                  git config dispatch.model.local.server-model '<model>'
                   git config --add dispatch.model.local.env 'ANTHROPIC_AUTH_TOKEN=<token>'
-                  git config --add dispatch.model.local.env 'ANTHROPIC_MODEL=<model>'
-                  git config --add dispatch.model.local.env 'ANTHROPIC_DEFAULT_HAIKU_MODEL=<model>'
-                  git config --add dispatch.model.local.env 'CLAUDE_CODE_MAX_CONTEXT_TOKENS=<n>'
                   git config --add dispatch.model.local.env 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1'
+                With server and server-model set together, dispatch reads /v1/models on start
+                and resume, or /props for a plain server's context. Explicit env entries win.
                 The worker copies GIT_DISPATCH_IMPLEMENTER verbatim into Implementer.
   --effort L    The worker's reasoning effort (default: high). claude: low, medium, high,
                 xhigh, max; codex: the same, or ultra. omp and cursor take none; --effort
@@ -285,7 +285,7 @@ inventory_field() {
         index($0, "**" key ": ") == 1 {sub("^\\*\\*" key ": *", ""); sub(/\*\*$/, ""); print; exit}' "$1"
 }
 declare -A harness_program=([claude-code]=claude [codex]=codex [omp]=omp [cursor]=cursor)
-declare -A models model_harness model_impl model_env impl_model
+declare -A models model_harness model_impl model_env impl_model model_server server_model
 read_models() {
     local config_fd config_pid record key value suffix name h impl
     # Git emits entries in config precedence order, separated by NUL so values stay literal.
@@ -303,6 +303,8 @@ read_models() {
         case "${suffix##*.}" in
             harness) model_harness[$name]=$value ;;
             implementer) model_impl[$name]=$value ;;
+            server) model_server[$name]=$value ;;
+            server-model) server_model[$name]=$value ;;
             env)
                 [[ "$value" =~ ^([a-zA-Z_][a-zA-Z_0-9]*)= ]] || die "$key requires KEY=VALUE with a shell-safe key"
                 model_env[$name.${BASH_REMATCH[1]}]=${value#*=}
@@ -322,6 +324,10 @@ read_models() {
         [[ "$impl" != *$'\n'* && "$impl" != [[:space:]]* && "$impl" != *[[:space:]] ]] ||
             die "configured model '$name' needs implementer text that fits a header field"
         [ -z "${impl_model[$impl]-}" ] || die "configured models '${impl_model[$impl]}' and '$name' have the same implementer"
+        if [[ -v 'model_server[$name]' || -v 'server_model[$name]' ]]; then
+            [[ -n "${model_server[$name]-}" && -n "${server_model[$name]-}" ]] ||
+                die "configured model '$name' requires both server and server-model"
+        fi
         impl_model[$impl]=$name
     done
 }
@@ -601,11 +607,117 @@ if [ "$session" != unassigned ]; then
     fi
 fi
 
+# stdout carries only the numeric context. An explicit context still requires a listed model.
+server_context() {
+    python3 - "$@" <<'PY'
+import json
+import subprocess
+import sys
+
+server, model_id, pinned = sys.argv[1:]
+
+def refuse(message):
+    sys.exit(f"git-dispatch: {message}")
+
+def get(path):
+    url = server.rstrip("/") + path
+    try:
+        data = subprocess.check_output([
+            "curl", "-q", "--fail", "--silent", "--show-error", "--max-time", "5",
+            "--proto", "=http,https", "--globoff", "--", url,
+        ])
+    except (OSError, subprocess.CalledProcessError):
+        refuse(f"cannot read {url}")
+    try:
+        result = json.loads(data)
+    except ValueError:
+        refuse(f"invalid JSON from {url}")
+    if not isinstance(result, dict):
+        refuse(f"expected a JSON object from {url}")
+    return result
+
+def arg_value(args, names, default):
+    value = default
+    for i, arg in enumerate(args):
+        key, sep, inline = arg.partition("=")
+        if key in names:
+            raw = inline if sep else (args[i + 1] if i + 1 < len(args) else "")
+            try:
+                value = int(raw)
+            except ValueError:
+                refuse(f"cannot determine context for model '{model_id}': invalid {key}")
+    return value
+
+def router_context(args):
+    size = arg_value(args, ("-c", "-ctx", "--ctx-size"), None)
+    slots = arg_value(args, ("-np", "--parallel"), -1)
+    cap = arg_value(args, ("--kv-unified-per-slot",), 0)
+    unified = False
+    for arg in args:
+        if arg in ("--kv-unified", "-kvu"):
+            unified = True
+        elif arg in ("--no-kv-unified", "-no-kvu"):
+            unified = False
+    if slots == 0 or slots < -1:
+        return 0
+    if size is None:
+        return cap
+    if size <= 0:
+        return 0
+    if slots > 0 and not unified:
+        size = size // slots
+    return min(size, cap) if cap > 0 else size
+
+models = get("/v1/models").get("data")
+if not isinstance(models, list):
+    refuse(f"invalid model list from {server}")
+entry = next((m for m in models if isinstance(m, dict) and m.get("id") == model_id), None)
+if entry is None:
+    refuse(f"model '{model_id}' is not listed by {server}")
+if pinned:
+    sys.exit(0)
+
+size = 0
+if "status" in entry:
+    status = entry["status"]
+    args = status.get("args") if isinstance(status, dict) else None
+    if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+        size = router_context(args)
+        meta = entry.get("meta")
+        trained = meta.get("n_ctx_train") if isinstance(meta, dict) else None
+        if type(trained) is int and trained > 0:
+            size = min(size, trained)
+elif len(models) == 1:
+    settings = get("/props").get("default_generation_settings")
+    if isinstance(settings, dict):
+        size = settings.get("n_ctx")
+if type(size) is not int or size <= 0:
+    refuse(f"cannot determine context for model '{model_id}' on {server}; "
+           "set CLAUDE_CODE_MAX_CONTEXT_TOKENS in its env")
+print(size)
+PY
+}
+
+declare -A derived_env
 worker_env=()
 selected_agent=$agent_opt
 worker_path=$PATH
 if [ -n "$model" ]; then
     selected_agent=${harness_program[${model_harness[$model]}]}
+    if [[ -v 'model_server[$model]' ]]; then
+        server=${model_server[$model]}
+        server_id=${server_model[$model]}
+        context=$(server_context "$server" "$server_id" "${model_env[$model.CLAUDE_CODE_MAX_CONTEXT_TOKENS]+set}") || exit 1
+        derived_env=([ANTHROPIC_BASE_URL]="$server" [ANTHROPIC_MODEL]="$server_id"
+                     [ANTHROPIC_DEFAULT_HAIKU_MODEL]="$server_id" [CLAUDE_CODE_MAX_CONTEXT_TOKENS]="$context")
+        for key in "${!derived_env[@]}"; do
+            if [[ -v 'model_env[$model.$key]' ]]; then
+                unset 'derived_env[$key]'
+            else
+                model_env[$model.$key]=${derived_env[$key]}
+            fi
+        done
+    fi
     model_env[$model.GIT_DISPATCH_IMPLEMENTER]=${model_impl[$model]}
     for key in "${!model_env[@]}"; do
         [ "${key%.*}" = "$model" ] || continue
@@ -939,9 +1051,16 @@ if [ -n "$model" ] && (( dry_run || setup_only )); then
     echo "$SELF: model: $model"
     for assignment in "${worker_env[@]}"; do
         key=${assignment%%=*}
+        source_note=""
+        if [[ -v 'derived_env[$key]' ]]; then
+            printf -v source_note ' (derived from %q)' "$server"
+            if [ "$key" = CLAUDE_CODE_MAX_CONTEXT_TOKENS ]; then
+                printf '%s: server context: %s tokens%s\n' "$SELF" "$context" "$source_note"
+            fi
+        fi
         case "${key^^}" in
-            *TOKEN*|*KEY*|*SECRET*) printf '%s: env: %s=<masked>\n' "$SELF" "$key" ;;
-            *) printf '%s: env: %s=%q\n' "$SELF" "$key" "${assignment#*=}" ;;
+            *TOKEN*|*KEY*|*SECRET*) printf '%s: env: %s=<masked>%s\n' "$SELF" "$key" "$source_note" ;;
+            *) printf '%s: env: %s=%q%s\n' "$SELF" "$key" "${assignment#*=}" "$source_note" ;;
         esac
     done
 fi

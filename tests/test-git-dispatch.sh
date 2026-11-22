@@ -81,6 +81,11 @@ for agent in claude codex omp agent; do
     for key in GIT_DISPATCH_IMPLEMENTER DISPATCH_TEST_TOKEN DISPATCH_TEST_LITERAL; do
         [ -z "${!key+x}" ] || printf '%s=%s\n' "$key" "${!key}"
     done
+    if [ -n "${SERVER_FIXTURES:-}" ]; then
+        for key in ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_MAX_CONTEXT_TOKENS; do
+            printf '%s=%s\n' "$key" "${!key-}"
+        done
+    fi
     echo "argv0=$(basename "$0")"
     for a in "$@"; do echo "arg=$a"; done
 } > "$AGENT_LOG"
@@ -1965,6 +1970,146 @@ for option in --dry-run --setup-only; do
     assert_eq "$option protects secrets" '' "$(grep -F private-test-value <<< "$OUT$ERR")"
     [ "$option" != --dry-run ] || assert_eq 'dry-run changes nothing' "$before" "$(snapshot)"
 done
+
+server_project() {
+    model_project
+    export SERVER_FIXTURES="$D"
+    SERVER_URL='https://fixture.invalid'
+    git -C "$MAIN" config dispatch.model.local.v1.server "$SERVER_URL"
+    git -C "$MAIN" config dispatch.model.local.v1.server-model 'wanted'
+    cat > "$D/models" <<'JSON'
+{"data":[{"id":"wanted-next","status":{"args":["-c","8192"]}},
+         {"id":"wanted","status":{"value":"unloaded","args":["--parallel","2","--ctx-size","262144"]}}]}
+JSON
+}
+
+cat > "$FAKEBIN/curl" <<'CURL'
+#!/bin/bash
+url=${!#}
+printf '%s\n' "$url" >> "$SERVER_FIXTURES/requests"
+while [ "$#" -gt 1 ]; do
+    if [ "$1" = --max-time ]; then echo "$2" >> "$SERVER_FIXTURES/timeouts"; fi
+    shift
+done
+case "$url" in
+    https://fixture.invalid/v1/models) file=models ;;
+    https://fixture.invalid/props) file=props ;;
+    *) exit 22 ;;
+esac
+[ -f "$SERVER_FIXTURES/$file" ] || exit 7
+cat "$SERVER_FIXTURES/$file"
+CURL
+chmod +x "$FAKEBIN/curl"
+
+check_server_worker() {
+    assert_eq 'worker starts' 0 "$STATUS"
+    local key expected
+    for key in ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_MAX_CONTEXT_TOKENS; do
+        case "$key" in
+            ANTHROPIC_BASE_URL) expected=$SERVER_URL ;;
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS) expected=$1 ;;
+            *) expected=wanted ;;
+        esac
+        assert_eq "worker $key" "$key=$expected" "$(grep "^$key=" "$LOG" 2>/dev/null)"
+    done
+}
+
+# RD: Taking the first router entry or its total pool gives the worker the wrong context.
+begin test_server_start "an unloaded router model supplies its own per-request settings"
+server_project
+run_dispatch --agent local.v1 "$T"
+check_server_worker 131072
+assert_eq 'bounds model lookup time' '5' "$(cat "$D/timeouts" 2>/dev/null)"
+assert_eq 'only read model list' "$SERVER_URL/v1/models" "$(cat "$D/requests")"
+
+# RD: Reusing launch settings on resume misses a context change made at the server.
+begin test_server_resume "resume reads fresh settings without an agent option"
+server_project
+write_task "$T" Returned 'Local Model' "$ID1" terea@model claude-code
+echo '## Report' >> "$T"
+echo '{"data":[{"id":"wanted","status":{"args":["-c","98304","-np","3"]}}]}' > "$D/models"
+run_dispatch "$T"
+check_server_worker 32768
+assert_contains 'continues saved session' "--resume|$ID1|Continue task:" "$(agent_argv)"
+
+# RD: Dividing a shared KV pool by the slot count can understate the context, while ignoring its cap overstates it.
+begin test_server_unified "unified KV shares context across slots subject to runtime limits"
+server_project
+echo '{"data":[{"id":"wanted","status":{"args":["-c","65536","-np","4","--kv-unified","--kv-unified-per-slot","49152"]}}]}' > "$D/models"
+run_dispatch --agent local.v1 "$T"
+check_server_worker 49152
+echo '{"data":[{"id":"wanted","meta":{"n_ctx_train":32768},"status":{"args":["--kv-unified-per-slot","49152"]}}]}' > "$D/models"
+run_dispatch --agent local.v1 "$T"
+check_server_worker 32768
+
+# RD: Dividing the standalone server's per-slot n_ctx again silently shortens every request.
+begin test_server_props "a plain server reports its slot context in props"
+server_project
+echo '{"data":[{"id":"wanted","meta":{"n_ctx_train":8192}}]}' > "$D/models"
+echo '{"total_slots":2,"default_generation_settings":{"n_ctx":4096}}' > "$D/props"
+run_dispatch --agent local.v1 "$T"
+check_server_worker 4096
+
+# RD: Applying server defaults last overwrites operator pins or makes a pinned context depend on props.
+begin test_server_pin "explicit env overrides derivation and covers missing context"
+server_project
+git -C "$MAIN" config --add dispatch.model.local.v1.env 'ANTHROPIC_MODEL=pinned'
+git -C "$MAIN" config --add dispatch.model.local.v1.env 'CLAUDE_CODE_MAX_CONTEXT_TOKENS=7777'
+echo '{"data":[{"id":"wanted"}]}' > "$D/models"
+run_dispatch --agent local.v1 "$T"
+assert_eq 'pinned context works without props' 0 "$STATUS"
+assert_eq 'explicit model' 'ANTHROPIC_MODEL=pinned' "$(grep '^ANTHROPIC_MODEL=' "$LOG")"
+assert_eq 'explicit context' 'CLAUDE_CODE_MAX_CONTEXT_TOKENS=7777' "$(grep '^CLAUDE_CODE_MAX_CONTEXT_TOKENS=' "$LOG")"
+assert_eq 'listed model still verified' "$SERVER_URL/v1/models" "$(cat "$D/requests")"
+
+# RD: A failed lookup must not leave a task moved or silently borrow another model's context.
+begin test_server_refusal "unreachable server, unlisted model and unknown context refuse before setup"
+server_project
+rm "$D/models"
+refused 'unreachable' "cannot read $SERVER_URL/v1/models" --agent local.v1 "$T"
+assert_eq 'unreachable exit' 1 "$STATUS"
+echo '{"data":[{"id":"wanted-next","status":{"args":["-c","8192"]}}]}' > "$D/models"
+refused 'unlisted' "model 'wanted' is not listed" --agent local.v1 "$T"
+assert_eq 'unlisted exit' 1 "$STATUS"
+echo '{"data":[{"id":"wanted","status":{"value":"unloaded"}}]}' > "$D/models"
+echo '{"default_generation_settings":{"n_ctx":8192}}' > "$D/props"
+refused 'no router context' 'cannot determine context' --agent local.v1 "$T"
+assert_eq 'no context exit' 1 "$STATUS"
+
+echo '{"data":[{"id":"wanted"}]}' > "$D/models"
+echo '{"default_generation_settings":{"n_ctx":false}}' > "$D/props"
+refused 'invalid plain server context' 'cannot determine context' --agent local.v1 "$T"
+assert_eq 'invalid context exit' 1 "$STATUS"
+
+# RD: Reading just the chosen model can leave a half-configured server silently accepted.
+begin test_server_pair "validate both halves of every server definition before setup"
+server_project
+git -C "$MAIN" config --unset dispatch.model.local.v1.server-model
+refused 'missing model' 'requires both server and server-model' "$T"
+assert_eq 'missing model exit' 1 "$STATUS"
+git -C "$MAIN" config --unset dispatch.model.local.v1.server
+git -C "$MAIN" config dispatch.model.local.v1.server-model wanted
+refused 'missing server' 'requires both server and server-model' "$T"
+assert_eq 'missing server exit' 1 "$STATUS"
+
+# RD: Labeling explicit pins as server values makes previews misleading and can expose credentials.
+begin test_server_preview "previews identify the source of each derived setting"
+server_project
+before=$(snapshot)
+for option in --dry-run --setup-only; do
+    run_dispatch "$option" --agent local.v1 "$T"
+    assert_eq "$option succeeds" 0 "$STATUS"
+    for assignment in "ANTHROPIC_BASE_URL=$SERVER_URL" ANTHROPIC_MODEL=wanted ANTHROPIC_DEFAULT_HAIKU_MODEL=wanted; do
+        assert_contains "$option source" "$assignment (derived from $SERVER_URL)" "$OUT"
+    done
+    assert_contains "$option context source" "131072 tokens (derived from $SERVER_URL)" "$OUT"
+    assert_contains "$option masks token" 'DISPATCH_TEST_TOKEN=<masked>' "$OUT"
+    [ "$option" != --dry-run ] || assert_eq 'preview leaves task and refs intact' "$before" "$(snapshot)"
+done
+git -C "$MAIN" config --add dispatch.model.local.v1.env 'CLAUDE_CODE_MAX_CONTEXT_TOKENS=private-pin'
+run_dispatch --dry-run --agent local.v1 "$T"
+assert_eq 'explicit context has no derivation or value in preview' 'git-dispatch: env: CLAUDE_CODE_MAX_CONTEXT_TOKENS=<masked>' \
+    "$(grep 'env: CLAUDE_CODE_MAX_CONTEXT_TOKENS=' <<< "$OUT")"
 
 echo
 echo "== behaviour -> test mapping =="
