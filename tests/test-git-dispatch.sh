@@ -23,6 +23,10 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 WORK=$(cd "$WORK" && pwd -P)
 
+# Keep the operator's configured models and commit signing out of the disposable repositories.
+export GIT_CONFIG_GLOBAL="$WORK/global"
+unset GIT_DISPATCH_IMPLEMENTER DISPATCH_TEST_TOKEN DISPATCH_TEST_LITERAL
+
 TESTS_RUN=0
 TESTS_FAILED=0
 SNAP_EXTRA=()
@@ -74,6 +78,9 @@ for agent in claude codex omp agent; do
 #!/bin/bash
 {
     echo "cwd=$(pwd -P)"
+    for key in GIT_DISPATCH_IMPLEMENTER DISPATCH_TEST_TOKEN DISPATCH_TEST_LITERAL; do
+        [ -z "${!key+x}" ] || printf '%s=%s\n' "$key" "${!key}"
+    done
     echo "argv0=$(basename "$0")"
     for a in "$@"; do echo "arg=$a"; done
 } > "$AGENT_LOG"
@@ -336,7 +343,7 @@ test4() {
 # --- test 5: the Harness line decides the program -------------------------------------------
 
 test5() {
-    begin test5 "a session resumes with the program its Harness names; the model name is never read"
+    begin test5 "a session resumes with the program its Harness names; unconfigured model names are ignored"
     new_project t5
     local task="$MAIN/context/TASK_who.md"
     write_task "$task" "Returned" "Claude Opus 5.5" "$ID1" "terea@who" codex
@@ -669,7 +676,8 @@ test15() {
     refused "a session id that is a search term" "is not a session UUID" "$task"
 
     write_task "$task" "Pending" "unassigned" "unassigned" "terea@in"
-    refused "--agent bogus" "--agent must be 'claude', 'codex', 'omp' or 'cursor'" --agent bogus "$task"
+    refused "--agent bogus" "unknown --agent 'bogus'" --agent bogus "$task"
+    assert_eq "unknown agent refusal" 1 "$STATUS"
     refused "--agent twice" "--agent given twice" --agent claude --agent codex "$task"
     refused "--cwd twice" "--cwd given twice" --cwd "$ROOT" --cwd "$MAIN" "$task"
     refused "two task files" "one task file" "$task" "$task"
@@ -1854,6 +1862,110 @@ chmod +x "$MAIN/.git/hooks/post-checkout"
 refused "checkout hook refusal" 'git worktree add failed' --setup-only "$T"
 
 
+# Use a private global config so a real operator's model definitions cannot affect the fixtures.
+model_project() {
+    export GIT_CONFIG_GLOBAL="$WORK/$CURRENT.gitconfig"
+    new_project "$CURRENT"
+    T="$MAIN/context/TASK_model.md"
+    git -C "$MAIN" config dispatch.root "$ROOT"
+    git -C "$MAIN" config dispatch.moveTask true
+    git config --global dispatch.model.local.v1.harness codex
+    git config --global dispatch.model.local.v1.implementer "Global Name"
+    git config --global --add dispatch.model.local.v1.env "DISPATCH_TEST_TOKEN=global"
+    git config --global --add dispatch.model.local.v1.env 'DISPATCH_TEST_LITERAL=a b=$x'
+    git -C "$MAIN" config dispatch.model.local.v1.harness claude-code
+    git -C "$MAIN" config dispatch.model.local.v1.implementer "Local Model"
+    git -C "$MAIN" config --add dispatch.model.local.v1.env "DISPATCH_TEST_TOKEN=private-test-value"
+    write_task "$T" Pending unassigned unassigned terea@model
+}
+
+check_model_worker() {
+    assert_eq 'worker starts' 0 "$STATUS"
+    assert_eq 'worker argv' "$1" "$(agent_argv)"
+    assert_eq 'worker environment' $'GIT_DISPATCH_IMPLEMENTER=Local Model\nDISPATCH_TEST_TOKEN=private-test-value\nDISPATCH_TEST_LITERAL=a b=$x' \
+        "$(sed -n '/^GIT_DISPATCH_IMPLEMENTER=/p; /^DISPATCH_TEST_/p' "$LOG" 2>/dev/null)"
+}
+
+# RD: Starting a model with the default program or global values can silently route work elsewhere.
+begin test_model_start "configured model starts with its effective environment and exact name"
+model_project
+run_dispatch --agent local.v1 "$T"
+check_model_worker 'claude|--effort|high|Task: terea@model/context/TASK_model.md'
+git -C "$MAIN" config dispatch.model.local.v1.harness cursor
+run_dispatch --agent local.v1 "$T"
+check_model_worker 'agent|Task: terea@model/context/TASK_model.md'
+
+# RD: Reconstructing only the harness argv on resume silently drops the local server settings.
+begin test_model_resume "a report continues on the configured model without --agent"
+model_project
+write_task "$T" Returned 'Local Model' "$ID1" terea@model claude-code
+echo '## Report' >> "$T"
+run_dispatch "$T"
+check_model_worker "claude|--effort|high|--resume|$ID1|Continue task: terea@model/context/TASK_model.md - read it from the end."
+
+# RD: A prefix match can redirect an unrelated session to the configured server.
+begin test_model_exact "an unconfigured implementer resumes with the recorded harness alone"
+model_project
+write_task "$T" Returned 'Local Model Extended' "$ID1" terea@model claude-code
+run_dispatch "$T"
+assert_eq 'resume succeeds' 0 "$STATUS"
+assert_eq 'harness argv' "claude|--effort|high|--resume|$ID1|Follow-up task: terea@model/context/TASK_model.md" "$(agent_argv)"
+assert_eq 'no model variables' '' "$(sed -n '/^GIT_DISPATCH_IMPLEMENTER=/p; /^DISPATCH_TEST_/p' "$LOG")"
+refused 'explicit configured model with unmatched header' 'requires Implementer' --agent local.v1 "$T"
+assert_eq 'unmatched model refusal' 1 "$STATUS"
+
+# RD: Comparing only program names lets --agent claude replace a local session using Claude Code.
+begin test_model_conflict "resume refuses an agent or harness that contradicts the configured model"
+model_project
+write_task "$T" Returned 'Local Model' "$ID1" terea@model claude-code
+refused 'wrong model' "contradicts configured model 'local.v1'" --agent claude "$T"
+assert_eq 'model conflict exit' 1 "$STATUS"
+write_task "$T" Returned 'Local Model' "$ID1" terea@model codex
+refused 'wrong harness' "Harness is 'codex'" "$T"
+assert_eq 'harness conflict exit' 1 "$STATUS"
+
+# RD: Ignoring a broken entry can turn a configured session into a plain harness resume.
+begin test_model_config "invalid model definitions refuse before moving the task or creating refs"
+model_project
+bad_config() {
+    refused "$1" "$2" "$T"
+    assert_eq "$1 exit" 1 "$STATUS"
+}
+git -C "$MAIN" config dispatch.model.bad.harness cursor
+bad_config 'no implementer' 'missing implementer'
+git -C "$MAIN" config --unset dispatch.model.bad.harness
+git -C "$MAIN" config dispatch.model.bad.implementer 'Local Model'
+bad_config 'no harness' 'missing harness'
+git -C "$MAIN" config dispatch.model.bad.harness cursor
+bad_config 'ambiguous model' 'same implementer'
+git -C "$MAIN" config dispatch.model.bad.harness invalid
+bad_config 'unknown harness' 'unknown harness'
+git -C "$MAIN" config --remove-section dispatch.model.bad
+for entry in 'NO_EQUALS' 'BAD-KEY=1' '1KEY=x'; do
+    git -C "$MAIN" config dispatch.model.local.v1.env "$entry"
+    bad_config 'invalid env' 'requires KEY=VALUE'
+done
+git -C "$MAIN" config --unset-all dispatch.model.local.v1.env
+git -C "$MAIN" config dispatch.model.claude.harness cursor
+bad_config 'reserved name' 'built-in agent'
+
+# RD: A preview can leak a credential even when another line prints the masked value correctly.
+begin test_model_preview "dry-run and setup-only describe the model and mask credential values"
+model_project
+git -C "$MAIN" config --add dispatch.model.local.v1.env 'aPiKeyId=private-test-value'
+git -C "$MAIN" config --add dispatch.model.local.v1.env 'SECRET_VALUE=private-test-value'
+for option in --dry-run --setup-only; do
+    before=$(snapshot)
+    run_dispatch "$option" --agent local.v1 "$T"
+    assert_eq "$option succeeds" 0 "$STATUS"
+    assert_contains "$option names model" "model: local.v1" "$OUT"
+    for key in DISPATCH_TEST_TOKEN aPiKeyId SECRET_VALUE DISPATCH_TEST_LITERAL GIT_DISPATCH_IMPLEMENTER; do
+        assert_contains "$option names $key" "env: $key=" "$OUT"
+    done
+    assert_eq "$option protects secrets" '' "$(grep -F private-test-value <<< "$OUT$ERR")"
+    [ "$option" != --dry-run ] || assert_eq 'dry-run changes nothing' "$before" "$(snapshot)"
+done
+
 echo
 echo "== behaviour -> test mapping =="
 echo "38. setup-only creates, moves, links; prompts match normal argv ....... test38"
@@ -1864,7 +1976,7 @@ echo "1. new task: worktree from the default branch, claude in the root ..... te
 echo "2. Returned task: worktree reused untouched, claude --resume .......... test2"
 echo "3. routed follow-up, new slug: new worktree, resume in the root ....... test3"
 echo "4. Harness codex: codex resume <id>; codex for a new session .......... test4"
-echo "5. Harness decides the program; the model name is never read .......... test5"
+echo "5. Harness decides the program; unconfigured model names are ignored .......... test5"
 echo "6. --cwd moves only the agent's working directory ..................... test6"
 echo "7. every non-dispatchable status is refused ........................... test7"
 echo "8. missing / malformed / duplicate Checkout is refused ................ test8"

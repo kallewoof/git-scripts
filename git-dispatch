@@ -5,7 +5,7 @@
 # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
 
 # Usage:
-#   git dispatch [--dry-run] [--setup-only] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
+#   git dispatch [--dry-run] [--setup-only] [--agent NAME] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
 #
 #   Read a task file (<project root>/<repo>/context/TASK_<name>.md), set up its checkout
 #   (<project root>/<repo>@<slug> on task/<slug>, from its 'Checkout: <repo>@<slug>' line), and
@@ -25,9 +25,8 @@
 #   block, is the same task continued: the worker already has it, and what is new is at the end.
 #   With no report it is a new task routed to an existing worker.
 #
-#   The session is resumed by the program that ran it, which only the 'Harness' line says. The
-#   'Implementer' line is a model name, and a model does not say which program ran it (Claude
-#   Opus from Claude Code, Cursor or agy alike), so it is never read.
+#   On resume, an exact configured Implementer selects its model environment and harness.
+#   Other sessions use the header's Harness or an explicit --agent.
 #
 #   --list       List tasks and drafts under the root, without starting an agent.
 #   --dry-run    Print each step -- the project root and where it came from (dispatch.root
@@ -35,7 +34,7 @@
 #                dispatch.moveTask), the agent's exact argv and its cwd -- and change nothing.
 #   --setup-only Prepare the checkout and task file, print the paths, prompt and argv,
 #                then stop before cd/exec. Combine with --dry-run to preview without changes.
-#   --agent A    claude, codex, omp or cursor. Resumes a session whose header has no Harness line
+#   --agent A    A built-in agent or configured model. Resumes a session whose header has no Harness line
 #                (omp cannot resume); for a new session, picks the agent (default claude).
 #                cursor runs the 'agent' program. Contradicting a Harness is refused.
 #   --effort L   The worker's reasoning effort, on a new session and a resume alike (default:
@@ -113,7 +112,7 @@ usage() {
 Usage:
   git dispatch --list
                 List root-wide tasks and drafts: repository, slug, status, session, task-path (TSV).
-  git dispatch [--dry-run] [--setup-only] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
+  git dispatch [--dry-run] [--setup-only] [--agent NAME] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
                 Set up the task's checkout (<repo>@<slug>, on task/<slug>) and start or resume
                 its worker in the project root (the main checkout's parent, or dispatch.root).
   --dry-run     Print the root and where it came from, the worktree command, the agent's
@@ -121,9 +120,19 @@ Usage:
   --setup-only Prepare the checkout and task file, then stop before cd/exec. Print the
                 checkout, task-path, cwd, exact prompt and informational exec argv.
                 With --dry-run, preview the same setup without changing anything.
-  --agent A     claude, codex, omp or cursor; picks a new session's agent (default claude), and
-                names the one to resume when the header has no Harness line (omp cannot resume).
-                cursor runs the 'agent' program.
+  --agent NAME  claude (default), codex, omp, cursor or a configured model. On resume,
+                an exact configured Implementer restores that model and must agree with
+                --agent and Harness. Otherwise Harness selects the program (omp cannot resume).
+                cursor runs the 'agent' program. Configure a local Claude Code model with:
+                  git config dispatch.model.local.harness claude-code
+                  git config dispatch.model.local.implementer '<display name>'
+                  git config --add dispatch.model.local.env 'ANTHROPIC_BASE_URL=<url>'
+                  git config --add dispatch.model.local.env 'ANTHROPIC_AUTH_TOKEN=<token>'
+                  git config --add dispatch.model.local.env 'ANTHROPIC_MODEL=<model>'
+                  git config --add dispatch.model.local.env 'ANTHROPIC_DEFAULT_HAIKU_MODEL=<model>'
+                  git config --add dispatch.model.local.env 'CLAUDE_CODE_MAX_CONTEXT_TOKENS=<n>'
+                  git config --add dispatch.model.local.env 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1'
+                The worker copies GIT_DISPATCH_IMPLEMENTER verbatim into Implementer.
   --effort L    The worker's reasoning effort (default: high). claude: low, medium, high,
                 xhigh, max; codex: the same, or ultra. omp and cursor take none; --effort
                 with either is refused.
@@ -196,10 +205,6 @@ while [ "$#" -gt 0 ]; do
 done
 [ -n "$task" ] || [ "$list_only" -eq 1 ] || usage_error "no task file given"
 [ "$list_only" -eq 0 ] || [ -z "$task" ] || usage_error "--list takes no task"
-case "$agent_opt" in
-    ""|claude|codex|omp|cursor) ;;
-    *) usage_error "--agent must be 'claude', 'codex', 'omp' or 'cursor', not '$agent_opt'" ;;
-esac
 if [ "$seen_cwd" -eq 1 ] && [ -z "$cwd_opt" ]; then
     usage_error "--cwd needs a directory"
 fi
@@ -279,7 +284,64 @@ inventory_field() {
         {sub(/\r$/, ""); sub(/[[:space:]]*$/, "")}
         index($0, "**" key ": ") == 1 {sub("^\\*\\*" key ": *", ""); sub(/\*\*$/, ""); print; exit}' "$1"
 }
+declare -A harness_program=([claude-code]=claude [codex]=codex [omp]=omp [cursor]=cursor)
+declare -A models model_harness model_impl model_env impl_model
+read_models() {
+    local config_fd config_pid record key value suffix name h impl
+    # Git emits entries in config precedence order, separated by NUL so values stay literal.
+    exec {config_fd}< <(git -C "$1" config --null --get-regexp '^dispatch\.model\.')
+    config_pid=$!
+    while IFS= read -r -d '' record; do
+        key=${record%%$'\n'*}
+        value=""
+        [[ "$key" = "$record" ]] || value=${record#*$'\n'}
+        suffix=${key#dispatch.model.}
+        name=${suffix%.*}
+        [[ "$suffix" = *.* && "$name" =~ $NAME_RE ]] || die "invalid configured model key '$key'"
+        case "$name" in claude|codex|omp|cursor) die "configured model '$name' is a built-in agent" ;; esac
+        models[$name]=1
+        case "${suffix##*.}" in
+            harness) model_harness[$name]=$value ;;
+            implementer) model_impl[$name]=$value ;;
+            env)
+                [[ "$value" =~ ^([a-zA-Z_][a-zA-Z_0-9]*)= ]] || die "$key requires KEY=VALUE with a shell-safe key"
+                model_env[$name.${BASH_REMATCH[1]}]=${value#*=}
+                ;;
+            *) die "unknown configured model setting '$key'" ;;
+        esac
+    done <&"$config_fd"
+    exec {config_fd}<&-
+    wait "$config_pid" || [ "$?" -eq 1 ] || die "cannot read configured models"
+
+    for name in "${!models[@]}"; do
+        h=${model_harness[$name]-}
+        impl=${model_impl[$name]-}
+        [ -n "$h" ] || die "configured model '$name' is missing harness"
+        [ -n "${harness_program[$h]-}" ] || die "configured model '$name' has unknown harness '$h'"
+        [ -n "$impl" ] || die "configured model '$name' is missing implementer"
+        [[ "$impl" != *$'\n'* && "$impl" != [[:space:]]* && "$impl" != *[[:space:]] ]] ||
+            die "configured model '$name' needs implementer text that fits a header field"
+        [ -z "${impl_model[$impl]-}" ] || die "configured models '${impl_model[$impl]}' and '$name' have the same implementer"
+        impl_model[$impl]=$name
+    done
+}
+
+select_agent_option() {
+    model=""
+    if [ "$seen_agent" -eq 1 ]; then
+        case "$agent_opt" in
+            claude|codex|omp|cursor) ;;
+            *) [ -n "$agent_opt" ] && [ -n "${models[$agent_opt]-}" ] || die "unknown --agent '$agent_opt'"
+               model=$agent_opt ;;
+        esac
+    fi
+}
+
 if [ "$list_only" -eq 1 ]; then
+    if [ "$seen_agent" -eq 1 ]; then
+        read_models "$PWD"
+        select_agent_option
+    fi
     inventory
     printf 'repository\tslug\tstatus\timplementer-session\ttask-path\n'
     for f in "${inventory_files[@]}"; do
@@ -524,18 +586,40 @@ co_repo=${BASH_REMATCH[1]} slug=${BASH_REMATCH[2]}
 
 # --- the agent ------------------------------------------------------------------------------
 
-# The program that ran the session, from the Harness line. claude-code, codex and cursor can be
-# resumed from here (omp starts a session but cannot resume one); anything else is named and
-# refused rather than guessed at. cursor's command-line program is 'agent', not 'cursor'.
+read_models "$main"
+select_agent_option
+header_impl=${field[Implementer]-}
+if [ "$session" != unassigned ]; then
+    header_model=""
+    [ -z "$header_impl" ] || header_model=${impl_model[$header_impl]-}
+    if [ -n "$header_model" ]; then
+        [ "$seen_agent" -eq 0 ] || [ "$agent_opt" = "$header_model" ] ||
+            die "$task: --agent $agent_opt contradicts configured model '$header_model' in Implementer"
+        model=$header_model
+    elif [ -n "$model" ]; then
+        die "$task: --agent $model requires Implementer '${model_impl[$model]}' to resume"
+    fi
+fi
+
+worker_env=()
+selected_agent=$agent_opt
+worker_path=$PATH
+if [ -n "$model" ]; then
+    selected_agent=${harness_program[${model_harness[$model]}]}
+    model_env[$model.GIT_DISPATCH_IMPLEMENTER]=${model_impl[$model]}
+    for key in "${!model_env[@]}"; do
+        [ "${key%.*}" = "$model" ] || continue
+        worker_env+=("${key##*.}=${model_env[$key]}")
+    done
+    worker_path=${model_env[$model.PATH]-$PATH}
+fi
+
 harness="" harness_agent=""
 if [ -n "${field[Harness]+set}" ]; then
     harness=${field[Harness]}
     l_harness=${field_line[Harness]}
     case "$harness" in
-        claude-code) harness_agent=claude ;;
-        codex) harness_agent=codex ;;
-        omp) harness_agent=omp ;;
-        cursor) harness_agent=cursor ;;
+        claude-code|codex|omp|cursor) harness_agent=${harness_program[$harness]} ;;
         unassigned) harness="" ;;
         "") die "$task: line $l_harness: empty Harness (write 'unassigned' for none)" ;;
         *)
@@ -547,14 +631,17 @@ if [ -n "${field[Harness]+set}" ]; then
                 "resume it in $harness, or dispatch a new session"
             ;;
     esac
-    if [ -n "$agent_opt" ] && [ -n "$harness_agent" ] && [ "$agent_opt" != "$harness_agent" ]; then
+    if [ -n "$selected_agent" ] && [ -n "$harness_agent" ] && [ "$selected_agent" != "$harness_agent" ]; then
+        if [ -n "$model" ]; then
+            die "$task: line $l_harness: Harness is '$harness'; configured model '$model' uses '${model_harness[$model]}'"
+        fi
         die "$task: line $l_harness: Harness is '$harness'; --agent $agent_opt contradicts it"
     fi
 fi
 
 if [ "$session" = "unassigned" ]; then
     resume=0
-    agent=${agent_opt:-${harness_agent:-claude}}
+    agent=${selected_agent:-${harness_agent:-claude}}
 else
     resume=1
     [ -n "$session" ] || die "$task: line $l_session: empty Implementer Session ID (write 'unassigned' for none)"
@@ -562,7 +649,7 @@ else
     # for it, and a leading '-' would be read as an option.
     [[ "$session" =~ $UUID_RE ]] ||
         die "$task: line $l_session: Implementer Session ID '$session' is not a session UUID"
-    agent=${agent_opt:-$harness_agent}
+    agent=${selected_agent:-$harness_agent}
     [ -n "$agent" ] ||
         die "$task: line $l_session: session $session, but no program to resume it with: add" \
             "'**Harness: claude-code**', '**Harness: codex**' or '**Harness: cursor**' to the header," \
@@ -577,7 +664,6 @@ case "$agent" in
     cursor) agent_bin=agent ;;
     *) agent_bin=$agent ;;
 esac
-command -v "$agent_bin" > /dev/null 2>&1 || die "'$agent_bin' is not on PATH"
 
 # Checked against the agent that will run, not against a union: 'claude --effort ultra' is not a
 # level claude has, and a typo must not reach any agent to be rejected -- or quietly ignored.
@@ -601,6 +687,8 @@ if [ -n "$cwd_opt" ]; then
 else
     agent_cwd=$root
 fi
+
+(cd -- "$agent_cwd" && PATH=$worker_path command -v "$agent_bin") > /dev/null 2>&1 || die "'$agent_bin' is not on PATH"
 
 # The task file as the agent will see it from where it starts: relative when it is below that
 # directory (<repo>/context/TASK_<name>.md from the project root), absolute otherwise. A
@@ -847,6 +935,16 @@ else
     how="resume $session with $agent, a follow-up: no report"
 fi
 echo "$SELF: task $task_abs ($status, $how)"
+if [ -n "$model" ] && (( dry_run || setup_only )); then
+    echo "$SELF: model: $model"
+    for assignment in "${worker_env[@]}"; do
+        key=${assignment%%=*}
+        case "${key^^}" in
+            *TOKEN*|*KEY*|*SECRET*) printf '%s: env: %s=<masked>\n' "$SELF" "$key" ;;
+            *) printf '%s: env: %s=%q\n' "$SELF" "$key" "${assignment#*=}" ;;
+        esac
+    done
+fi
 if [ "$dry_run" -eq 1 ]; then
     echo "$SELF: root: $root    ($root_from)"
 fi
@@ -999,4 +1097,8 @@ if [ "$setup_only" -eq 1 ]; then
     exit 0
 fi
 cd -- "$agent_cwd" || die "cannot enter $agent_cwd"
+if [ -n "$model" ]; then
+    exec env "${worker_env[@]}" "${argv[@]}"
+fi
+unset GIT_DISPATCH_IMPLEMENTER
 exec "${argv[@]}"

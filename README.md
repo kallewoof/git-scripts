@@ -588,7 +588,7 @@ test the fix rather than the property.
 # git dispatch
 
 ```
-git dispatch [--dry-run] [--setup-only] [--agent claude|codex|omp|cursor] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
+git dispatch [--dry-run] [--setup-only] [--agent NAME] [--effort LEVEL] [--cwd DIR] <task file> [-- <args...>]
 ```
 
 Everything after a `--` following the task file goes verbatim to the agent program. For a task whose
@@ -628,12 +628,13 @@ never read, because a task file that describes the format quotes a header of its
 
 ```
 **Status: Pending**                                  line 3; only Pending or Returned is dispatched
+**Implementer: <display name>**                      exact configured display name on resume
 **Harness: claude-code**                             or "codex", "omp", "cursor", or "unassigned"; omp cannot resume
 **Implementer Session ID: 82ea4726-...**             or "unassigned"
 **Checkout: terea@failed-call**                      <repo>@<slug>
 ```
 
-`Implementer`, the model, is not read at all: see below. Any other header line is ignored.
+On resume, dispatch looks for an exact match between `Implementer` and a configured model's display name.
 
 `Checkout: <repo>@<slug>` names the worktree. `<repo>` is the directory name of the repo's main checkout, and
 it has to be the repo the task file is in. The worktree is `<project root>/<repo>@<slug>` on
@@ -682,15 +683,13 @@ nothing is passed to either, and an explicit `--effort` with one of them is refu
 dropped. Cursor's CLI has no effort flag; effort is a parameter of a model name, and the model is not
 chosen here.
 
-**A session is resumed by the program that ran it, which only `Harness` says.** `claude-code` resumes with
-`claude --resume`, `codex` with `codex resume`, and `cursor` with `agent --resume`, spelled exactly like
-that, with no aliases. Cursor's command-line program is `agent`, so `--agent cursor` and `Harness: cursor`
-both exec `agent`. A model name does not tell you the program: Claude Opus runs in Claude Code, Cursor and
-agy alike, and only the program that ran a session can resume it. So `Implementer` is never read, and
-`Implementer: Claude Opus 5.5` with `Harness: codex` resumes with `codex`. Any other Harness (`agy`, …) is
+**Resuming a session.** An exact configured `Implementer` selects the model and its program. A
+present, assigned `Harness` must agree, and an explicit `--agent` must name that same model.
+For other implementers, `Harness` selects the program. `claude-code` resumes with `claude --resume`,
+`codex` with `codex resume`, and `cursor` with `agent --resume`. Any other Harness (`agy`, …) is
 refused by name: *"cannot be resumed from the command line; resume it in agy, or dispatch a new session"*.
-A session with no Harness line, or with `Harness: unassigned`, is refused, and the refusal names both fixes:
-add the line, or pass `--agent`. A task written before `Harness` existed therefore needs `--agent` once.
+Without a matching model, resuming a session with a missing or unassigned Harness requires a program:
+add the line, or pass `--agent`.
 `--agent` contradicting a present Harness is refused. omp starts a session (`omp 'Task: …'`) but git
 dispatch cannot resume one, so a session ID with `Harness: omp` is refused: resume it in omp itself, or set
 the ID to `unassigned` to start a new omp session.
@@ -715,6 +714,37 @@ the same steps (the project root and whether it came from `dispatch.root` or the
 command, the exact argv as `printf %q` would quote it, and the cwd) and changes nothing. A set
 `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` is refused: it would point every git command,
 the agent's included, at a repository the task file did not name.
+
+## Configured models
+
+Use `dispatch.model.<name>` to give an existing harness a model-specific environment.
+For example, to run Claude Code against a local Anthropic Messages API server:
+
+```sh
+git config --global dispatch.model.local.harness claude-code
+git config --global dispatch.model.local.implementer '<display name>'
+git config --global --add dispatch.model.local.env 'ANTHROPIC_BASE_URL=<url>'
+git config --global --add dispatch.model.local.env 'ANTHROPIC_AUTH_TOKEN=<token>'
+git config --global --add dispatch.model.local.env 'ANTHROPIC_MODEL=<model>'
+git config --global --add dispatch.model.local.env 'ANTHROPIC_DEFAULT_HAIKU_MODEL=<model>'
+git config --global --add dispatch.model.local.env 'CLAUDE_CODE_MAX_CONTEXT_TOKENS=<n>'
+git config --global --add dispatch.model.local.env 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1'
+git dispatch --agent local context/TASK_x.md
+```
+
+The token supplies separate credentials for the local server. Model names start with a letter or
+digit and may also contain dots, underscores and hyphens. Built-in agent names are reserved.
+Each model needs a supported harness and a unique, single-line implementer display name.
+Use repository-local config to add models or override settings. For repeated environment keys,
+the last assignment in Git config order wins. Values are literal, including spaces and equals signs.
+
+Add this instruction to the repository's worker rules: **If `GIT_DISPATCH_IMPLEMENTER` is set,
+write its value verbatim as `Implementer` in the task header.** Dispatch supplies this variable
+from the model's configured display name. On resume, the same header selects the current settings
+for that model without `--agent`. A configured `--agent` on resume requires a matching header.
+
+Both `--dry-run` and `--setup-only` show the model name and its environment assignments. They mask
+values whose variable names contain TOKEN, KEY or SECRET, regardless of case.
 
 ## `--setup-only`
 
